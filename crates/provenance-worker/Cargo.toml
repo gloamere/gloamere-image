@@ -1,0 +1,23 @@
+[package]
+name = "light-provenance-worker"
+autobins = false
+description = "gloamere-image offline provenance worker"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "gloamere-image-worker"
+path = "src/main.rs"
+
+[dependencies]
+c2pa = { version = "=0.91.2", default-features = false, features = ["rust_native_crypto"] }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
+png = "=0.18.1"
+kamadak-exif = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+quick-xml = "0.41"
+

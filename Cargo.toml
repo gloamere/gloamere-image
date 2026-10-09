@@ -1,0 +1,48 @@
+[package]
+name = "light-image-tool"
+# Keep the library/package identity for source compatibility; ship only the branded binary.
+autobins = false
+description = "gloamere-image: local JPEG and PNG viewer and editor"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "gloamere-image"
+path = "src/main.rs"
+
+[workspace]
+members = ["crates/provenance-worker"]
+default-members = ["."]
+resolver = "3"
+
+[dependencies]
+eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "wgpu_no_default_features", "accesskit", "__screenshot"] }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
+moxcms = "=0.8.1"
+rfd = { version = "0.17", default-features = false }
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false }
+sha2 = "0.10.9"
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "dx12", "wgsl"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Shell"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "metal", "wgsl"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+
+[dev-dependencies]
+png = "=0.18.1"
+
