@@ -1,12 +1,12 @@
+//! Main-image adapter over the same bounded, owned worker used by browsing.
 use crate::{
     Cancellation, Result,
+    browsing::{Request, Worker},
     pipeline::{self, LoadedImage},
 };
-use std::{
-    path::PathBuf,
-    sync::{Arc, Condvar, Mutex},
-    thread,
-};
+use std::path::PathBuf;
+
+pub use crate::browsing::ShutdownReport;
 
 pub struct LoadRequest {
     pub generation: u64,
@@ -18,76 +18,96 @@ pub struct LoadResponse {
     pub result: Result<LoadedImage>,
     pub siblings: Vec<PathBuf>,
 }
-#[derive(Default)]
-struct State {
-    pending: Option<LoadRequest>,
-    shutdown: bool,
-}
 pub struct Loader {
-    shared: Arc<(Mutex<State>, Condvar)>,
-    result: Arc<Mutex<Option<LoadResponse>>>,
+    worker: Worker<LoadedImage>,
 }
 impl Loader {
     pub fn new(ctx: eframe::egui::Context) -> Self {
-        let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
-        let result = Arc::new(Mutex::new(None));
-        let input = shared.clone();
-        let output = result.clone();
-        thread::Builder::new()
-            .name("image-loader".into())
-            .spawn(move || {
-                loop {
-                    let request = {
-                        let (lock, wake) = &*input;
-                        let mut state = lock.lock().unwrap();
-                        while state.pending.is_none() && !state.shutdown {
-                            state = wake.wait(state).unwrap();
-                        }
-                        if state.shutdown {
-                            break;
-                        }
-                        state.pending.take().unwrap()
-                    };
-                    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        pipeline::load(&request.path, &request.cancel)
-                    }))
-                    .unwrap_or_else(|_| {
-                        Err(crate::ToolError::Invalid("解码器异常，原文件未修改".into()))
-                    });
-                    // Directory scanning is independent: a slow/inaccessible folder
-                    // must never withhold a successfully decoded image.
-                    let siblings = vec![request.path.clone()];
-                    *output.lock().unwrap() = Some(LoadResponse {
-                        generation: request.generation,
-                        result: decoded,
-                        siblings,
-                    });
-                    ctx.request_repaint();
-                }
-            })
-            .expect("image worker creation");
-        Self { shared, result }
+        Self {
+            worker: Worker::new("image-loader", ctx, pipeline::load),
+        }
     }
     pub fn request(&self, request: LoadRequest) {
-        let (lock, wake) = &*self.shared;
-        // Exactly one pending request: rapid browsing replaces queued work instead of spawning threads.
-        if let Some(old) = lock.lock().unwrap().pending.replace(request) {
-            old.cancel.cancel();
-        }
-        wake.notify_one();
+        self.worker.request(Request {
+            generation: request.generation,
+            path: request.path,
+            cancel: request.cancel,
+        });
     }
     pub fn take_result(&self) -> Option<LoadResponse> {
-        self.result.lock().unwrap().take()
+        self.worker.take_result().map(|response| LoadResponse {
+            generation: response.generation,
+            result: response.result,
+            // Directory scanning stays independent of successfully decoded pixels.
+            siblings: vec![response.path],
+        })
+    }
+    pub fn cancel(&self) {
+        self.worker.cancel();
+    }
+    pub fn is_busy(&self) -> bool {
+        self.worker.is_busy()
+    }
+    pub fn shutdown(&mut self) -> ShutdownReport {
+        self.worker.shutdown()
     }
 }
-impl Drop for Loader {
-    fn drop(&mut self) {
-        let (lock, wake) = &*self.shared;
-        let mut state = lock.lock().unwrap();
-        state.shutdown = true;
-        if let Some(pending) = state.pending.take() {
-            pending.cancel.cancel();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn wait_result(loader: &Loader) -> LoadResponse {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(response) = loader.take_result() {
+                return response;
+            }
+            assert!(Instant::now() < deadline, "loader result deadline");
+            std::thread::sleep(Duration::from_millis(1));
         }
-        wake.notify_one();
+    }
+
+    #[test]
+    fn loader_recovers_from_bad_file_and_preserves_selected_path_and_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.png");
+        let image = dir.path().join("图片2.png");
+        image::RgbaImage::from_pixel(2, 3, image::Rgba([1, 2, 3, 255]))
+            .save(&image)
+            .unwrap();
+        let mut loader = Loader::new(eframe::egui::Context::default());
+        loader.request(LoadRequest {
+            generation: 1,
+            path: missing.clone(),
+            cancel: Cancellation::default(),
+        });
+        let error = wait_result(&loader);
+        assert_eq!(error.generation, 1);
+        assert_eq!(error.siblings, vec![missing]);
+        assert!(error.result.is_err());
+        loader.request(LoadRequest {
+            generation: 2,
+            path: image.clone(),
+            cancel: Cancellation::default(),
+        });
+        let response = wait_result(&loader);
+        assert_eq!(response.generation, 2);
+        assert_eq!(response.siblings, vec![image]);
+        let loaded = response.result.unwrap();
+        assert_eq!(loaded.pixels.dimensions(), (2, 3));
+        assert!(!loader.is_busy());
+        let report = loader.shutdown();
+        assert!(!report.join_panicked);
+        assert_eq!(loader.shutdown(), report);
+        let token = Cancellation::default();
+        loader.request(LoadRequest {
+            generation: 3,
+            path: dir.path().join("unused.png"),
+            cancel: token.clone(),
+        });
+        assert!(token.check().is_err());
+        assert!(loader.take_result().is_none());
     }
 }

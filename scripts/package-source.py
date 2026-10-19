@@ -12,6 +12,7 @@ import io
 import json
 import stat
 import subprocess
+import tomllib
 import zipfile
 from pathlib import Path
 
@@ -20,6 +21,26 @@ staging = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(staging)
 packaging = staging.packaging
 PROJECT = Path(__file__).resolve().parent.parent
+# Current product documentation only. Historical delivery/task notes are not source inputs.
+SOURCE_DOCUMENTS = {
+    "docs/v05-candidate-acceptance.md", "docs/v05-animation-core.md",
+    "docs/clipboard-v0.5.md", "docs/v05-browsing-worker-settings.md",
+    "docs/installer-v0.5.md",
+    "docs/v06/implementation-plan.md", "docs/v06/acceptance.md",
+    "docs/v06/windows-handoff.md", "docs/v06/ui.md", "docs/v06/policy-cache.md",
+    "docs/v07-integration-addendum.md",
+    "docs/v07-installer-implementation-addendum.md",
+    "docs/v07/ai.md",
+    "docs/v07/implementation-addendum.md",
+    "docs/v07/updater.md",
+    "docs/v07/windows-acceptance.md",
+    "docs/v07/windows-native-repair.md",
+    "docs/v07/preflight-security-correction.md",
+    "docs/v07/dependency-notices.md",
+    "docs/v07/dependency-tree-windows.txt",
+    "docs/v07/dependency-notices-verification.json",
+    "docs/v07/dependency-notices-recollection.txt",
+}
 
 
 def package_source(commit_ref: str, notices: Path, output: Path, project: Path = PROJECT) -> dict:
@@ -46,9 +67,20 @@ def package_source(commit_ref: str, notices: Path, output: Path, project: Path =
                 ".beads", ".agents", ".codex", ".git", "dist", "target", "test-output", "third-party-notices"
             ) or entry.filename == "SOURCE-MANIFEST.json":
                 continue
+            if path.parts[0] == "docs" and entry.filename not in SOURCE_DOCUMENTS:
+                continue
             if entry.filename in files:
                 raise ValueError("Duplicate source archive entry")
             files[entry.filename] = archive.read(entry)
+    # A requested old commit must not be stamped with this checkout's new version.
+    # Both paired binaries and the source manifest describe the same candidate.
+    try:
+        versions = [tomllib.loads(files[name].decode("utf-8"))["package"]["version"]
+                    for name in ("Cargo.toml", "crates/provenance-worker/Cargo.toml")]
+    except (KeyError, UnicodeError, ValueError, TypeError) as error:
+        raise ValueError("Source archive lacks valid paired Cargo version manifests") from error
+    if versions != [packaging.VERSION, packaging.VERSION]:
+        raise ValueError("Source archive versions do not match the paired candidate version")
     inventory = packaging.load_json(notices / "inventory.json")
     expected = {"inventory.json"}
     for record in inventory["packages"]:
@@ -66,7 +98,8 @@ def package_source(commit_ref: str, notices: Path, output: Path, project: Path =
         "product": packaging.PRODUCT, "version": packaging.VERSION, "source_commit": commit,
         "kind": "developer source with paired Windows dependency notices; not an installation archive",
         "registry_sources_vendored": False, "execution_instructions_included": False,
-        "application_screenshots_included": False, "notice_packages": len(inventory["packages"]),
+        "application_screenshots_included": False, "historical_delivery_notes_included": False,
+        "notice_packages": len(inventory["packages"]),
         "files": [{"path": name, "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
                   for name, content in sorted(files.items())],
     }

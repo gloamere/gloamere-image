@@ -1,0 +1,146 @@
+{
+  "kind": "Frozen branded v0.4 registry/identity fixture; no Windows installation performed",
+  "baseline_version": "0.4.0",
+  "identity": {
+    "product_id": "9CCB6F43-7782-4F69-9E91-67C6D144737B",
+    "install_directory": "C:\\Users\\fixture\\AppData\\Local\\Programs\\LightImageTool",
+    "default_directory": "{userpf}\\LightImageTool",
+    "owner_marker": "LIGHT-IMAGE-INSTALL.txt",
+    "main_executable": "gloamere-image.exe",
+    "worker_executable": "gloamere-image-worker.exe",
+    "progid": "LightImageTool.Image",
+    "menu_verb": "LightImageTool",
+    "settings_path": "%LOCALAPPDATA%\\LightImageTool\\settings.json",
+    "settings_schema": 1
+  },
+  "candidate_values": [
+    {
+      "key": "Software\\LightImageTool\\DefaultApps",
+      "name": "OwnerId",
+      "type": "REG_SZ",
+      "text": "9CCB6F43-7782-4F69-9E91-67C6D144737B"
+    },
+    {
+      "key": "Software\\LightImageTool\\DefaultApps",
+      "name": "OwnerPath",
+      "type": "REG_SZ",
+      "text": "C:\\Users\\fixture\\AppData\\Local\\Programs\\LightImageTool\\gloamere-image.exe"
+    },
+    {
+      "key": "Software\\LightImageTool\\DefaultApps\\Capabilities",
+      "name": "ApplicationName",
+      "type": "REG_SZ",
+      "text": "gloamere-image"
+    },
+    {
+      "key": "Software\\LightImageTool\\DefaultApps\\Capabilities",
+      "name": "ApplicationDescription",
+      "type": "REG_SZ",
+      "text": "Local JPEG and PNG image viewer and editor."
+    },
+    {
+      "key": "Software\\LightImageTool\\DefaultApps\\Capabilities",
+      "name": "ApplicationIcon",
+      "type": "REG_SZ",
+      "text": "\"C:\\Users\\fixture\\AppData\\Local\\Programs\\LightImageTool\\assets\\gloamere-image.ico\",0"
+    },
+    {
+      "key": "Software\\LightImageTool\\DefaultApps\\Capabilities\\FileAssociations",
+      "name": ".jpg",
+      "type": "REG_SZ",
+      "text": "LightImageTool.Image"
+    },
+    {
+      "key": "Software\\LightImageTool\\DefaultApps\\Capabilities\\FileAssociations",
+      "name": ".jpeg",
+      "type": "REG_SZ",
+      "text": "LightImageTool.Image"
+    },
+    {
+      "key": "Software\\LightImageTool\\DefaultApps\\Capabilities\\FileAssociations",
+      "name": ".png",
+      "type": "REG_SZ",
+      "text": "LightImageTool.Image"
+    },
+    {
+      "key": "Software\\Classes\\LightImageTool.Image",
+      "name": "OwnerId",
+      "type": "REG_SZ",
+      "text": "9CCB6F43-7782-4F69-9E91-67C6D144737B"
+    },
+    {
+      "key": "Software\\Classes\\LightImageTool.Image",
+      "name": "OwnerPath",
+      "type": "REG_SZ",
+      "text": "C:\\Users\\fixture\\AppData\\Local\\Programs\\LightImageTool\\gloamere-image.exe"
+    },
+    {
+      "key": "Software\\Classes\\LightImageTool.Image",
+      "name": "",
+      "type": "REG_SZ",
+      "text": "gloamere-image JPEG / PNG image"
+    },
+    {
+      "key": "Software\\Classes\\LightImageTool.Image\\DefaultIcon",
+      "name": "",
+      "type": "REG_SZ",
+      "text": "\"C:\\Users\\fixture\\AppData\\Local\\Programs\\LightImageTool\\assets\\gloamere-image.ico\",0"
+    },
+    {
+      "key": "Software\\Classes\\LightImageTool.Image\\shell\\open\\command",
+      "name": "",
+      "type": "REG_SZ",
+      "text": "\"C:\\Users\\fixture\\AppData\\Local\\Programs\\LightImageTool\\gloamere-image.exe\" --open \"%1\""
+    },
+    {
+      "key": "Software\\RegisteredApplications",
+      "name": "gloamere-image",
+      "type": "REG_SZ",
+      "text": "Software\\LightImageTool\\DefaultApps\\Capabilities"
+    }
+  ],
+  "settings": {
+    "schema_version": 1,
+    "background": "checker_dark",
+    "list_visible": true
+  },
+  "preserved_values": [
+    {
+      "key": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.jpg\\UserChoice",
+      "name": "ProgId",
+      "type": "REG_SZ",
+      "text": "OtherViewer.Image"
+    },
+    {
+      "key": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.jpeg\\UserChoice",
+      "name": "ProgId",
+      "type": "REG_SZ",
+      "text": "OtherViewer.Image"
+    },
+    {
+      "key": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.png\\UserChoice",
+      "name": "ProgId",
+      "type": "REG_SZ",
+      "text": "OtherViewer.Image"
+    },
+    {
+      "key": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.gif\\UserChoice",
+      "name": "ProgId",
+      "type": "REG_SZ",
+      "text": "OtherViewer.Image"
+    },
+    {
+      "key": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.webp\\UserChoice",
+      "name": "ProgId",
+      "type": "REG_SZ",
+      "text": "OtherViewer.Image"
+    }
+  ],
+  "ordinary_files": [
+    "family.jpg",
+    "notes.png",
+    "download.gif",
+    "animation.webp",
+    "personal.txt"
+  ]
+}

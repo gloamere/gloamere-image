@@ -1,0 +1,36 @@
+[package]
+name = "safeupdate-core"
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+description = "Fail-closed TUF metadata and bounded HTTPS download core for gloamere-image"
+
+[features]
+default = []
+# Debug-only authenticated fixture transport; forbidden in release builds.
+fixture-harness = []
+
+[dependencies]
+tough = { version = "=0.24.0", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots-no-provider", "system-proxy", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio = { version = "1", features = ["fs", "io-util", "rt", "time", "sync", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+url = "2"
+sha2 = "0.10.9"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+olpc-cjson = "0.1"
+thiserror = "2"
+tempfile = "3"
+jiff = "0.2"
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

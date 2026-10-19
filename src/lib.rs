@@ -1,11 +1,15 @@
+pub mod ai;
+pub mod animation;
 pub mod browsing;
 pub mod cli;
+pub mod clipboard;
 pub mod edit;
 pub mod export;
 pub mod memory;
 pub mod pipeline;
 pub mod provenance;
 pub mod settings;
+pub mod updater;
 pub mod worker;
 
 #[derive(Debug, thiserror::Error)]
@@ -42,7 +46,9 @@ impl Cancellation {
             Ok(())
         }
     }
-    pub(crate) fn publish<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    /// Linearize a cancellable publication. Once publication wins, report its actual result
+    /// even if cancellation arrives later; callers must keep the operation bounded in scope.
+    pub fn publish<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         match self.0.compare_exchange(
             0,
             Self::PUBLICATION_STARTED,

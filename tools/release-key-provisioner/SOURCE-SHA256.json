@@ -1,0 +1,38 @@
+{
+  ".gitignore": {
+    "bytes": 46,
+    "sha256": "d89067b98297abc861e7e97b55f80e7aca918a7a9fcce28bad350840f9cb9c28"
+  },
+  "README.md": {
+    "bytes": 13611,
+    "sha256": "3fefc4f3eb5192025bdcbc2f5645457aa1de9b44cbc7bee40213dad3d7fa18d7"
+  },
+  "VERIFICATION.md": {
+    "bytes": 3004,
+    "sha256": "291748935603e7d3f46beb7b9801985c7a18f89a34ecbdb355a29557995e36fb"
+  },
+  "provision_keys.py": {
+    "bytes": 22285,
+    "sha256": "af7142b0006ebb8bde19de3aeae07530a2019593d440c5b965f52adef51ff403"
+  },
+  "requirements-operator.txt": {
+    "bytes": 165,
+    "sha256": "d4007bb78adc5c9fb851f008764e1f7b3aa02defdade985b808c63a3fb34ad7d"
+  },
+  "test_provision_keys.py": {
+    "bytes": 13286,
+    "sha256": "b4e5dd30bf5732b205db429f1a6eb1ff008ad8cdf9789a35cbb5dc1592c7ca15"
+  },
+  "verify-root/Cargo.lock": {
+    "bytes": 47482,
+    "sha256": "624ddb11b7d28b613bb3393e8e5ce4b1f9fb89a3db9614f01ccd484e72a7ba68"
+  },
+  "verify-root/Cargo.toml": {
+    "bytes": 309,
+    "sha256": "1a7fa67a558d4713aef53dca33187ee44f0a62a177a8ad3579fceec36ba09061"
+  },
+  "verify-root/src/main.rs": {
+    "bytes": 1480,
+    "sha256": "e489815e09033f1afaa1c2cff12c16a7aad885be5eada50ab9c0f4931442f67e"
+  }
+}

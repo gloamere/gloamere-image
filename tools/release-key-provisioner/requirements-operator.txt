@@ -1,0 +1,3 @@
+# Optional offline operator tool only. NOT an application/runtime dependency.
+# Tested in this workspace with this exact official PyPI release.
+cryptography==50.0.0

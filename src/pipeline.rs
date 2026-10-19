@@ -18,6 +18,7 @@ pub const MAX_ICC_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct LoadedImage {
+    pub animation: Option<Arc<crate::animation::AnimationSource>>,
     pub path: PathBuf,
     pub pixels: Arc<crate::memory::Pixels>,
     pub format: ImageFormat,
@@ -47,7 +48,13 @@ pub fn validate_dimensions(width: u32, height: u32) -> Result<()> {
 
 pub fn load(path: &Path, cancel: &Cancellation) -> Result<LoadedImage> {
     let started = Instant::now();
-    let bytes = read_snapshot(path, cancel)?;
+    let bytes = Arc::new(read_snapshot(path, cancel)?);
+    let format = image::guess_format(&bytes)?;
+    if let Some(animated) =
+        crate::animation::try_load(bytes.clone(), path, format, cancel, started)?
+    {
+        return Ok(animated);
+    }
     decode(&bytes, path, cancel, started)
 }
 
@@ -95,11 +102,16 @@ fn decode(
     let mut reservation = crate::memory::reserve(MAX_DECODE_BYTES)?;
     // Never trust the extension. Restrict the accepted content formats explicitly.
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
-    let format = reader
-        .format()
-        .ok_or_else(|| ToolError::Invalid("无法识别图片；当前支持 JPEG 和 PNG".into()))?;
-    if !matches!(format, ImageFormat::Jpeg | ImageFormat::Png) {
-        return Err(ToolError::Invalid("当前版本仅支持 JPEG 和 PNG".into()));
+    let format = reader.format().ok_or_else(|| {
+        ToolError::Invalid("无法识别图片；当前支持 JPEG、PNG、GIF 和 WebP".into())
+    })?;
+    if !matches!(
+        format,
+        ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::Gif | ImageFormat::WebP
+    ) {
+        return Err(ToolError::Invalid(
+            "当前版本仅支持 JPEG、PNG、GIF 和 WebP".into(),
+        ));
     }
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DIMENSION);
@@ -175,6 +187,7 @@ fn decode(
     cancel.check()?;
     let color_managed = !color_status.contains("未完整") && !color_status.contains("核验不完整");
     Ok(LoadedImage {
+        animation: None,
         path: path.to_path_buf(),
         pixels: Arc::new(crate::memory::Pixels::from_reserved(
             rgba,
@@ -192,7 +205,7 @@ fn decode(
     })
 }
 
-fn parse_icc(icc: &[u8]) -> Result<ColorProfile> {
+pub(crate) fn parse_icc(icc: &[u8]) -> Result<ColorProfile> {
     if icc.len() > MAX_ICC_BYTES {
         return Err(ToolError::Invalid("ICC 超过 4 MiB 安全限制".into()));
     }
@@ -207,7 +220,7 @@ fn parse_icc(icc: &[u8]) -> Result<ColorProfile> {
     Ok(profile)
 }
 
-fn transform_icc(
+pub(crate) fn transform_icc(
     rgba: &mut RgbaImage,
     profile: &ColorProfile,
     gray: Option<&image::GrayAlphaImage>,
@@ -233,10 +246,12 @@ fn transform_icc(
     let stride = rgba.width() as usize * if is_gray { 2 } else { 4 };
     let out_stride = rgba.width() as usize * 4;
     let mut converted = RgbaImage::new(rgba.width(), rgba.height());
-    for (src, dst) in source
-        .chunks_exact(stride)
-        .zip(converted.as_mut().chunks_exact_mut(out_stride))
-    {
+    for (src, dst) in source.chunks_exact(stride).zip(
+        converted
+            .as_flat_samples_mut()
+            .samples
+            .chunks_exact_mut(out_stride),
+    ) {
         cancel.check()?;
         transform
             .transform(src, dst)
@@ -283,7 +298,7 @@ pub fn sibling_images_cancellable(path: &Path, cancel: &Cancellation) -> Result<
         let supported = candidate.extension().is_some_and(|e| {
             matches!(
                 e.to_string_lossy().to_ascii_lowercase().as_str(),
-                "jpg" | "jpeg" | "png"
+                "jpg" | "jpeg" | "png" | "gif" | "webp"
             )
         });
         if !supported {

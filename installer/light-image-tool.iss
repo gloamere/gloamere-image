@@ -11,12 +11,15 @@
 #ifndef PayloadRecoveryList
   #error Supply validated /DPayloadRecoveryList
 #endif
+#ifndef TransactionPlan
+  #error Supply validated /DTransactionPlan
+#endif
 #define ProductId "9CCB6F43-7782-4F69-9E91-67C6D144737B"
 #ifndef ProductVersion
-  #define ProductVersion "0.4.0"
+  #define ProductVersion "0.7.0"
 #endif
 #define ProductExe "gloamere-image.exe"
-#define ProductWorker "gloamere-image-worker.exe"
+#define ProductWorker "runtime\gloamere-image-worker.exe"
 #define MenuVerb "LightImageTool"
 
 [Setup]
@@ -49,7 +52,9 @@ Compression=lzma2
 SolidCompression=yes
 CloseApplications=no
 RestartApplications=no
-AllowCancelDuringInstall=yes
+AllowCancelDuringInstall=no
+AlwaysRestart=no
+RestartIfNeededByRun=no
 ChangesAssociations=yes
 SetupLogging=yes
 WizardStyle=modern
@@ -68,14 +73,16 @@ Name: "explorer"; Description: "{cm:ExplorerTask}"; Flags: unchecked
 [CustomMessages]
 english.ExplorerTask=Add 'Open with gloamere-image' to image right-click menus (current user)
 chinesesimp.ExplorerTask=添加“Open with gloamere-image”图片右键菜单（仅当前用户，不改变默认打开方式）
-english.OpenDefaultApps=Open Windows Default Apps settings (choose JPEG / PNG defaults yourself)
-chinesesimp.OpenDefaultApps=打开 Windows 默认应用设置（由您自行选择 JPEG / PNG 默认应用）
+english.OpenDefaultApps=Open Windows Default Apps settings (choose JPEG / PNG / GIF / WebP defaults yourself)
+chinesesimp.OpenDefaultApps=打开 Windows 默认应用设置（由您自行选择 JPEG / PNG / GIF / WebP 默认应用）
 
 [Run]
 ; Opening Settings is a one-time, opt-in action, never a remembered installer task.
-Filename: "{code:DefaultAppsSettingsUri}"; Description: "{cm:OpenDefaultApps}"; Flags: postinstall unchecked shellexec skipifsilent nowait
+Filename: "{code:DefaultAppsSettingsUri}"; Description: "{cm:OpenDefaultApps}"; Flags: postinstall unchecked shellexec skipifsilent nowait; Check: NativeCanOpenDefaults
 
 [Files]
+Source: "{#PayloadDir}\gloamere-image.exe"; DestName: "gloamere-image-recovery.exe"; Flags: dontcopy
+Source: "{#TransactionPlan}"; DestName: "installer-plan.json"; Flags: dontcopy
 ; Inno logs each exact file and removes only that installed payload on uninstall.
 #include PayloadFileList
 
@@ -200,16 +207,18 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var Path, PreviousPath: String;
 begin
   Result := ''; Path := ExpandConstant('{app}');
+  if (Length(Path) < 8) or (CompareText(Path, ExpandConstant('{win}')) = 0) or
+     (CompareText(Path, ExpandConstant('{sys}')) = 0) then begin
+    Result := 'Choose a dedicated application directory.'; Exit;
+  end;
+  Result := RecoveryReconcile;
+  if Result <> '' then Exit;
   if RegKeyExists(HKCU, UninstallKey) then begin
     if not RegQueryStringValue(HKCU, UninstallKey, 'InstallLocation', PreviousPath) or
        not MatchesValue(UninstallKey, 'InstallLocation', PreviousPath) or
        (CompareText(AddBackslash(PreviousPath), AddBackslash(Path)) <> 0) or not MarkerOwned then begin
       Result := 'Upgrade must use the existing owned installation directory. To relocate, uninstall first; images and settings are retained.'; Exit;
     end;
-  end;
-  if (Length(Path) < 8) or (CompareText(Path, ExpandConstant('{win}')) = 0) or
-     (CompareText(Path, ExpandConstant('{sys}')) = 0) then begin
-    Result := 'Choose a dedicated application directory.'; Exit;
   end;
   if HasEntries(Path) and not MarkerOwned then begin
     Result := 'This directory contains files not owned by gloamere-image. Choose an empty directory.'; Exit;
@@ -220,7 +229,8 @@ begin
     Result := 'Close gloamere-image, Light Image Tool and their source-check workers before installing. No application was closed automatically.'; Exit;
   end;
   // Refuse changed old menus even when unchecked: never strand a broken handler.
-  if not MenuSafe('.jpg') or not MenuSafe('.jpeg') or not MenuSafe('.png') then begin
+  if not MenuSafe('.jpg') or not MenuSafe('.jpeg') or not MenuSafe('.png') or
+     not MenuSafe('.gif') or not MenuSafe('.webp') then begin
     Result := 'A LightImageTool menu key contains foreign or changed values. Nothing was overwritten. Preserve and review the product-specific key before installing.'; Exit;
   end;
   if not DefaultAppsSafe then begin
@@ -234,22 +244,46 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then begin
-    RecoveryStarted := True;
-    // Fatal ssInstall failures trigger explicit recovery after Inno rollback.
-    if not MenuSafe('.jpg') or not MenuSafe('.jpeg') or not MenuSafe('.png') then
-      RaiseException('Image menu registration changed after preflight.');
-    if not DefaultAppsSafe then RaiseException('Candidate registration changed after preflight.');
-    MigrateLegacyPayload;
-    InstallMenus;
-    InstallDefaultApps;
+    try
+      RecoveryStart;
+      if not MenuSafe('.jpg') or not MenuSafe('.jpeg') or not MenuSafe('.png') or
+         not MenuSafe('.gif') or not MenuSafe('.webp') then
+        RaiseException('Image menu registration changed after preflight.');
+      if not DefaultAppsSafe then RaiseException('Candidate registration changed after preflight.');
+      // Native begin durably publishes bootstrap launcher and removes only the
+      // snapshotted legacy shortcut. Obsolete payload removal remains native.
+      InstallMenus;
+      InstallDefaultApps;
+    except
+      NativeFailureDetected := True;
+      Log('Installation stopped: ' + GetExceptionMessage);
+      SuppressibleMsgBox('Installation stopped safely. Preserve the recovery journal. ' + GetExceptionMessage,
+        mbError, MB_OK, IDOK);
+      // Official Inno API: Abort at ssInstall exits without an unsuppressible
+      // exception dialog; DeinitializeSetup still runs native recovery.
+      Abort;
+    end;
   end;
-  if CurStep = ssDone then RecoverySuccess := True;
+  if CurStep = ssPostInstall then begin
+    try
+      RecoveryInstalled;
+    except
+      NativeFailureDetected := True;
+      Log('Installation verification failed: ' + GetExceptionMessage);
+      SuppressibleMsgBox('Installation verification failed. Recovery will run before Setup exits. ' + GetExceptionMessage,
+        mbError, MB_OK, IDOK);
+    end;
+  end;
+  if CurStep = ssDone then begin
+    if not NativePendingHealth then NativeFailureDetected := True;
+    RecoverySuccess := NativePendingHealth and not NativeFailureDetected;
+  end;
 end;
 
 function InitializeUninstall: Boolean;
 var RegisteredPath: String;
 begin
-  Result := MarkerOwned and FileAvailable(InstalledExe) and
+  Result := NativeUninstallPreflight and MarkerOwned and FileAvailable(InstalledExe) and
     FileAvailable(ExpandConstant('{app}\') + WorkerName);
   if Result and RegKeyExists(HKCU, UninstallKey) then
     Result := RegQueryStringValue(HKCU, UninstallKey, 'InstallLocation', RegisteredPath) and
@@ -262,14 +296,19 @@ begin
     if FileOrDirExists(ProductShortcut(False)) and not ShortcutOwned(ProductShortcut(False), False) then Result := False;
     if FileOrDirExists(ProductShortcut(True)) and not ShortcutOwned(ProductShortcut(True), True) then Result := False;
   end;
-  if not Result then SuppressibleMsgBox('Close the app/worker and verify this is an owned gloamere-image installation. Preserve or rename any changed product Start Menu shortcut before retrying. No files have been removed.', mbError, MB_OK, IDOK);
+  if not Result then begin
+    if NativeAcquireError <> '' then SuppressibleMsgBox(NativeAcquireError, mbError, MB_OK, IDOK)
+    else SuppressibleMsgBox('Close the app/worker and verify this is an owned gloamere-image installation. Preserve or rename any changed product Start Menu shortcut before retrying. No files have been removed.', mbError, MB_OK, IDOK);
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
+  if CurUninstallStep = usPostUninstall then NativeRemoveLauncher;
   if CurUninstallStep = usUninstall then begin
     RemoveOwnedCurrentShortcut;
     RemoveOwnedMenu('.jpg'); RemoveOwnedMenu('.jpeg'); RemoveOwnedMenu('.png');
+    RemoveOwnedMenu('.gif'); RemoveOwnedMenu('.webp');
     RemoveOwnedDefaultApps;
   end;
 end;

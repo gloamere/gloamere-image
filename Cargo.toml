@@ -2,25 +2,36 @@
 name = "light-image-tool"
 # Keep the library/package identity for source compatibility; ship only the branded binary.
 autobins = false
-description = "gloamere-image: local JPEG and PNG viewer and editor"
-version = "0.4.0"
+description = "gloamere-image: bounded local image and animation viewer with safe static-copy editing"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "gloamere-image"
+path = "src/launcher.rs"
+
+[[bin]]
+name = "gloamere-image-ui"
 path = "src/main.rs"
 
 [workspace]
-members = ["crates/provenance-worker"]
+members = ["crates/provenance-worker", "crates/update-security"]
 default-members = ["."]
 resolver = "3"
 
 [dependencies]
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+raw-window-handle = "0.6"
+safeupdate-core = { path = "crates/update-security" }
 eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "wgpu_no_default_features", "accesskit", "__screenshot"] }
-image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+gif = "=0.14.2"
+image-webp = "=0.2.4"
 moxcms = "=0.8.1"
+# Already used by image and tests; direct API permits bounded borrowed ICC inspection.
+png = "=0.18.1"
 rfd = { version = "0.17", default-features = false }
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
@@ -29,10 +40,16 @@ thiserror = "2"
 log = "0.4"
 env_logger = { version = "0.11", default-features = false }
 sha2 = "0.10.9"
+libloading = "=0.9.0"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-24"] }
+rusqlite = { version = "=0.37.0", features = ["bundled", "hooks", "limits"] }
+flate2 = "1"
+crc32fast = "1"
+kamadak-exif = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "dx12", "wgsl"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Shell", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Power", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security_WinTrust", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_System_Registry", "Win32_System_IO", "Win32_System_SystemInformation"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "metal", "wgsl"] }
@@ -42,7 +59,3 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "unwind"
-
-[dev-dependencies]
-png = "=0.18.1"
-

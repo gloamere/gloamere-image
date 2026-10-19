@@ -30,7 +30,41 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
+    let worker_args: Vec<_> = std::env::args_os().skip(1).collect();
     configure_taskbar_identity();
+    let _runtime_guard = match light_image_tool::updater::launch::RuntimeGuard::acquire() {
+        Ok(guard) => guard,
+        Err(error) => {
+            if worker_args
+                .first()
+                .is_some_and(|a| a == "--ai-pixel-worker")
+            {
+                std::process::exit(2);
+            }
+            rfd::MessageDialog::new()
+                .set_title("gloamere-image · 更新维护")
+                .set_description(error.to_string())
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+            std::process::exit(1);
+        }
+    };
+    if worker_args
+        .first()
+        .is_some_and(|a| a == "--ai-pixel-worker")
+    {
+        let result = match worker_args.as_slice() {
+            [_, pack] => light_image_tool::ai::model::worker_main(std::path::Path::new(pack)),
+            _ => Err(light_image_tool::ToolError::Invalid(
+                "模型 worker 参数无效".into(),
+            )),
+        };
+        if result.is_err() {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let is_smoke = args.first().is_some_and(|a| a == "--smoke");
     let initial = if is_smoke {
@@ -160,7 +194,7 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_icon(viewer_ui::window_icon())
             .with_inner_size(window_size)
-            .with_min_inner_size([800.0, 550.0]),
+            .with_min_inner_size([360.0, 320.0]),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: WgpuConfiguration {
             wgpu_setup: setup.into(),
@@ -176,6 +210,7 @@ fn main() {
             Box::new(move |cc| Ok(Box::new(app::ImageApp::new(cc, initial, smoke)))),
         )
     }));
+    log::info!("shutdown: eframe returned; renderer/window teardown completed");
     let failure = match outcome {
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some((false, error.to_string())),

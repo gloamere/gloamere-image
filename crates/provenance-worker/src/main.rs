@@ -330,7 +330,85 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     io::stdout().lock().write_all(&json)?;
     Ok(())
 }
+fn installed_session_guard() -> io::Result<Option<std::fs::File>> {
+    let current = std::env::current_exe()?;
+    if current
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|p| p.to_str())
+        != Some("runtime")
+    {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    let root = {
+        use windows_sys::Win32::{
+            System::Com::CoTaskMemFree,
+            UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath},
+        };
+        let mut text = std::ptr::null_mut();
+        let status = unsafe {
+            SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, std::ptr::null_mut(), &mut text)
+        };
+        if status < 0 || text.is_null() {
+            return Err(io::Error::other("cannot resolve LocalAppData"));
+        }
+        let mut length = 0;
+        unsafe {
+            while length < 32768 && *text.add(length) != 0 {
+                length += 1;
+            }
+        }
+        let path = if length < 32768 {
+            Some(
+                std::path::PathBuf::from(String::from_utf16_lossy(unsafe {
+                    std::slice::from_raw_parts(text, length)
+                }))
+                .join("LightImageTool/updater-state"),
+            )
+        } else {
+            None
+        };
+        unsafe {
+            CoTaskMemFree(text.cast());
+        }
+        path
+    };
+    #[cfg(not(windows))]
+    let root = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.join("Library/Application Support/LightImageTool/updater-state"));
+    let root = root.ok_or_else(|| io::Error::other("user update state unavailable"))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(root.join("sessions.lock"))?;
+    file.try_lock_shared()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(Some(file))
+}
 fn main() {
+    let _session = match installed_session_guard() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("worker update lock: {error}");
+            std::process::exit(2);
+        }
+    };
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == "--health-protocol")
+    {
+        if offline_context(DenyNetwork::default()).is_err() {
+            std::process::exit(2);
+        }
+        println!(
+            "{}",
+            serde_json::json!({"protocol":1,"version":env!("CARGO_PKG_VERSION"),"offline":true})
+        );
+        return;
+    }
     if let Err(e) = run() {
         eprintln!("provenance worker: {e}");
         std::process::exit(2);

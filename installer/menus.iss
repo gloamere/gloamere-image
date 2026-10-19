@@ -19,6 +19,8 @@ function MenuProfileMatches(Ext: String; Legacy: Boolean): Boolean;
 var Values: TDefaultAppValues;
 begin
   Result := False;
+  // Legacy releases never owned GIF/WebP menu verbs.
+  if Legacy and (Ext <> '.jpg') and (Ext <> '.jpeg') and (Ext <> '.png') then Exit;
   if Legacy and not LegacyInstallationOwned then Exit;
   if not RegKeyExists(HKCU, MenuKey(Ext)) then Exit;
   PopulateMenuValues(Values, Ext, Legacy);
@@ -60,6 +62,7 @@ end;
 procedure InstallMenus;
 begin
   InstallMenu('.jpg'); InstallMenu('.jpeg'); InstallMenu('.png');
+  InstallMenu('.gif'); InstallMenu('.webp');
 end;
 
 procedure RemoveOwnedMenu(Ext: String);

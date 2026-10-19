@@ -58,7 +58,9 @@ def stage_payload(release: Path, licenses: Path, output: Path, commit: str,
     inventory = copy.deepcopy(packaging.load_json(licenses / "inventory.json"))
     if not isinstance(inventory.get("packages"), list) or not inventory["packages"]:
         raise ValueError("License inventory must contain dependency packages")
-    copies = [(release / name, name) for name in ("gloamere-image.exe", "gloamere-image-worker.exe")]
+    copies = [(release / "gloamere-image.exe", "gloamere-image.exe"),
+              (release / "gloamere-image-ui.exe", "runtime/gloamere-image-ui.exe"),
+              (release / "gloamere-image-worker.exe", "runtime/gloamere-image-worker.exe")]
     copies.extend((project / name, name) for name in ("README.md", "LICENSE-MIT", "LICENSE-APACHE", "assets/gloamere-image.ico"))
     copies.append((report, "VALIDATION.md"))
     package_ids = set()
@@ -90,7 +92,7 @@ def stage_payload(release: Path, licenses: Path, output: Path, commit: str,
         records = []
         for local in packaging.regular_tree(output):
             relative = local.relative_to(output).as_posix()
-            if local.suffix.lower() in (".png", ".jpg", ".jpeg", ".cs", ".ttf", ".ttc", ".key"):
+            if local.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".cs", ".ttf", ".ttc", ".key"):
                 raise ValueError(f"Unexpected screenshot/font/client/key in staging: {relative}")
             records.append({"path": relative, "size_bytes": local.stat().st_size,
                             "sha256": packaging.sha256(local)})

@@ -13,6 +13,10 @@ pub const MAIN: Product = Product {
     binary: "gloamere-image",
     description: "gloamere-image",
 };
+pub const UI: Product = Product {
+    binary: "gloamere-image-ui",
+    description: "gloamere-image viewer",
+};
 pub const WORKER: Product = Product {
     binary: "gloamere-image-worker",
     description: "gloamere-image metadata and provenance worker",

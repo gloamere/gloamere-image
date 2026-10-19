@@ -14,6 +14,7 @@ import os
 import subprocess
 import struct
 import tempfile
+import tomllib
 import unittest
 import zipfile
 from pathlib import Path
@@ -44,7 +45,7 @@ class PackagingFixture(unittest.TestCase):
         self.project.mkdir()
         self.release = self.root / "release"
         self.release.mkdir()
-        for name in ("gloamere-image.exe", "gloamere-image-worker.exe"):
+        for name in ("gloamere-image.exe", "gloamere-image-ui.exe", "gloamere-image-worker.exe"):
             (self.release / name).write_bytes(b"MZfixture")
         for name in ("README.md", "LICENSE-MIT", "LICENSE-APACHE"):
             (self.project / name).write_text("fixture\n", "utf-8")
@@ -89,7 +90,7 @@ class PackagingFixture(unittest.TestCase):
         result = self.make_payload()
         manifest = build.validate_payload(self.payload)
         self.assertEqual(manifest["product"], "gloamere-image")
-        self.assertEqual(manifest["version"], "0.4.0")
+        self.assertEqual(manifest["version"], build.VERSION)
         self.assertFalse(result["distribution_archive_created"])
         self.assertFalse(list(self.project.rglob("*.zip")))
         self.assertNotIn("light-image-tool.exe", [entry["path"] for entry in manifest["files"]])
@@ -131,7 +132,7 @@ class PackagingFixture(unittest.TestCase):
 
     def test_invalid_icon_and_non_pe_are_rejected_even_with_correct_hash(self):
         self.make_payload()
-        for name in ("assets/gloamere-image.ico", "gloamere-image.exe", "gloamere-image-worker.exe"):
+        for name in ("assets/gloamere-image.ico", "gloamere-image.exe", "runtime/gloamere-image-ui.exe", "runtime/gloamere-image-worker.exe"):
             with self.subTest(name=name):
                 local = self.payload / name
                 original = local.read_bytes()
@@ -246,6 +247,18 @@ class PackagingFixture(unittest.TestCase):
         self.assertFalse(self.payload.exists())
         self.assertTrue((self.project / "README.md").exists())
 
+    def test_image_fixtures_including_new_formats_cannot_enter_setup_payload(self):
+        for extension in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".GIF", ".WebP"):
+            relative = "dependency-1.0.0/unexpected" + extension
+            original = self.licenses / relative
+            original.write_bytes(b"ordinary fixture image sentinel")
+            self.inventory["packages"][0]["notices"] = [relative]
+            self.write_inventory()
+            with self.subTest(extension=extension), self.assertRaisesRegex(ValueError, "Unexpected screenshot"):
+                self.make_payload()
+            self.assertFalse(self.payload.exists())
+            self.assertEqual(original.read_bytes(), b"ordinary fixture image sentinel")
+
     def test_existing_staging_is_preserved(self):
         self.make_payload()
         before = (self.payload / "MANIFEST.json").read_bytes()
@@ -293,18 +306,23 @@ class PackagingFixture(unittest.TestCase):
         self.make_payload()
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, "w") as output:
-            output.writestr("Cargo.toml", "fixture")
+            for name in ("Cargo.toml", "crates/provenance-worker/Cargo.toml"):
+                output.writestr(name, f'[package]\nversion="{build.VERSION}"\n')
             output.writestr("SOURCE-MANIFEST.json", "stale")
             output.writestr("AGENTS.md", "private")
             output.writestr(".codex/private", "private")
+            output.writestr("docs/implementation-v0.2.md", "historical delivery identifier")
+            output.writestr("docs/v05-candidate-acceptance.md", "Current product acceptance")
             output.writestr("third-party-notices/stale", "stale")
-        destination = self.project / "dist/gloamere-image-0.4.0-source.zip"
+        destination = self.project / f"dist/gloamere-image-{build.VERSION}-source.zip"
         with mock.patch.object(source.subprocess, "check_output", side_effect=["a" * 40, archive.getvalue()]):
             result = source.package_source("HEAD", self.payload / "third-party-notices", destination, self.project)
         self.assertTrue(result["zip_crc_verified"])
         with zipfile.ZipFile(destination) as output:
             self.assertNotIn("AGENTS.md", output.namelist())
             self.assertNotIn(".codex/private", output.namelist())
+            self.assertNotIn("docs/implementation-v0.2.md", output.namelist())
+            self.assertIn("docs/v05-candidate-acceptance.md", output.namelist())
             self.assertNotIn("third-party-notices/stale", output.namelist())
             manifest = json.loads(output.read("SOURCE-MANIFEST.json"))
             self.assertNotIn("SOURCE-MANIFEST.json", [entry["path"] for entry in manifest["files"]])
@@ -316,10 +334,27 @@ class PackagingFixture(unittest.TestCase):
         (self.payload / "third-party-notices/extra").write_text("unexpected")
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, "w") as output:
-            output.writestr("Cargo.toml", "fixture")
+            for name in ("Cargo.toml", "crates/provenance-worker/Cargo.toml"):
+                output.writestr(name, f'[package]\nversion="{build.VERSION}"\n')
         with mock.patch.object(source.subprocess, "check_output", side_effect=["a" * 40, archive.getvalue()]):
             with self.assertRaisesRegex(ValueError, "Unlisted or missing"):
                 source.package_source("HEAD", self.payload / "third-party-notices", self.project / "dist/source.zip", self.project)
+
+    def test_source_archive_cannot_label_an_old_or_mixed_commit_as_new_candidate(self):
+        self.make_payload()
+        for main_version, worker_version in (("0.4.0", "0.4.0"), (build.VERSION, "0.4.0"),
+                                             ("0.4.0", build.VERSION), (build.VERSION, None)):
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w") as output:
+                output.writestr("Cargo.toml", f'[package]\nversion="{main_version}"\n')
+                if worker_version:
+                    output.writestr("crates/provenance-worker/Cargo.toml", f'[package]\nversion="{worker_version}"\n')
+            destination = self.project / "dist/mismatched-source.zip"
+            with self.subTest(main=main_version, worker=worker_version), \
+                    mock.patch.object(source.subprocess, "check_output", side_effect=["a" * 40, archive.getvalue()]):
+                with self.assertRaisesRegex(ValueError, "Source archive"):
+                    source.package_source("HEAD", self.payload / "third-party-notices", destination, self.project)
+            self.assertFalse(destination.exists())
 
 
 
@@ -602,14 +637,49 @@ class LicenseCollectionTests(unittest.TestCase):
         (registry / "Cargo.toml").write_text('[package]\nname="dependency"\nversion="1.0.0"\nlicense="MIT"\n')
         (registry / "LICENSE").write_text("MIT fixture")
         tree = self.root / "tree.txt"
-        workspace_names = []
-        import tomllib
-        for local in (ROOT / "Cargo.toml", ROOT / "crates/provenance-worker/Cargo.toml"):
-            workspace_names.append(tomllib.loads(local.read_text())["package"]["name"])
-        tree.write_text("\n".join([name + " v0.4.0" for name in workspace_names] + ["dependency v1.0.0"]))
+        workspace_packages = []
+        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        manifests = [ROOT / "Cargo.toml"] + [ROOT / member / "Cargo.toml" for member in manifest["workspace"]["members"]]
+        for local in manifests:
+            package = tomllib.loads(local.read_text())["package"]
+            workspace_packages.append(package["name"] + " v" + package["version"])
+        self.assertTrue(any(entry.startswith("safeupdate-core v") for entry in workspace_packages))
+        tree.write_text("\n".join(workspace_packages + ["dependency v1.0.0"]))
         result = collect.collect(tree, self.root / "registry", self.root / "collected", None)
         self.assertEqual(result["packages"], 1)
         self.assertEqual(result["notices"], 1)
+
+    def test_workspace_discovery_includes_new_member_and_exact_versions(self):
+        project = self.root / "future-workspace"
+        (project / "crates/new-member").mkdir(parents=True)
+        (project / "Cargo.toml").write_text('[package]\nname="root"\nversion="1.0.0"\n[workspace]\nmembers=["crates/new-member"]\n')
+        (project / "crates/new-member/Cargo.toml").write_text('[package]\nname="new-member"\nversion="2.0.0"\n')
+        self.assertEqual(collect.workspace_packages(project), {("root", "1.0.0"), ("new-member", "2.0.0")})
+        registry = self.root / "registry/index/new-member-1.0.0"
+        registry.mkdir(parents=True)
+        (registry / "Cargo.toml").write_text('[package]\nname="new-member"\nversion="1.0.0"\nlicense="MIT"\n')
+        (registry / "LICENSE").write_text("MIT fixture")
+        tree = self.root / "tree.txt"
+        tree.write_text("root v1.0.0\nnew-member v2.0.0\nnew-member v1.0.0\n")
+        with mock.patch.object(collect, "PROJECT", project):
+            result = collect.collect(tree, self.root / "registry", self.root / "collected", None)
+        self.assertEqual(result["packages"], 1)
+
+    def test_workspace_member_paths_fail_closed(self):
+        project = self.root / "unsafe-workspace"
+        project.mkdir()
+        for member in ("../outside", "crates/*"):
+            (project / "Cargo.toml").write_text('[workspace]\nmembers=[' + json.dumps(member) + ']\n')
+            with self.subTest(member=member), self.assertRaises(ValueError):
+                collect.workspace_packages(project)
+
+    def test_tree_drawing_cannot_silently_produce_zero_dependency_notices(self):
+        tree = self.root / "tree.txt"
+        package = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]
+        tree.write_text(f'{package["name"]} v{package["version"]}\n└── dependency v1.0.0\n', "utf-8")
+        with self.assertRaisesRegex(ValueError, "No external dependencies parsed"):
+            collect.collect(tree, self.root / "registry", self.root / "collected", None)
+        self.assertFalse((self.root / "collected").exists())
 
     def test_new_license_gap_fails_with_inventory_evidence(self):
         registry = self.root / "registry/index/dependency-1.0.0"
@@ -645,6 +715,17 @@ class ReleaseCommandContracts(unittest.TestCase):
         self.assertNotIn("zipfile", wrapper)
         self.assertIn("stage-installer-payload.py", wrapper)
 
+    def test_animation_core_duration_is_reported_and_logs_are_live(self):
+        script = (ROOT / "scripts/build-release.ps1").read_text()
+        self.assertIn("[UInt64]$animationSoakSeconds = 1800", script)
+        self.assertIn("GLOAMERE_ANIMATION_SOAK_SECONDS", script)
+        self.assertIn("seconds_per_profile = $animationSoakSeconds", script)
+        self.assertIn("'short_smoke_only'", script)
+        self.assertIn("gui_playback_qa = 'not_run'", script)
+        for gate in ("debug_tests", "release_tests"):
+            line = next(line for line in script.splitlines() if "Invoke-Gate '" + gate + "'" in line)
+            self.assertIn("'--include-ignored', '--nocapture', '--test-threads=1'", line)
+
     def test_silent_success_has_nonnull_log_lines(self):
         script = (ROOT / "scripts/build-release.ps1").read_text()
         gate = script.split("function Invoke-Gate", 1)[1].split("Push-Location", 1)[0]
@@ -656,7 +737,38 @@ class ReleaseCommandContracts(unittest.TestCase):
     def test_stable_identity_and_unsigned_exe_name(self):
         self.assertEqual(build.PRODUCT_ID, "9CCB6F43-7782-4F69-9E91-67C6D144737B")
         self.assertEqual(build.OWNER_MARKER, "LIGHT-IMAGE-INSTALL.txt")
-        self.assertEqual(build.INSTALLER_NAME, "gloamere-image-0.4.0-Win64-Setup-unsigned.exe")
+        self.assertEqual(build.INSTALLER_NAME, f"gloamere-image-{build.VERSION}-Win64-Setup-unsigned.exe")
+        self.assertEqual(build.VERSION, tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"])
+        installer = (ROOT / "installer/light-image-tool.iss").read_text("utf-8")
+        self.assertIn(f'#define ProductVersion "{build.VERSION}"', installer)
+
+    def test_pipeline_reuses_paired_candidate_version_for_report_and_pe_gate(self):
+        script = (ROOT / "scripts/build-release.ps1").read_text()
+        self.assertIn("'build-installer.py') --print-version", script)
+        self.assertIn("$report['version'] = $productVersion", script)
+        self.assertIn("'--version', $productVersion", script)
+        self.assertIn('"# gloamere-image $productVersion build validation', script)
+        self.assertNotIn("0.4.0", script)
+
+    def test_version_cli_has_no_build_or_windows_requirement(self):
+        result = subprocess.run([os.sys.executable, str(ROOT / "scripts/build-installer.py"), "--print-version"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), build.VERSION)
+
+    def test_candidate_version_rejects_mismatched_or_invalid_manifests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            worker = project / "crates/provenance-worker/Cargo.toml"
+            worker.parent.mkdir(parents=True)
+            for main_version, worker_version in (("0.5.0", "0.4.0"), ("0.5.0-beta", "0.5.0-beta"),
+                                                 ("65536.0.0", "65536.0.0")):
+                (project / "Cargo.toml").write_text('[package]\nversion="' + main_version + '"\n')
+                worker.write_text('[package]\nversion="' + worker_version + '"\n')
+                with self.subTest(main=main_version, worker=worker_version), self.assertRaises(ValueError):
+                    build.candidate_version(project)
+            (project / "Cargo.toml").write_text('[package]\nversion="0.5.0"\n')
+            worker.write_text('[package]\nversion="0.5.0"\n')
+            self.assertEqual(build.candidate_version(project), "0.5.0")
 
 
 if __name__ == "__main__":

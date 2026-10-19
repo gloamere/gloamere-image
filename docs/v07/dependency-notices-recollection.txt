@@ -1,0 +1,11 @@
+{
+  "packages": 449,
+  "notices": 819,
+  "declaration_fallbacks": [
+    "btree-range-map-0.7.2",
+    "range-traits-0.3.2",
+    "static-regular-grammar-2.0.2",
+    "typed-path-0.9.3"
+  ],
+  "missing": []
+}

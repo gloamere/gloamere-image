@@ -1,0 +1,44 @@
+# v0.7 updater implementation and verification boundary
+
+## What is implemented
+
+The app and optional model update choices are independent and default off. The existing schema-1 `settings.json` and `ai-settings.json` are not expanded. Updater preferences are in `update-settings.json`; Windows updater state and locks use the OS-resolved current user's LocalAppData/LightImageTool/updater-state, independent of image-settings overrides.
+
+The stable `gloamere-image.exe` launches `runtime/gloamere-image-ui.exe`; the provenance worker is next to the UI. All runtime workers participate in the same session locking protocol. Setup and uninstall use product-owned current-user locks. New open requests retain their arguments while waiting on actual lock ownership (up to two minutes, then an explicit maintenance error); hiding a window is never permission to install.
+
+A checked update passes maintained `tough` TUF verification, persistent role/release floors, expiry and clock checks, scope/compatibility checks, bounded HTTPS download/resume, exact length/hash validation and Windows executable policy. A saved pending JSON is an expectation, never executable authority: the exit helper re-fetches signed metadata and obtains a new opaque verified target. It compares the exact release, target, size and hash, then revalidates under the trust-state lock immediately before process creation. Redirects cannot leave the configured HTTPS origin; the exact IP must have a valid public TLS certificate. Normal system proxy/certificate trust applies.
+
+The user selected direct IP distribution and has no Authenticode certificate. The reviewed build policy may explicitly accept a TUF-authenticated unsigned PE; it never treats a present bad or unexpected signature as unsigned. A signed policy additionally pins the exact leaf certificate DER SHA-256 after WinVerifyTrust. No source/remoting configuration can silently alter that compiled policy. Windows warnings and security blocks are respected.
+
+Custom-download OS-zone limitation: the current HTTPS downloader writes a new partial file and atomically publishes it; it does not call Windows Attachment Services or synthesize a Zone.Identifier stream. The exit helper uses direct process creation with fixed Setup arguments. This is not evidence that SmartScreen will display, or that an installer is guaranteed to run without prompts. Existing zone streams are never stripped, and no Unblock-File, security-policy change or warning bypass is used. Native acceptance must separately exercise marked browser/Explorer downloads and internal updater downloads under the actual SmartScreen, Defender, WDAC and UAC policies; a policy block must remain a failure/deferred update.
+
+The UI never installs while running. A normal-close ticket is written only after user-work gates and joined background jobs. The stable launcher validates the actual child PID and per-launch challenge; an external copy of the stable helper proves its real parent PID/creation time/image, opens that process handle, signals a ready event, and waits for that exact process to end. It does not kill any UI, installer or other user's process. Shutdown/logoff observation suppresses installation.
+
+Setup uses its extracted native transaction helper to persist verified old payload, permissions, exact product registry and shortcut state before changes. Bootstrap installs the new stable entry atomically; ordinary update leaves it unchanged. Recovery restores non-root files and integration first and the old root last. Health confirmation requires the exact package/version/protocol, readable settings, an embedded-image decode, actual required provenance-worker version/protocol and UI event-loop frames. It neither reads user images nor requires the optional pixel model.
+
+An installer exit code of zero only reaches pending health. 3010 or ambiguous pending reboot operations retain evidence and require repair. No restartreplace, delayed-at-reboot replacement, elevation, automatic process closure, UAC/SmartScreen bypass or default-association takeover is permitted. Unclear foreign/new filesystem effects fail closed; known old product preimages are restored under durable write intent. After durable healthy commit, bounded cleanup retains the current recovery set and its exact predecessor; the current set includes the previous healthy payload preimages. Older exact-owned terminal snapshots are retired through individually journaled deletions under the maintenance lock. Changed, foreign, ambiguous, linked, pending or legacy-unidentified sets remain untouched. Durable cleanup receipts are capped at 128 records and 16 MiB; reaching the cap defers cleanup without rejecting the healthy UI. There is no recursive cleanup of an installation or download directory. A completed application download is retired only after matching healthy commit, under task/download locks and exact full-receipt/hash checks; a newer task or changed receipt is preserved. Cleanup failures never turn a healthy commit into rollback.
+
+## Independent model updates
+
+Only an already installed, verified component can enter the model-update job. Its own consent, startup delay, bounded retry and metered download permission are independent of application updates. Preparation uses a constructor-private signed model target, strict compiled compatibility/content/license hashes, a bounded fixed ZIP inventory, exact expanded-size checks on the actual model volume, and real self-test. Switching is an atomic write-through pointer to an immutable version directory; the previous component remains available for startup recovery. Model release floors and failed-release quarantine are independent from app release tracking. A repository cannot approve detector accuracy or install an arbitrary new graph/runtime.
+
+Both transfer schedulers pause when network cost, battery/energy saver or active user work changes. Pausing preserves only verified-bound resume fragments; explicit cancellation drains the job before task-specific cleanup. Model activation rechecks current consent and exact installed identity, while keeping the job's publication gate alive through the pointer replacement. Original files and manual records are preserved; only incompatible automatic pixel results expire.
+
+## Provisioning is intentionally absent
+
+`ProductionConfig::bundled()` has no embedded deployment root and returns NotConfigured. The server has not been contacted or changed. A confirmed address alone cannot authorize a package. The UI records the user's choice and explains why the candidate makes no automatic request or installation. Activating production requires separately reviewed root provisioning, valid IP HTTPS and operational renewal, a signed release repository, actual Windows build/install/recovery acceptance and the chosen executable policy. Test keys and fixture repositories are not production trust. The public-only bootstrap manifest/root import and offline key-provisioning source tool are provided for a separately approved future build. There is no runtime or environment-variable trust switch; this candidate still embeds no root. The offline helper has not created production keys and requires native Windows verification and the owner's explicit approval before use.
+
+## Verification
+
+Cloud Linux unit/fixture tests validate state transitions, complete snapshot/restoration, fault boundaries, legacy integration profiles, tamper/path/lock denial, consent/cancellation, trusted metadata and download faults. A Windows cfg adapter checks real Win32 source against MSVC bindings when the full dependency cross-build is unavailable. These are not Windows execution evidence.
+
+The final acceptance report records exact commands and counts for the final source snapshot. Required native acceptance remains standard-user Windows 10/11, clean bootstrap, v0.6 upgrade and a second distinct release, process ownership/multi-instance races, paths with Chinese and spaces, power-loss boundaries, raw ACL/registry/shortcut readback, real TLS and OS protection behavior. Source work does not publish, push a branch, sign a release or modify a user's installed application.
+
+## Primary technical references
+
+- TUF specification: https://theupdateframework.github.io/specification/latest/
+- Inno Setup command-line parameters: https://jrsoftware.org/ishelp/topic_setupcmdline.htm
+- WinVerifyTrust: https://learn.microsoft.com/en-us/windows/win32/api/wintrust/nf-wintrust-winverifytrust
+- File access rights including FILE_DELETE_CHILD: https://learn.microsoft.com/en-us/windows/win32/fileio/file-access-rights-constants
+- WM_QUERYENDSESSION: https://learn.microsoft.com/en-us/windows/win32/shutdown/wm-queryendsession
+- GetNetworkConnectivityHint (dynamically resolved, Windows 10 2004+): https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getnetworkconnectivityhint

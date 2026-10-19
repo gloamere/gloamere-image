@@ -47,12 +47,16 @@ fn report_cache_is_bounded_by_serialized_bytes() {
 }
 
 fn worker() -> PathBuf {
-    support::profile_dir().join("gloamere-image-worker.exe")
+    support::profile_dir().join(if cfg!(windows) {
+        "gloamere-image-worker.exe"
+    } else {
+        "gloamere-image-worker"
+    })
 }
 
 #[test]
 #[ignore = "requires built workspace worker; run explicitly after cargo build --workspace"]
-fn real_windows_job_worker_reads_no_credential_fixture() {
+fn real_worker_reads_no_credential_fixture() {
     let mut bytes = Vec::new();
     let img = image::RgbaImage::from_pixel(4, 3, image::Rgba([10, 20, 30, 128]));
     image::DynamicImage::ImageRgba8(img)
@@ -88,7 +92,7 @@ fn file_mutation_cannot_reuse_loaded_source_identity() {
 
 #[test]
 #[ignore = "requires built workspace worker; scripts/verify.ps1 includes ignored integration tests"]
-fn real_windows_worker_classifies_signed_tampered_remote_and_ocsp_fixtures() {
+fn real_worker_classifies_signed_tampered_remote_and_ocsp_fixtures() {
     for (name, bytes) in [
         (
             "signed",

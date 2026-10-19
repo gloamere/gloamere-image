@@ -1,0 +1,363 @@
+safeupdate-core v0.7.0 (/workspace/scratch/509a263196e7/gloamere-image-v07/source/crates/update-security) MIT OR Apache-2.0
+futures-util v0.3.34 MIT OR Apache-2.0
+futures-channel v0.3.34 MIT OR Apache-2.0
+futures-core v0.3.34 MIT OR Apache-2.0
+futures-sink v0.3.34 MIT OR Apache-2.0
+futures-core v0.3.34 MIT OR Apache-2.0
+futures-io v0.3.34 MIT OR Apache-2.0
+futures-macro v0.3.34 (proc-macro) MIT OR Apache-2.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0
+unicode-ident v1.0.26 (MIT OR Apache-2.0) AND Unicode-3.0
+quote v1.0.47 MIT OR Apache-2.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+syn v3.0.6 MIT OR Apache-2.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+unicode-ident v1.0.26 (MIT OR Apache-2.0) AND Unicode-3.0
+futures-sink v0.3.34 MIT OR Apache-2.0
+futures-task v0.3.34 MIT OR Apache-2.0
+memchr v2.8.3 Unlicense OR MIT
+pin-project-lite v0.2.17 Apache-2.0 OR MIT
+slab v0.4.12 MIT
+hex v0.4.3 MIT OR Apache-2.0
+jiff v0.2.38 Unlicense OR MIT
+jiff-core v0.1.1 Unlicense OR MIT
+jiff-tzdb-platform v0.1.3 Unlicense OR MIT
+jiff-tzdb v0.1.9 Unlicense OR MIT
+serde_core v1.0.229 MIT OR Apache-2.0
+windows-link v0.2.1 MIT OR Apache-2.0
+reqwest v0.12.28 MIT OR Apache-2.0
+base64 v0.22.1 MIT OR Apache-2.0
+bytes v1.12.1 MIT
+futures-core v0.3.34 MIT OR Apache-2.0
+futures-util v0.3.34 MIT OR Apache-2.0 (*)
+http v1.5.0 MIT OR Apache-2.0
+bytes v1.12.1 MIT
+itoa v1.0.18 MIT OR Apache-2.0
+http-body v1.1.0 MIT
+bytes v1.12.1 MIT
+http v1.5.0 MIT OR Apache-2.0 (*)
+http-body-util v0.1.5 MIT
+bytes v1.12.1 MIT
+futures-core v0.3.34 MIT OR Apache-2.0
+http v1.5.0 MIT OR Apache-2.0 (*)
+http-body v1.1.0 MIT (*)
+pin-project-lite v0.2.17 Apache-2.0 OR MIT
+hyper v1.12.0 MIT
+atomic-waker v1.1.2 Apache-2.0 OR MIT
+bytes v1.12.1 MIT
+futures-core v0.3.34 MIT OR Apache-2.0
+http v1.5.0 MIT OR Apache-2.0 (*)
+http-body v1.1.0 MIT (*)
+httparse v1.10.1 MIT OR Apache-2.0
+itoa v1.0.18 MIT OR Apache-2.0
+pin-project-lite v0.2.17 Apache-2.0 OR MIT
+smallvec v1.16.2 MIT OR Apache-2.0
+tokio v1.53.2 MIT
+bytes v1.12.1 MIT
+mio v1.2.4 MIT
+windows-sys v0.61.2 MIT OR Apache-2.0
+windows-link v0.2.1 MIT OR Apache-2.0
+pin-project-lite v0.2.17 Apache-2.0 OR MIT
+socket2 v0.6.5 MIT OR Apache-2.0
+windows-sys v0.61.2 MIT OR Apache-2.0 (*)
+tokio-macros v2.7.2 (proc-macro) MIT
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+syn v3.0.6 MIT OR Apache-2.0 (*)
+windows-sys v0.61.2 MIT OR Apache-2.0 (*)
+want v0.3.2 MIT
+try-lock v0.2.5 MIT
+hyper-rustls v0.27.10 Apache-2.0 OR ISC OR MIT
+http v1.5.0 MIT OR Apache-2.0 (*)
+hyper v1.12.0 MIT (*)
+hyper-util v0.1.21 MIT
+base64 v0.23.1 MIT OR Apache-2.0
+bytes v1.12.1 MIT
+futures-channel v0.3.34 MIT OR Apache-2.0 (*)
+futures-util v0.3.34 MIT OR Apache-2.0 (*)
+http v1.5.0 MIT OR Apache-2.0 (*)
+http-body v1.1.0 MIT (*)
+httparse v1.10.1 MIT OR Apache-2.0
+hyper v1.12.0 MIT (*)
+ipnet v2.12.2 MIT OR Apache-2.0
+libc v0.2.190 MIT OR Apache-2.0
+percent-encoding v2.3.2 MIT OR Apache-2.0
+pin-project-lite v0.2.17 Apache-2.0 OR MIT
+socket2 v0.6.5 MIT OR Apache-2.0 (*)
+tokio v1.53.2 MIT (*)
+tower-service v0.3.3 MIT
+tracing v0.1.44 MIT
+pin-project-lite v0.2.17 Apache-2.0 OR MIT
+tracing-core v0.1.36 MIT
+once_cell v1.21.4 MIT OR Apache-2.0
+windows-registry v0.6.1 MIT OR Apache-2.0
+windows-link v0.2.1 MIT OR Apache-2.0
+windows-result v0.4.1 MIT OR Apache-2.0
+windows-link v0.2.1 MIT OR Apache-2.0
+windows-strings v0.5.1 MIT OR Apache-2.0
+windows-link v0.2.1 MIT OR Apache-2.0
+rustls v0.23.45 Apache-2.0 OR ISC OR MIT
+aws-lc-rs v1.18.1 ISC AND (Apache-2.0 OR ISC)
+aws-lc-sys v0.45.0 ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)
+cc v1.6.0 MIT OR Apache-2.0
+find-msvc-tools v0.1.14 MIT OR Apache-2.0
+jobserver v0.1.35 MIT OR Apache-2.0
+libc v0.2.190 MIT OR Apache-2.0
+libc v0.2.190 MIT OR Apache-2.0
+shlex v2.0.1 MIT OR Apache-2.0
+cmake v0.1.58 MIT OR Apache-2.0
+cc v1.6.0 MIT OR Apache-2.0 (*)
+dunce v1.0.5 CC0-1.0 OR MIT-0 OR Apache-2.0
+fs_extra v1.3.0 MIT
+pkg-config v0.3.34 MIT OR Apache-2.0
+untrusted v0.7.1 ISC
+zeroize v1.9.1 Apache-2.0 OR MIT
+log v0.4.34 MIT OR Apache-2.0
+once_cell v1.21.4 MIT OR Apache-2.0
+rustls-pki-types v1.15.1 MIT OR Apache-2.0
+zeroize v1.9.1 Apache-2.0 OR MIT
+rustls-webpki v0.103.15 ISC
+aws-lc-rs v1.18.1 ISC AND (Apache-2.0 OR ISC) (*)
+rustls-pki-types v1.15.1 MIT OR Apache-2.0 (*)
+untrusted v0.9.0 ISC
+subtle v2.6.1 BSD-3-Clause
+zeroize v1.9.1 Apache-2.0 OR MIT
+rustls-native-certs v0.8.4 Apache-2.0 OR ISC OR MIT
+rustls-pki-types v1.15.1 MIT OR Apache-2.0 (*)
+schannel v0.1.29 MIT
+windows-sys v0.61.2 MIT OR Apache-2.0 (*)
+tokio v1.53.2 MIT (*)
+tokio-rustls v0.26.6 MIT OR Apache-2.0
+rustls v0.23.45 Apache-2.0 OR ISC OR MIT (*)
+tokio v1.53.2 MIT (*)
+tower-service v0.3.3 MIT
+hyper-util v0.1.21 MIT (*)
+log v0.4.34 MIT OR Apache-2.0
+percent-encoding v2.3.2 MIT OR Apache-2.0
+pin-project-lite v0.2.17 Apache-2.0 OR MIT
+rustls v0.23.45 Apache-2.0 OR ISC OR MIT (*)
+rustls-native-certs v0.8.4 Apache-2.0 OR ISC OR MIT (*)
+rustls-pki-types v1.15.1 MIT OR Apache-2.0 (*)
+serde v1.0.229 MIT OR Apache-2.0
+serde_core v1.0.229 MIT OR Apache-2.0
+serde_derive v1.0.229 (proc-macro) MIT OR Apache-2.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+syn v3.0.6 MIT OR Apache-2.0 (*)
+serde_urlencoded v0.7.1 MIT/Apache-2.0
+form_urlencoded v1.2.2 MIT OR Apache-2.0
+percent-encoding v2.3.2 MIT OR Apache-2.0
+itoa v1.0.18 MIT OR Apache-2.0
+ryu v1.0.23 Apache-2.0 OR BSL-1.0
+serde v1.0.229 MIT OR Apache-2.0 (*)
+sync_wrapper v1.0.2 Apache-2.0
+futures-core v0.3.34 MIT OR Apache-2.0
+tokio v1.53.2 MIT (*)
+tokio-rustls v0.26.6 MIT OR Apache-2.0 (*)
+tokio-util v0.7.20 MIT
+bytes v1.12.1 MIT
+futures-core v0.3.34 MIT OR Apache-2.0
+futures-sink v0.3.34 MIT OR Apache-2.0
+futures-util v0.3.34 MIT OR Apache-2.0 (*)
+pin-project-lite v0.2.17 Apache-2.0 OR MIT
+tokio v1.53.2 MIT (*)
+tower v0.5.3 MIT
+futures-core v0.3.34 MIT OR Apache-2.0
+futures-util v0.3.34 MIT OR Apache-2.0 (*)
+pin-project-lite v0.2.17 Apache-2.0 OR MIT
+sync_wrapper v1.0.2 Apache-2.0 (*)
+tokio v1.53.2 MIT (*)
+tower-layer v0.3.3 MIT
+tower-service v0.3.3 MIT
+tower-http v0.6.11 MIT
+bitflags v2.13.2 MIT OR Apache-2.0
+bytes v1.12.1 MIT
+futures-util v0.3.34 MIT OR Apache-2.0 (*)
+http v1.5.0 MIT OR Apache-2.0 (*)
+http-body v1.1.0 MIT (*)
+pin-project-lite v0.2.17 Apache-2.0 OR MIT
+tower v0.5.3 MIT (*)
+tower-layer v0.3.3 MIT
+tower-service v0.3.3 MIT
+url v2.5.8 MIT OR Apache-2.0
+form_urlencoded v1.2.2 MIT OR Apache-2.0 (*)
+idna v1.1.0 MIT OR Apache-2.0
+idna_adapter v1.2.2 Apache-2.0 OR MIT
+icu_normalizer v2.3.0 Unicode-3.0
+icu_collections v2.3.0 Unicode-3.0
+displaydoc v0.2.7 (proc-macro) MIT OR Apache-2.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+syn v3.0.6 MIT OR Apache-2.0 (*)
+potential_utf v0.1.6 Unicode-3.0
+zerovec v0.11.8 Unicode-3.0
+yoke v0.8.3 Unicode-3.0
+stable_deref_trait v1.2.1 MIT OR Apache-2.0
+yoke-derive v0.8.4 (proc-macro) Unicode-3.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+syn v3.0.6 MIT OR Apache-2.0 (*)
+synstructure v0.14.0 MIT
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+syn v3.0.6 MIT OR Apache-2.0 (*)
+zerofrom v0.1.8 Unicode-3.0
+zerofrom-derive v0.1.8 (proc-macro) Unicode-3.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+syn v3.0.6 MIT OR Apache-2.0 (*)
+synstructure v0.14.0 MIT (*)
+zerofrom v0.1.8 Unicode-3.0 (*)
+zerovec-derive v0.11.6 (proc-macro) Unicode-3.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+syn v3.0.6 MIT OR Apache-2.0 (*)
+utf8_iter v1.0.4 Apache-2.0 OR MIT
+yoke v0.8.3 Unicode-3.0 (*)
+zerofrom v0.1.8 Unicode-3.0 (*)
+zerovec v0.11.8 Unicode-3.0 (*)
+icu_normalizer_data v2.3.0 Unicode-3.0
+icu_provider v2.3.1 Unicode-3.0
+displaydoc v0.2.7 (proc-macro) MIT OR Apache-2.0 (*)
+icu_locale_core v2.3.0 Unicode-3.0
+displaydoc v0.2.7 (proc-macro) MIT OR Apache-2.0 (*)
+litemap v0.8.3 Unicode-3.0
+tinystr v0.8.4 Unicode-3.0
+displaydoc v0.2.7 (proc-macro) MIT OR Apache-2.0 (*)
+zerovec v0.11.8 Unicode-3.0 (*)
+writeable v0.6.4 Unicode-3.0
+zerovec v0.11.8 Unicode-3.0 (*)
+writeable v0.6.4 Unicode-3.0
+yoke v0.8.3 Unicode-3.0 (*)
+zerofrom v0.1.8 Unicode-3.0 (*)
+zerotrie v0.2.5 Unicode-3.0
+displaydoc v0.2.7 (proc-macro) MIT OR Apache-2.0 (*)
+yoke v0.8.3 Unicode-3.0 (*)
+zerofrom v0.1.8 Unicode-3.0 (*)
+zerovec v0.11.8 Unicode-3.0 (*)
+smallvec v1.16.2 MIT OR Apache-2.0
+zerovec v0.11.8 Unicode-3.0 (*)
+icu_properties v2.3.0 Unicode-3.0
+displaydoc v0.2.7 (proc-macro) MIT OR Apache-2.0 (*)
+icu_collections v2.3.0 Unicode-3.0 (*)
+icu_locale_core v2.3.0 Unicode-3.0 (*)
+icu_properties_data v2.3.0 Unicode-3.0
+icu_provider v2.3.1 Unicode-3.0 (*)
+zerotrie v0.2.5 Unicode-3.0 (*)
+zerovec v0.11.8 Unicode-3.0 (*)
+smallvec v1.16.2 MIT OR Apache-2.0
+utf8_iter v1.0.4 Apache-2.0 OR MIT
+percent-encoding v2.3.2 MIT OR Apache-2.0
+tower-service v0.3.3 MIT
+url v2.5.8 MIT OR Apache-2.0 (*)
+rustls v0.23.45 Apache-2.0 OR ISC OR MIT (*)
+serde v1.0.229 MIT OR Apache-2.0 (*)
+serde_json v1.0.151 MIT OR Apache-2.0
+itoa v1.0.18 MIT OR Apache-2.0
+memchr v2.8.3 Unlicense OR MIT
+serde_core v1.0.229 MIT OR Apache-2.0
+zmij v1.0.23 MIT
+sha2 v0.10.9 MIT OR Apache-2.0
+cfg-if v1.0.5 MIT OR Apache-2.0
+cpufeatures v0.2.17 MIT OR Apache-2.0
+digest v0.10.7 MIT OR Apache-2.0
+block-buffer v0.10.4 MIT OR Apache-2.0
+generic-array v0.14.9 MIT
+typenum v1.20.1 MIT OR Apache-2.0
+version_check v0.9.5 MIT/Apache-2.0
+crypto-common v0.1.6 MIT OR Apache-2.0
+generic-array v0.14.9 MIT (*)
+typenum v1.20.1 MIT OR Apache-2.0
+tempfile v3.27.0 MIT OR Apache-2.0
+fastrand v2.5.0 Apache-2.0 OR MIT
+getrandom v0.4.3 MIT OR Apache-2.0
+cfg-if v1.0.5 MIT OR Apache-2.0
+once_cell v1.21.4 MIT OR Apache-2.0
+windows-sys v0.61.2 MIT OR Apache-2.0 (*)
+thiserror v2.0.21 MIT OR Apache-2.0
+thiserror-impl v2.0.21 (proc-macro) MIT OR Apache-2.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+syn v3.0.6 MIT OR Apache-2.0 (*)
+tokio v1.53.2 MIT (*)
+tokio-util v0.7.20 MIT (*)
+tough v0.24.0 MIT OR Apache-2.0
+async-recursion v1.2.0 (proc-macro) MIT OR Apache-2.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+syn v3.0.6 MIT OR Apache-2.0 (*)
+async-trait v0.1.92 (proc-macro) MIT OR Apache-2.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+syn v3.0.6 MIT OR Apache-2.0 (*)
+aws-lc-rs v1.18.1 ISC AND (Apache-2.0 OR ISC) (*)
+bytes v1.12.1 MIT
+dyn-clone v1.0.20 MIT OR Apache-2.0
+futures v0.3.34 MIT OR Apache-2.0
+futures-channel v0.3.34 MIT OR Apache-2.0 (*)
+futures-core v0.3.34 MIT OR Apache-2.0
+futures-executor v0.3.34 MIT OR Apache-2.0
+futures-core v0.3.34 MIT OR Apache-2.0
+futures-task v0.3.34 MIT OR Apache-2.0
+futures-util v0.3.34 MIT OR Apache-2.0 (*)
+futures-io v0.3.34 MIT OR Apache-2.0
+futures-sink v0.3.34 MIT OR Apache-2.0
+futures-task v0.3.34 MIT OR Apache-2.0
+futures-util v0.3.34 MIT OR Apache-2.0 (*)
+futures-core v0.3.34 MIT OR Apache-2.0
+globset v0.4.20 Unlicense OR MIT
+aho-corasick v1.1.5 Unlicense OR MIT
+memchr v2.8.3 Unlicense OR MIT
+bstr v1.13.1 MIT OR Apache-2.0
+memchr v2.8.3 Unlicense OR MIT
+log v0.4.34 MIT OR Apache-2.0
+regex-automata v0.4.18 MIT OR Apache-2.0
+aho-corasick v1.1.5 Unlicense OR MIT (*)
+memchr v2.8.3 Unlicense OR MIT
+regex-syntax v0.8.11 MIT OR Apache-2.0
+regex-syntax v0.8.11 MIT OR Apache-2.0
+hex v0.4.3 MIT OR Apache-2.0
+jiff v0.2.38 Unlicense OR MIT (*)
+log v0.4.34 MIT OR Apache-2.0
+olpc-cjson v0.1.4 MIT OR Apache-2.0
+serde v1.0.229 MIT OR Apache-2.0 (*)
+serde_json v1.0.151 MIT OR Apache-2.0 (*)
+unicode-normalization v0.1.25 MIT OR Apache-2.0
+tinyvec v1.13.3 Zlib OR Apache-2.0 OR MIT
+pem v3.0.6 MIT
+base64 v0.22.1 MIT OR Apache-2.0
+percent-encoding v2.3.2 MIT OR Apache-2.0
+rustls v0.23.45 Apache-2.0 OR ISC OR MIT (*)
+serde v1.0.229 MIT OR Apache-2.0 (*)
+serde_json v1.0.151 MIT OR Apache-2.0 (*)
+serde_plain v1.0.2 MIT/Apache-2.0
+serde v1.0.229 MIT OR Apache-2.0 (*)
+snafu v0.8.9 MIT OR Apache-2.0
+futures-core v0.3.34 MIT OR Apache-2.0
+pin-project v1.1.13 Apache-2.0 OR MIT
+pin-project-internal v1.1.13 (proc-macro) Apache-2.0 OR MIT
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+syn v2.0.119 MIT OR Apache-2.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+unicode-ident v1.0.26 (MIT OR Apache-2.0) AND Unicode-3.0
+snafu-derive v0.8.9 (proc-macro) MIT OR Apache-2.0
+heck v0.5.0 MIT OR Apache-2.0
+proc-macro2 v1.0.107 MIT OR Apache-2.0 (*)
+quote v1.0.47 MIT OR Apache-2.0 (*)
+syn v2.0.119 MIT OR Apache-2.0 (*)
+tempfile v3.27.0 MIT OR Apache-2.0 (*)
+tokio v1.53.2 MIT (*)
+tokio-util v0.7.20 MIT (*)
+typed-path v0.9.3 MIT OR Apache-2.0
+untrusted v0.7.1 ISC
+url v2.5.8 MIT OR Apache-2.0 (*)
+walkdir v2.5.0 Unlicense/MIT
+same-file v1.0.6 Unlicense/MIT
+winapi-util v0.1.11 Unlicense OR MIT
+windows-sys v0.61.2 MIT OR Apache-2.0 (*)
+winapi-util v0.1.11 Unlicense OR MIT (*)
+url v2.5.8 MIT OR Apache-2.0 (*)
+windows-sys v0.61.2 MIT OR Apache-2.0 (*)

@@ -22,6 +22,36 @@ packaging = staging.packaging
 PROJECT = Path(__file__).resolve().parent.parent
 
 
+def workspace_packages(project: Path) -> set[tuple[str, str]]:
+    """Read every explicitly declared local member; reject unsafe/glob paths.
+
+    This release workspace uses literal paths. Fail closed if it adopts member
+    globbing or inherited package identities rather than silently omitting them.
+    Match name AND version so an unrelated registry version is still collected.
+    """
+    packaging.require_plain_ancestors(project)
+    root_path = project / "Cargo.toml"
+    packaging.require_regular_file(root_path)
+    root = tomllib.loads(root_path.read_text("utf-8"))
+    manifests = [root]
+    for member in root.get("workspace", {}).get("members", []):
+        packaging.safe_relative_path(member)
+        path = project / member / "Cargo.toml"
+        packaging.require_plain_ancestors(path)
+        packaging.require_regular_file(path)
+        manifests.append(tomllib.loads(path.read_text("utf-8")))
+    result = set()
+    for manifest in manifests:
+        package = manifest.get("package")
+        if package is None:
+            continue
+        name, version = package.get("name"), package.get("version")
+        if not isinstance(name, str) or not name or not isinstance(version, str) or not version:
+            raise ValueError("Workspace package must declare literal name and version")
+        result.add((name, version))
+    return result
+
+
 def collect(tree: Path, registry: Path, output: Path, cache: Path | None = None) -> dict:
     packaging.require_plain_ancestors(output)
     if output.exists():
@@ -30,9 +60,9 @@ def collect(tree: Path, registry: Path, output: Path, cache: Path | None = None)
     packages = sorted(set(re.findall(r"^([\w-]+) v([0-9][^\s]+)", tree.read_text("utf-8-sig"), re.M)))
     if not packages:
         raise ValueError("Empty dependency tree; use cargo tree --prefix none --edges normal,build")
-    own_packages = set()
-    for path in (PROJECT / "Cargo.toml", PROJECT / "crates/provenance-worker/Cargo.toml"):
-        own_packages.add(tomllib.loads(path.read_text("utf-8"))["package"]["name"])
+    own_packages = workspace_packages(PROJECT)
+    if not any(package not in own_packages for package in packages):
+        raise ValueError("No external dependencies parsed; use cargo tree --prefix none --edges normal,build")
     cached = {}
     if cache is not None:
         cached_inventory = packaging.load_json(cache / "inventory.json")
@@ -44,7 +74,7 @@ def collect(tree: Path, registry: Path, output: Path, cache: Path | None = None)
     records, missing, declarations = [], [], []
     output.mkdir(parents=True)
     for name, version in packages:
-        if name in own_packages:
+        if (name, version) in own_packages:
             continue
         package_id = f"{name}-{version}"
         packaging.safe_relative_path(package_id)

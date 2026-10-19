@@ -1,0 +1,114 @@
+{
+  "linux-x64": {
+    "CoDE-MIT.txt": {
+      "bytes": 1066,
+      "sha256": "a8fc49db1c029248ef7b4419a99866adae2db97d6bf47a28dd1c8f40421b7694"
+    },
+    "CoDE-model-card-upstream.md": {
+      "bytes": 3191,
+      "sha256": "f4bf55bba0d1eff6216a1429575b41a48871b99ff6aadb6c9da46187413478f2"
+    },
+    "JPEG-PROVENANCE.json": {
+      "bytes": 6640,
+      "sha256": "3be57f178f48ea9719aeda6e8ced5b7dd8b4cb890af0f8cbfe4410ed9de5de64"
+    },
+    "MODEL-PROVENANCE.json": {
+      "bytes": 6505,
+      "sha256": "53371b3cc50fe74e93b47b3bae568bd8aab7d748c574bcb1c668cd8773cfddf8"
+    },
+    "ONNXRuntime-LICENSE": {
+      "bytes": 1094,
+      "sha256": "c250d6278f0b47a6439fb7592b08b58a55eb9f535aa49a1db63211c3f982b674"
+    },
+    "ONNXRuntime-Privacy.md": {
+      "bytes": 2490,
+      "sha256": "bfb7712b075f3f07e3ebee5dc2a296d1de32dbf71ad28663f73d1538cb6c3b08"
+    },
+    "ONNXRuntime-ThirdPartyNotices.txt": {
+      "bytes": 331175,
+      "sha256": "fb0af774b4d7cffc5b9d046f2aaeade2f37df2f80abf8033c95dfffcc77a8866"
+    },
+    "code-linear-fp32.onnx": {
+      "bytes": 22278043,
+      "sha256": "5a888282941391e2249af4da8af54ee36a822ff3d09c22f2e6cb4a6be6dc2e7b"
+    },
+    "libjpeg-turbo-LICENSE.md": {
+      "bytes": 5622,
+      "sha256": "e10114e6e40f3d0311c401ca25245ac5ef459a43c20f976fd63f03e816f5741f"
+    },
+    "libjpeg-turbo-README.ijg": {
+      "bytes": 12799,
+      "sha256": "75815e3bf6484201a3c3d17a1bbf10f2e8e3237f84df10a2357ea896db2a81d6"
+    },
+    "libonnxruntime.so.1.28.3": {
+      "bytes": 24301616,
+      "sha256": "5a1ce74e56e8c4b278d5a9e9d12b7192d9f70811084dde9616da4fa1710efc5a"
+    },
+    "libturbojpeg.so.0.4.0": {
+      "bytes": 907408,
+      "sha256": "a7a6fd79fd6ab9b294904723c5e1a340c8a2be1c0aa05125e2cc3b27a66aa60c"
+    },
+    "manifest.json": {
+      "bytes": 1039,
+      "sha256": "e7c1e7b365eb87253000543dcd0e1f56fdf090e026925381791fc80da2d47b1d"
+    }
+  },
+  "win-x64": {
+    "CoDE-MIT.txt": {
+      "bytes": 1066,
+      "sha256": "a8fc49db1c029248ef7b4419a99866adae2db97d6bf47a28dd1c8f40421b7694"
+    },
+    "CoDE-model-card-upstream.md": {
+      "bytes": 3191,
+      "sha256": "f4bf55bba0d1eff6216a1429575b41a48871b99ff6aadb6c9da46187413478f2"
+    },
+    "JPEG-PROVENANCE.json": {
+      "bytes": 6640,
+      "sha256": "3be57f178f48ea9719aeda6e8ced5b7dd8b4cb890af0f8cbfe4410ed9de5de64"
+    },
+    "MODEL-PROVENANCE.json": {
+      "bytes": 6505,
+      "sha256": "53371b3cc50fe74e93b47b3bae568bd8aab7d748c574bcb1c668cd8773cfddf8"
+    },
+    "ONNXRuntime-LICENSE": {
+      "bytes": 1094,
+      "sha256": "c250d6278f0b47a6439fb7592b08b58a55eb9f535aa49a1db63211c3f982b674"
+    },
+    "ONNXRuntime-Privacy.md": {
+      "bytes": 2490,
+      "sha256": "bfb7712b075f3f07e3ebee5dc2a296d1de32dbf71ad28663f73d1538cb6c3b08"
+    },
+    "ONNXRuntime-ThirdPartyNotices.txt": {
+      "bytes": 331175,
+      "sha256": "fb0af774b4d7cffc5b9d046f2aaeade2f37df2f80abf8033c95dfffcc77a8866"
+    },
+    "code-linear-fp32.onnx": {
+      "bytes": 22278043,
+      "sha256": "5a888282941391e2249af4da8af54ee36a822ff3d09c22f2e6cb4a6be6dc2e7b"
+    },
+    "libjpeg-turbo-LICENSE.md": {
+      "bytes": 5622,
+      "sha256": "e10114e6e40f3d0311c401ca25245ac5ef459a43c20f976fd63f03e816f5741f"
+    },
+    "libjpeg-turbo-README.ijg": {
+      "bytes": 12799,
+      "sha256": "75815e3bf6484201a3c3d17a1bbf10f2e8e3237f84df10a2357ea896db2a81d6"
+    },
+    "manifest.json": {
+      "bytes": 1193,
+      "sha256": "900966df9db55dd65ac2431aed44c37166c0605cfd136d1bca6198bc965180ab"
+    },
+    "onnxruntime.dll": {
+      "bytes": 15828832,
+      "sha256": "4d2774a5f64e4a230b16b74b167171e92f65b0683c19680c1d04fb284b92a6e2"
+    },
+    "onnxruntime_providers_shared.dll": {
+      "bytes": 21856,
+      "sha256": "6582418469facb25b33bc212d8efdc8f7ee57d0c8161e57a59434377780a38b4"
+    },
+    "turbojpeg.dll": {
+      "bytes": 1133568,
+      "sha256": "4a171bfe14f3032fcaad3db6c9a199b0d81cf6ca8ce3b6f4c98809df76fadeb8"
+    }
+  }
+}

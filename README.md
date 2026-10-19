@@ -1,77 +1,105 @@
-# gloamere-image 0.4.0
+# gloamere-image 0.7.0 开发候选
 
-Windows 本地 JPEG / PNG 查看与编辑工具，Rust + egui/eframe + wgpu D3D12。
-当前版本为已交付的 Windows 未签名测试版。r4 已完成实际 Windows Debug/Release 构建、D3D12 运行与独立安装夹具验证；真实键鼠、输入法、多显示器 DPI、生产安装升级等仍有待验证。功能、验证范围与已知限制见 [v0.4.0 发布说明](docs/releases/v0.4.0.md)。
+Windows 优先的本地看图与轻编辑工具，Rust + egui/eframe + wgpu。v0.7 修正 AI 检测执行状态，增加明确选择的实验自动筛查，并实现可信更新、稳定入口及持久恢复路径。云端测试不代表 Windows 原生安装或模型准确率验收通过。
 
-## 安装与更新
+## AI 检测状态与实验筛查
 
-用户安装和更新统一使用 `gloamere-image-0.4.0-Win64-Setup-unsigned.exe`。
-关闭程序和来源检查后台后运行安装器。每用户安装，不要求管理员权限；以后手动运行新版 Setup EXE 即可原位更新。没有后台更新服务、自动联网检查或新域名。
+- 组件安装状态、当前图片执行状态和模型发布资格分别显示。来源检查完成不等于像素检测完成
+- 已安装组件执行成功显示“实验检测已完成”；正向信号最多是“疑似 AI · 实验”；未见强信号同时说明“不能排除 AI”
+- 默认仅手动像素检测；“自动筛查当前文件夹 · 实验功能”需要明确接受误报/漏报说明，不递归、不扫描网络文件夹或其他目录
+- 固定可信组件哈希和正式质量门槛独立，实验开关、下载签名或缓存均不能批准模型
+- 人工记录保留，模型结果与人工决定并存；角标是 UI 叠加，不写入原图、复制或导出像素
+- 单 worker、明确取消/超时、同名换图与模型版本失配失效；不支持输入不会变成“非 AI”
+- 模型仍有真实漏检：所给已知 AI PNG 的当前候选得分仍为 −4.0221，未调整阈值或针对样图硬编码
 
-从原 Light Image Tool / 轻图 v0.3 升级时，保留同一安装身份、原目录、图片与偏好。为保持兼容，默认安装目录仍是当前用户的 `Programs/LightImageTool`，设置仍位于 `LOCALAPPDATA/LightImageTool/settings.json`。这是一个产品的改名，不是第二套安装。
+[AI 实现与验证](docs/v07/ai.md)包含输入边界、缓存兼容与证据；尚未通过独立大规模模型质量门槛。
 
-开始菜单入口、主程序与来源后台分别为 `gloamere-image`、`gloamere-image.exe`、`gloamere-image-worker.exe`。安装器核验旧 EXE 的固定名称与已安装 manifest 哈希后才迁移；证据缺失、文件被改、进程占用或外来注册冲突会在写入前拒绝。请保留报告中的恢复数据并按提示处理，不要强删产品文件或注册表。
+## 可信更新与安装恢复
 
-“图片右键菜单”独立可选，仅 JPEG / PNG。安装完成页另有默认未勾选的“打开 Windows 默认应用设置”。选择后只打开系统界面，JPEG / PNG 默认应用由您自行确认。安装器不写 UserChoice、不抢占现有默认打开方式。
+“自动更新应用”与“自动更新已安装模型组件”独立、默认关闭。应用更新只在正常退出并完成安全条件后安装，不关闭其他窗口、不重启系统。更新偏好使用独立文件，v0.6 原设置格式保持可回退。
 
-卸载只处理匹配归属的产品文件、快捷方式和注册值，保留额外图片与用户偏好。旧安装身份、ProgID 和恢复目录名称有意保留用于升级兼容；不推荐自行改动。安装包未签名，安装并不消除 Windows 的安全提示。
+首次 v0.7 需要一个引导 Setup EXE，安装稳定入口和 runtime 布局。之后走同类 EXE，保留稳定 launcher，持久快照直到真实健康启动；签名/哈希、路径、所有权、进程和恢复条件失败时停止。
 
-## 查看与编辑
+当前没有已配置的生产可信根或 IP HTTPS 仓库，因此该源码候选不联网自动更新。用户选择的无 Authenticode 方案仍要求 TUF 发布签名与有效 HTTPS，不能绕过 Windows 保护。测试仓库不代表生产服务已上线。
 
-双击开始菜单入口或拖入一张图片，也可执行 `gloamere-image.exe --open "图片路径"`。支持中文、空格、`&` 和括号路径；路径是一个完整参数。
+[更新实现与限制](docs/v07/updater.md)与[实施附录](docs/v07/implementation-addendum.md)说明代码边界；主程序仍仅使用最终原生验收的 Setup EXE 分发，源码 ZIP 不是安装包。未授权 Git 推送或正式发布。
 
-默认是大面积浅棋盘画布和白色单行底栏：
+## 查看与阅读
 
-- 左侧尺寸与原始文件大小，右侧缩放比例
-- 中央图标：打开、前后切图、缩小/放大、适应、1:1、右转、撤销、导出、更多
-- 悬停或键盘聚焦可见中文名称和快捷键；右上角显示图片索引及“已编辑”状态
-- More / F10 提供路径打开、图片列表、裁剪/缩放、信息/安全来源、左转、全屏和背景设置
+- JPEG、PNG、静态 GIF/WebP；格式以内容探测为准，APNG 暂不支持
+- GIF/WebP 动画按需、有界解码；播放/暂停、下一帧、从头播放和帧/时间状态
+- Ctrl+V 显式从剪贴板打开图像或单个本地图片文件；Ctrl+C 复制完整图像，动画复制当前静态帧
+- 左右键切图；文件名按自然顺序排列（image2 在 image10 前）；列表默认折叠
+- F 适应窗口，1 实际像素，普通模式滚轮缩放，拖动平移
+- “更多 → 长图适应宽度”显式进入阅读模式：滚轮纵滚、Ctrl+滚轮缩放，PageUp/PageDown 翻屏，Ctrl+Home/End 到顶/底；Home/End 仍跳目录首尾
+- F11 全屏；空闲约 1.8 秒隐藏底栏，鼠标移动/底部边缘/键盘活动唤回；弹窗、编辑或键盘焦点期间不自动隐藏
+- Ctrl+O 打开、R/Shift+R 右/左转、Ctrl+Z 撤销、Ctrl+Shift+S 导出新副本、F10 更多
+- Esc 每次关闭一层：菜单/提示、确认/对话框、裁剪工具、编辑/信息面板，最后退出全屏
 
-← / →、PageUp / PageDown 切图；Home / End 跳首尾。F 适应窗口，1 实际像素，滚轮缩放，拖动画布平移，双击适应。R 右转、Shift+R 左转；Ctrl+O 打开、Ctrl+Shift+S 导出、Ctrl+Z 撤销。F11 全屏。文本/数值编辑和对话框不会误触看图快捷键；Esc 按层关闭菜单、对话框或编辑状态。
+底栏保持单行纯图标，按逻辑宽度显示 11/8/7 个常用操作；窄窗的低频项进入“更多”，触区不少于 32 逻辑点。小于 800 点时编辑为底部抽屉；关闭与导出保留可达位置。实际 100/125/150/200% Windows DPI、鼠标/触控板/IME 尚需原生验收。
 
-列表默认关闭，可在更多菜单开启、定位和刷新。同目录最多扫描 10000 个条目、列出 8000 张 JPEG/PNG；超限有提示。缩略图按需生成，最多缓存 48 张。旧用户保存的背景/列表偏好继续使用；不保存图片历史。
+文本/数值框有焦点时，Ctrl+C/V 保持文本语义。剪贴板只在明确操作时访问，不后台监听、不保存历史、不抓取 URL。Windows 原生 PNG/DIBV5/DIB 和应用互通仍需按矩阵验证；macOS 的剪贴板目前明确返回未支持，不声称完成跨平台兼容。
 
-列表、编辑面板和取消操作均使用紧凑的纯图标按钮，常规点击区域为 32 × 32 逻辑点。菜单选项、输入字段与导出确认保留说明文字。工具提示和辅助功能名称说明每个操作。
+## 编辑、保护与导出
 
-画布保留浅/深棋盘、浅色、深色四种背景，仅影响查看。PNG 保留 alpha；JPEG 导出底色另选。编辑支持选择裁剪、输入裁剪坐标、90° 旋转、水平翻转、保持比例缩放、撤销和恢复原图。选区模式左键框选、右键平移，确认“应用裁剪”才修改会话副本。
+原图只读。支持旋转、水平翻转、裁剪、保持比例缩放、撤销。裁剪/缩放各显示当前工具字段，信息与来源独立查看。
 
-导出只创建新副本，名称冲突拒绝，原图与已有文件不覆盖。副本应用 EXIF 方向并转换到 sRGB，不继承原 EXIF/XMP/C2PA 有效签名。切换图片会丢弃未导出的会话编辑，请先导出需要保留的修改。
+有未导出修改时，切图、重新打开、粘贴、恢复原图和正常关闭会询问“导出副本后继续 / 放弃改动并继续 / 取消”。只有对应导出成功才继续原操作；导出失败或取消保留当前编辑。重复导航只保留第一个待确认意图。
 
-## 安全、来源与范围
+动画编辑/导出必须明确“提取当前帧为静态副本”；之后仅输出 PNG/JPEG，不编码动画。剪贴板与提取帧使用无原文件路径的临时会话，不伪造文件哈希、EXIF 或有效来源签名。
 
-图片处理本地进行，没有图片上传、遥测或自动联网来源查找。普通查看不启动来源核验；打开信息/来源或编辑面板才执行离线检查，查看与编辑可继续。
+导出使用同目录独占临时文件、编码后验证和无覆盖发布。原图、已有同名文件不被覆盖。取消与发布在同一原子门禁排序：取消先赢则不发布，发布先赢则报告真实完成结果。正常退出回收文件拥有线程，不用强制退出掩盖清理。同步 codec、OS 文件系统调用和 GPU 驱动阻塞没有硬中断保证，断电/强杀另列限制。
 
-JPEG / PNG：单图最多 1600 万像素、单边 32768、文件 64 MiB，并受操作预算准入限制。动画 PNG 明确拒绝；16 位输入明确降到 8 位。ICC 转换失败仍可查看，暂不允许导出校准副本。预算准入不是主进程硬内存沙箱，也不是已达到的性能承诺。
+## 资源与颜色边界
 
-官方 C2PA SDK 禁用 HTTP 传输与远程获取，并使用拒绝 HTTP 的 resolver。来源 worker 在 Windows JobObject 中执行，512 MiB 限制、父进程 20 秒超时；不是完整 AppContainer 沙箱。相机 EXIF、未签名声明、签名、资产绑定、信任和离线不完整分别呈现。签名通过不等于画面真实，无凭证不代表非 AI；编辑后原图签名不代表当前像素。
+- 静态输入：64 MiB、1600 万像素、单边 32768
+- 动画输入：64 MiB、400 万画布像素、每次遍历最多 2000 帧
+- 动画应用合成/预读缓冲最多 128 MiB，同时计入全局估算准入；只保留当前与一个待显示帧，不收集全部帧
+- 超过动画画布上限直接安全拒绝，不额外解码超限首帧；坏帧或遍历超限暂停并保留最后正确帧，不当作完整播放结束
+- 小于 20 ms 的动画延时统一到 20 ms，并显示规范化说明；失焦、最小化或打开弹窗时暂停，不积压补播
+- 同目录最多扫描 10000 条目、列出 8000 张；按需缩略图最多 48 张，受固定浏览预算覆盖
+- 较大图切换先释放旧原图/纹理引用，再开始新解码；同尺寸动画纹理复用，旧上传/纹理交接暂留逻辑预算
 
-原创品牌 SVG 和派生 ICO/PNG 位于 assets；操作图标自绘，无图标字体或新增运行时依赖。系统中文字体不随软件分发。
+768 MiB 全局预算是保守应用准入估算，不是进程私有内存、GPU 驱动或恶意 codec 的硬沙箱。请勿把逻辑预算当作已达性能承诺。
 
-## 开发、检查与发布
+保留 EXIF 八方向归一、ICC 转 sRGB、透明像素和预乘 alpha 缩放。16 位输入明确转为 8 位副本；ICC 失败可查看，但拒绝输出声称已校准的副本。画布背景只影响查看，不污染导出或复制。JPEG 底色与画布分开选择。
 
-Windows 构建需要官方 Rust stable（MSRV 1.96，云端使用 1.99.0）、Visual Studio C++ Build Tools、Windows SDK 和官方 Inno Setup 6.7.3。资源编译器 `rc.exe` 必须可用；缺少图标、资源编译失败或实际 EXE 资源检查失败会阻止发布。
+## 安装与更新兼容
 
-统一发布命令：
+沿用相同 AppId、ProgID、Programs/LightImageTool 安装目录和 LocalAppData/LightImageTool 设置目录。v0.7 引导将真正 UI 与 worker 放入 runtime，快捷方式和 --open 保留稳定根入口。精确登记和默认关联保护继续有效，不写 UserChoice。
 
-```powershell
-powershell -NoProfile -File scripts/build-release.ps1 -Compiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-```
+settings.json 仍为 schema 1；未知/损坏/未来版本文件保留且拒绝覆盖。图片和人工标记不在应用安装目录，不参与更新替换。正式上线仍需要同一候选的 Windows EXE/Setup、升级、断电恢复和系统保护验收。
 
-可用参数及产物见脚本帮助与 `docs/branding-installer-migration.md`。流水线执行质量门禁、配对 debug/release 构建与各自 worker 集成测试、PE 资源检查、完整安装 payload/manifest 核验和安装器编译，输出 Setup EXE、SHA-256 与报告。实际 Windows 安装/升级/卸载和视觉输入 QA 是独立门禁。
+## 来源与范围
 
-源码 ZIP、内部 payload 暂存和开发测试资料不是用户安装/更新包；旧 portable 脚本仅保留兼容或开发用途。没有发布 portable ZIP 的用户流程。
+来源检查独立、按需、离线执行；普通查看和编辑不抢首图启动核验。官方 C2PA worker 不启用 HTTP 传输或远程获取；Windows JobObject 约束只覆盖来源 worker，不能当作主图 decoder 已被沙箱化。
 
-基础门禁为 `cargo fmt --all --check`、严格 `cargo clippy --workspace --all-targets -- -D warnings`、工作区/示例构建，以及包括 ignored 的单线程测试。集成测试从当前测试二进制的 target/profile 目录查找当轮 worker，不回退到旧 debug 产物。
+凭据存在、签名、资产绑定、信任及离线缺失分别陈述。签名有效不等于画面真实，无凭据不代表非 AI；编辑/复制/提取的像素不继承原有效签名。
 
-云端只能用明确的 `GLOAMERE_WINDOWS_RESOURCE_CHECK_ONLY=1` 做 debug Windows 目标源码检查；它不生成资源，且故意无法链接可运行 EXE。原生 Windows 和 release 构建禁止此开关。
+本版不包含 RAW/HEIC/AVIF/SVG/压缩包、OCR、云端 AI、批量编辑、双图 A/B、动画编码、后台系统服务或 macOS 正式分发。
 
-当前设计与验收：
+## 开发与验证
 
-- `docs/branding-design-v0.4.md`：身份、图标和 EXE-only 范围
-- `docs/branding-icons.md`：图标复现、资源编译与验证边界
-- `docs/branding-installer-migration.md`：旧产品归属迁移、恢复和 Windows QA
-- `docs/export-shutdown-fix.md`：最新导出线程退出修正、等待边界和 Windows 重测清单
-- `docs/compact-actions-design-v0.4.md`：紧凑图标操作与实际渲染回归
-- `docs/compiler-version-gate-fix.md`：实际 Inno 引擎探针与 Setup 元数据修正
+沿用官方 Rust stable（MSRV 1.96）、Visual Studio C++ Build Tools、Windows SDK 和官方 Inno Setup 6.7.3。Windows 图标资源编译必须成功。统一原生入口：
 
-不自动将源码检查、离屏渲染、Windows 构建和最终安装验收混为同一结果。
+    powershell -NoProfile -File scripts/build-release.ps1 -Compiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+
+质量门禁：fmt、workspace/all-targets 严格 clippy、Debug/Release 配对构建/测试、当前 profile worker 集成、实际 PE 资源检查和安装 payload/manifest 验证。`GLOAMERE_WINDOWS_RESOURCE_CHECK_ONLY=1` 只用于非 Windows debug 目标源码检查，刻意不产生可链接的 Windows EXE，不能作为原生通过。
+
+v0.7 实现与后续原生验收见：
+
+- `docs/v07/ai.md`
+- `docs/v07/updater.md`
+- `docs/v07/windows-acceptance.md`
+
+以下 v0.5 文档仅记录既有基础功能：
+
+- `docs/v05-candidate-acceptance.md`
+- `docs/v05-animation-core.md`
+- `docs/clipboard-v0.5.md`
+- `docs/v05-browsing-worker-settings.md`
+- `docs/installer-v0.5.md`
+
+云端单元测试、CPU egui 渲染、Windows 源码检查、原生 EXE 运行、真实输入与安装升级，是不同层次的证据。正式放行必须绑定同一候选提交及 EXE/Setup SHA-256。
+
+Optional JPEG component acknowledgment: This software is based in part on the work of the Independent JPEG Group.

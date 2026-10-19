@@ -19,28 +19,38 @@ begin
   Values[I].Removed := False;
 end;
 
-procedure PopulateDefaultAppProfile(var Values: TDefaultAppValues; Legacy: Boolean);
-var Root, Capabilities, ProgId, Path, Icon, LabelName: String;
+procedure PopulateDefaultAppProfile(var Values: TDefaultAppValues; Profile: TDefaultAppProfile);
+var Root, Capabilities, ProgId, Path, Icon, LabelName, Description, ImageLabel: String;
 begin
   SetArrayLength(Values, 0);
   Root := DefaultAppRoot; Capabilities := Root + '\Capabilities';
   ProgId := DefaultAppProgIdKey; Path := InstalledExe;
   LabelName := ProductName; Icon := '"' + InstalledIcon + '",0';
-  if Legacy then begin
+  if Profile = dapLegacy then begin
     Path := LegacyInstalledExe; LabelName := LegacyProductName;
     Icon := '"' + Path + '",0';
+  end;
+  Description := 'Local JPEG and PNG image viewer and editor.';
+  ImageLabel := ' JPEG / PNG image';
+  if Profile = dapV05 then begin
+    Description := 'Local JPEG, PNG, GIF and WebP viewer with static-copy editing.';
+    ImageLabel := ' JPEG / PNG / GIF / WebP image';
   end;
   AddDefaultAppValue(Values, Root, 'OwnerId', OwnerId);
   AddDefaultAppValue(Values, Root, 'OwnerPath', Path);
   AddDefaultAppValue(Values, Capabilities, 'ApplicationName', LabelName);
-  AddDefaultAppValue(Values, Capabilities, 'ApplicationDescription', 'Local JPEG and PNG image viewer and editor.');
+  AddDefaultAppValue(Values, Capabilities, 'ApplicationDescription', Description);
   AddDefaultAppValue(Values, Capabilities, 'ApplicationIcon', Icon);
   AddDefaultAppValue(Values, Capabilities + '\FileAssociations', '.jpg', 'LightImageTool.Image');
   AddDefaultAppValue(Values, Capabilities + '\FileAssociations', '.jpeg', 'LightImageTool.Image');
   AddDefaultAppValue(Values, Capabilities + '\FileAssociations', '.png', 'LightImageTool.Image');
+  if Profile = dapV05 then begin
+    AddDefaultAppValue(Values, Capabilities + '\FileAssociations', '.gif', 'LightImageTool.Image');
+    AddDefaultAppValue(Values, Capabilities + '\FileAssociations', '.webp', 'LightImageTool.Image');
+  end;
   AddDefaultAppValue(Values, ProgId, 'OwnerId', OwnerId);
   AddDefaultAppValue(Values, ProgId, 'OwnerPath', Path);
-  AddDefaultAppValue(Values, ProgId, '', LabelName + ' JPEG / PNG image');
+  AddDefaultAppValue(Values, ProgId, '', LabelName + ImageLabel);
   AddDefaultAppValue(Values, ProgId + '\DefaultIcon', '', Icon);
   AddDefaultAppValue(Values, ProgId + '\shell\open\command', '', MenuCommand(Path));
   // Publish discovery last, only after the candidate handler is complete.
@@ -49,7 +59,7 @@ end;
 
 procedure PopulateDefaultAppValues(var Values: TDefaultAppValues);
 begin
-  PopulateDefaultAppProfile(Values, False);
+  PopulateDefaultAppProfile(Values, dapV05);
 end;
 
 procedure RecordProductDeletion(Key, Name, Text: String);
@@ -91,16 +101,16 @@ begin
   Result := True;
 end;
 
-function DefaultAppProfileMatches(Legacy: Boolean): Boolean;
+function DefaultAppProfileMatches(Profile: TDefaultAppProfile): Boolean;
 var Values: TDefaultAppValues; LabelName, OtherName: String;
 begin
   Result := False;
   LabelName := ProductName; OtherName := LegacyProductName;
-  if Legacy then begin
-    if not LegacyInstallationOwned then Exit;
+  if (Profile <> dapV05) and not LegacyInstallationOwned then Exit;
+  if Profile = dapLegacy then begin
     LabelName := LegacyProductName; OtherName := ProductName;
   end;
-  PopulateDefaultAppProfile(Values, Legacy);
+  PopulateDefaultAppProfile(Values, Profile);
   if not RegKeyExists(HKCU, DefaultAppRoot) or not RegKeyExists(HKCU, DefaultAppProgIdKey) then Exit;
   if not DefaultAppTreeMatches(DefaultAppRoot, Values) then Exit;
   if not DefaultAppTreeMatches(DefaultAppProgIdKey, Values) then Exit;
@@ -116,7 +126,8 @@ begin
     not RegValueExists(HKCU, 'Software\RegisteredApplications', ProductName) and
     not RegValueExists(HKCU, 'Software\RegisteredApplications', LegacyProductName);
   if Result then Exit;
-  Result := DefaultAppProfileMatches(False) or DefaultAppProfileMatches(True);
+  Result := DefaultAppProfileMatches(dapV05) or
+    DefaultAppProfileMatches(dapV04) or DefaultAppProfileMatches(dapLegacy);
 end;
 
 procedure InstallDefaultApps;
@@ -125,11 +136,11 @@ begin
   // Recheck after snapshot preparation, before the first registration write.
   if not DefaultAppsSafe then
     RaiseException('Default-app registration changed during installation; restoring the installation snapshot.');
-  LegacyDiscovery := DefaultAppProfileMatches(True);
+  LegacyDiscovery := DefaultAppProfileMatches(dapLegacy);
   PopulateDefaultAppValues(Values);
   for I := 0 to GetArrayLength(Values)-1 do begin
     if not RegWriteStringValue(HKCU, Values[I].Key, Values[I].Name, Values[I].Text) then
-      RaiseException('Cannot register the JPEG / PNG candidate handler; restoring the installation snapshot.');
+      RaiseException('Cannot register the JPEG / PNG / GIF / WebP candidate handler; restoring the installation snapshot.');
     AddDefaultAppValue(DefaultAppWrites, Values[I].Key, Values[I].Name, Values[I].Text);
   end;
   if LegacyDiscovery then begin

@@ -1,417 +1,765 @@
-#include PayloadRecoveryList
+// The persisted Rust journal is the single recovery owner. Inno's automatic
+// rollback is not a power-loss/health-check transaction and is never sufficient.
+// Security ABI: pinned Inno Setup 6.7.3 is a 32-bit process on x64 Windows.
+// Pascal Script records are packed; fail closed if these layouts ever change.
+type
+  TNativeSecurityAttributes = record
+    Length: LongWord;
+    Descriptor: UINT_PTR;
+    InheritHandle: Integer;
+  end;
+  TNativeFileInfo = record
+    Attributes: LongWord;
+    Created, Accessed, Written: TFileTime;
+    VolumeSerial, SizeHigh, SizeLow, Links, IndexHigh, IndexLow: LongWord;
+  end;
+  TNativeAclSize = record
+    AceCount, BytesInUse, BytesFree: LongWord;
+  end;
+  TNativeAcePrefix = record
+    AceType, Flags: Byte;
+    Size: Word;
+    Mask: LongWord;
+  end;
+  TNativeAceHeader = record
+    AceType, Flags: Byte;
+    Size: Word;
+  end;
+const
+  NativeProductWriteMask = $500D0156;
+  NativeAncestorWriteMask = $500D0150;
+  NativeLauncherMaxBytes = 536870912;
+var
+  NativeHelper, NativePlan, NativeState, NativeLaunchError, NativeAcquireError, NativeVerifiedLauncherHash: String;
+  NativeMaintenance, NativeSessions, NativeStampPin, NativeLauncherPin: THandle;
+  NativePathPins: array of THandle;
+  NativeUserBuffer, NativeUserSid, NativeSystemSid, NativeAdminsSid, NativeTrustedInstallerSid: UINT_PTR;
+  NativeNewDescriptor, NativeNewAcl: UINT_PTR;
+  NativeNewAttributes: TNativeSecurityAttributes;
+  NativeLocksHeld, NativeBootstrap, NativePendingHealth, NativeFailureDetected: Boolean;
 
-function RecoveryJson(S: String): String;
+function NativeLockFile(Handle: THandle; OffsetLow, OffsetHigh, CountLow, CountHigh: LongWord): Integer;
+  external 'LockFile@kernel32.dll stdcall';
+function NativeGetCurrentProcessId: LongWord;
+  external 'GetCurrentProcessId@kernel32.dll stdcall';
+function NativeGetCurrentProcess: THandle;
+  external 'GetCurrentProcess@kernel32.dll stdcall';
+function NativeLocalAlloc(Flags: LongWord; Bytes: UINT_PTR): UINT_PTR;
+  external 'LocalAlloc@kernel32.dll stdcall';
+function NativeLocalFree(Address: UINT_PTR): UINT_PTR;
+  external 'LocalFree@kernel32.dll stdcall';
+procedure NativeCopyPointer(var Destination: UINT_PTR; Source, Bytes: UINT_PTR);
+  external 'RtlMoveMemory@kernel32.dll stdcall';
+procedure NativeCopyAcePrefix(var Destination: TNativeAcePrefix; Source, Bytes: UINT_PTR);
+  external 'RtlMoveMemory@kernel32.dll stdcall';
+procedure NativeCopyAceHeader(var Destination: TNativeAceHeader; Source, Bytes: UINT_PTR);
+  external 'RtlMoveMemory@kernel32.dll stdcall';
+function NativeOpenProcessToken(Process: THandle; Access: LongWord; var Token: THandle): Integer;
+  external 'OpenProcessToken@advapi32.dll stdcall';
+function NativeGetTokenInformation(Token: THandle; Kind: Integer; Buffer: UINT_PTR;
+  Size: LongWord; var Needed: LongWord): Integer;
+  external 'GetTokenInformation@advapi32.dll stdcall';
+function NativeConvertStringSid(Text: String; var Sid: UINT_PTR): Integer;
+  external 'ConvertStringSidToSidW@advapi32.dll stdcall';
+function NativeIsValidSid(Sid: UINT_PTR): Integer;
+  external 'IsValidSid@advapi32.dll stdcall';
+function NativeGetLengthSid(Sid: UINT_PTR): LongWord;
+  external 'GetLengthSid@advapi32.dll stdcall';
+function NativeEqualSid(Left, Right: UINT_PTR): Integer;
+  external 'EqualSid@advapi32.dll stdcall';
+function NativeGetSecurityInfo(Handle: THandle; ObjectType, Information: LongWord;
+  var Owner, Group, Dacl, Sacl, Descriptor: UINT_PTR): LongWord;
+  external 'GetSecurityInfo@advapi32.dll stdcall';
+function NativeIsValidSecurityDescriptor(Descriptor: UINT_PTR): Integer;
+  external 'IsValidSecurityDescriptor@advapi32.dll stdcall';
+function NativeGetDescriptorLength(Descriptor: UINT_PTR): LongWord;
+  external 'GetSecurityDescriptorLength@advapi32.dll stdcall';
+function NativeGetDescriptorControl(Descriptor: UINT_PTR; var Control: Word; var Revision: LongWord): Integer;
+  external 'GetSecurityDescriptorControl@advapi32.dll stdcall';
+function NativeIsValidAcl(Acl: UINT_PTR): Integer;
+  external 'IsValidAcl@advapi32.dll stdcall';
+function NativeGetAclInformation(Acl: UINT_PTR; var Info: TNativeAclSize;
+  Size, Kind: LongWord): Integer;
+  external 'GetAclInformation@advapi32.dll stdcall';
+function NativeGetAce(Acl: UINT_PTR; Index: LongWord; var Ace: UINT_PTR): Integer;
+  external 'GetAce@advapi32.dll stdcall';
+function NativeInitializeAcl(Acl: UINT_PTR; Size, Revision: LongWord): Integer;
+  external 'InitializeAcl@advapi32.dll stdcall';
+function NativeAddAllowedAce(Acl: UINT_PTR; Revision, Flags, Mask: LongWord; Sid: UINT_PTR): Integer;
+  external 'AddAccessAllowedAceEx@advapi32.dll stdcall';
+function NativeInitializeDescriptor(Descriptor: UINT_PTR; Revision: LongWord): Integer;
+  external 'InitializeSecurityDescriptor@advapi32.dll stdcall';
+function NativeSetDescriptorOwner(Descriptor, Owner: UINT_PTR; Defaulted: Integer): Integer;
+  external 'SetSecurityDescriptorOwner@advapi32.dll stdcall';
+function NativeSetDescriptorDacl(Descriptor: UINT_PTR; Present: Integer;
+  Acl: UINT_PTR; Defaulted: Integer): Integer;
+  external 'SetSecurityDescriptorDacl@advapi32.dll stdcall';
+function NativeSetDescriptorControl(Descriptor: UINT_PTR; Bits, Values: Word): Integer;
+  external 'SetSecurityDescriptorControl@advapi32.dll stdcall';
+function NativeCreateDirectory(Path: String; var Security: TNativeSecurityAttributes): Integer;
+  external 'CreateDirectoryW@kernel32.dll stdcall';
+function NativeCreateSecureFile(Path: String; Access, Share: LongWord;
+  var Security: TNativeSecurityAttributes; Creation, Flags: LongWord; Template: THandle): THandle;
+  external 'CreateFileW@kernel32.dll stdcall';
+function NativeGetFileInformation(Handle: THandle; var Info: TNativeFileInfo): Integer;
+  external 'GetFileInformationByHandle@kernel32.dll stdcall';
+function NativeGetFileType(Handle: THandle): LongWord;
+  external 'GetFileType@kernel32.dll stdcall';
+
+function NativeSecurityExplanation(Code: Integer): String;
+begin
+  Result := '';
+  case Code of
+    41: Result := ' A protected product path (installation, updater-state or Start Menu) is not owned by the required Windows principal. Have an administrator review its ownership before retrying; do not bypass the ownership check.';
+    42: Result := ' A protected product path (installation, updater-state or Start Menu) has unsafe or unsupported write permissions. Have an administrator review its write permissions before retrying; do not bypass the permissions check.';
+  end;
+end;
+
+function NativeSecurityRefusal(Path: String; Code: Integer): Boolean;
+begin
+  Result := False;
+  NativeAcquireError := 'Protected path validation failed (diagnostic ' + IntToStr(Code) + ') for "' +
+    Path + '".' + NativeSecurityExplanation(Code);
+end;
+
+function NativeWindowsRefusal(Action: String; Code: LongWord): Boolean;
+begin
+  Result := False;
+  NativeAcquireError := Action + ' (Windows error ' + IntToStr(Code) + ': ' + SysErrorMessage(Code) + ').';
+end;
+
+procedure NativeFreeMemory(var Address: UINT_PTR);
+begin
+  if Address <> 0 then begin NativeLocalFree(Address); Address := 0; end;
+end;
+
+procedure ReleaseNativeBootstrapPins;
+begin
+  if NativeLauncherPin <> 0 then begin CloseHandle(NativeLauncherPin); NativeLauncherPin := 0; end;
+  if NativeStampPin <> 0 then begin CloseHandle(NativeStampPin); NativeStampPin := 0; end;
+  NativeVerifiedLauncherHash := '';
+end;
+
+procedure ReleaseNativeLocks;
 var I: Integer;
 begin
-  Result := '"';
-  for I := 1 to Length(S) do begin
-    if S[I] = '"' then Result := Result + '\"'
-    else if S[I] = '\' then Result := Result + '\\'
-    else if Ord(S[I]) < 32 then Result := Result + '\u' + Format('%.4x', [Ord(S[I])])
-    else Result := Result + S[I];
-  end;
-  Result := Result + '"';
+  ReleaseNativeBootstrapPins;
+  if NativeSessions <> 0 then begin CloseHandle(NativeSessions); NativeSessions := 0; end;
+  if NativeMaintenance <> 0 then begin CloseHandle(NativeMaintenance); NativeMaintenance := 0; end;
+  for I := GetArrayLength(NativePathPins)-1 downto 0 do CloseHandle(NativePathPins[I]);
+  SetArrayLength(NativePathPins, 0);
+  NativeFreeMemory(NativeNewDescriptor); NativeFreeMemory(NativeNewAcl);
+  NativeFreeMemory(NativeUserBuffer); NativeUserSid := 0;
+  NativeFreeMemory(NativeSystemSid); NativeFreeMemory(NativeAdminsSid);
+  NativeFreeMemory(NativeTrustedInstallerSid);
+  NativeNewAttributes.Descriptor := 0;
+  NativeLocksHeld := False;
 end;
 
-procedure RecoverySnapshotValue(Key, Name: String);
-var I: Integer; Kind: LongWord;
-begin
-  I := GetArrayLength(RecoveryValues);
-  SetArrayLength(RecoveryValues, I+1);
-  RecoveryValues[I].Key := Key; RecoveryValues[I].Name := Name;
-  RecoveryValues[I].DefaultAppValue := False;
-  RecoveryValues[I].Existed := RegValueExists(HKCU, Key, Name);
-  if not RecoveryValues[I].Existed then Exit;
-  if not QueryHkcuValueKind(Key, Name, Kind) then
-    RaiseException('Cannot inspect the product registry value.');
-  RecoveryValues[I].Kind := Kind;
-  if Kind = 1 then begin
-    if not RegQueryStringValue(HKCU, Key, Name, RecoveryValues[I].Text) then
-      RaiseException('Cannot snapshot product text.');
-    if Length(RecoveryValues[I].Text) > 65536 then
-      RaiseException('Product registry text exceeds recovery bounds.');
-    if not MatchesValue(Key, Name, RecoveryValues[I].Text) then
-      RaiseException('Product registry text or type changed during snapshot; no payload was changed.');
-  end else if Kind = 4 then begin
-    if not RegQueryDWordValue(HKCU, Key, Name, RecoveryValues[I].Number) then
-      RaiseException('Cannot snapshot product number.');
-  end else RaiseException('Unsupported value type in the owned product key; no payload was changed.');
-end;
-
-procedure RecoverySnapshotMenu(Ext: String);
-var Values: TDefaultAppValues; I: Integer;
-begin
-  PopulateMenuValues(Values, Ext, False);
-  for I := 0 to GetArrayLength(Values)-1 do begin
-    RecoverySnapshotValue(Values[I].Key, Values[I].Name);
-    RecoveryValues[GetArrayLength(RecoveryValues)-1].DefaultAppValue := True;
-  end;
-end;
-
-procedure RecoverySnapshotDefaultApps;
-var Values: TDefaultAppValues; I: Integer;
-begin
-  PopulateDefaultAppValues(Values);
-  // New/old profile share all tree values; discovery names are the only union delta.
-  AddDefaultAppValue(Values, 'Software\RegisteredApplications', LegacyProductName,
-    DefaultAppRoot + '\Capabilities');
-  for I := 0 to GetArrayLength(Values)-1 do begin
-    RecoverySnapshotValue(Values[I].Key, Values[I].Name);
-    RecoveryValues[GetArrayLength(RecoveryValues)-1].DefaultAppValue := True;
-  end;
-end;
-
-function RecoveryUninstallerName(Name: String): Boolean;
-var I: Integer; Extension: String;
+function InitializeNativeSecurity: Boolean;
+var Token: THandle; Needed, BufferSize, SidSize: LongWord;
+  FileInfo: TNativeFileInfo; AclInfo: TNativeAclSize; Ace: TNativeAcePrefix; Header: TNativeAceHeader;
 begin
   Result := False;
-  if Length(Name) <> 12 then Exit;
-  if CompareText(Copy(Name, 1, 5), 'unins') <> 0 then Exit;
-  for I := 6 to 8 do if (Name[I] < '0') or (Name[I] > '9') then Exit;
-  Extension := LowerCase(Copy(Name, 9, 4));
-  Result := (Extension = '.exe') or (Extension = '.dat') or (Extension = '.msg');
-end;
-
-procedure RecoveryError(Message: String);
-begin
-  Log('Recovery error: ' + Message);
-  if RecoveryErrors <> '' then RecoveryErrors := RecoveryErrors + #13#10;
-  RecoveryErrors := RecoveryErrors + Message;
-end;
-
-function RecoveryRegularPath(Path: String): Boolean;
-var Item: TFindRec; Parent: String;
-begin
-  Result := False;
-  if (CompareText(Path, RecoveryApp) <> 0) and
-    (Pos(LowerCase(AddBackslash(RecoveryApp)), LowerCase(Path)) <> 1) then Exit;
-  while Path <> '' do begin
-    if FindFirst(Path, Item) then begin
-      try
-        if (Item.Attributes and $400) <> 0 then Exit;
-      finally FindClose(Item); end;
+  NativeAcquireError := 'Cannot initialize bounded Windows path-security checks.';
+  if (SizeOf(NativeUserSid) <> 4) or (SizeOf(NativeNewAttributes) <> 12) or
+     (SizeOf(FileInfo) <> 52) or (SizeOf(AclInfo) <> 12) or
+     (SizeOf(Ace) <> 8) or (SizeOf(Header) <> 4) then begin
+    NativeAcquireError := 'Unsupported installer security ABI; no product files were changed.'; Exit;
+  end;
+  Token := 0;
+  if NativeOpenProcessToken(NativeGetCurrentProcess, $8, Token) = 0 then begin
+    Result := NativeWindowsRefusal('Cannot read the current Windows identity', DLLGetLastError); Exit;
+  end;
+  try
+    Needed := 0;
+    NativeGetTokenInformation(Token, 1, 0, 0, Needed);
+    if (Needed < 12) or (Needed > 65536) then Exit;
+    BufferSize := Needed;
+    NativeUserBuffer := NativeLocalAlloc($40, BufferSize);
+    if NativeUserBuffer = 0 then Exit;
+    if NativeGetTokenInformation(Token, 1, NativeUserBuffer, BufferSize, Needed) = 0 then begin
+      Result := NativeWindowsRefusal('Cannot read TokenUser', DLLGetLastError); Exit;
     end;
-    Parent := ExtractFileDir(Path);
-    if Parent = Path then Break;
-    Path := Parent;
-  end;
-  Result := True;
-end;
-
-function RecoveryCheck(Path: String): Boolean;
-begin
-  Result := RecoveryRegularPath(Path);
-  if not Result then RecoveryError('Refused changed/reparse path: ' + Path);
-end;
-
-function RecoveryShortcutCheck(Index: Integer): Boolean;
-begin
-  Result := (RecoveryShortcuts[Index].Path = ProductShortcut(RecoveryShortcuts[Index].Legacy)) and
-    MigrationRegularPath(RecoveryShortcuts[Index].Path) and
-    RecoveryCheck(RecoveryDirectory + '\shortcuts\' + RecoveryShortcuts[Index].BackupName);
-  if not Result then RecoveryError('Refused changed shortcut path: ' + RecoveryShortcuts[Index].Path);
-end;
-
-procedure RecoverySnapshotShortcut(Legacy: Boolean);
-var I: Integer; Path, Backup: String;
-begin
-  Path := ProductShortcut(Legacy);
-  if Legacy and not LegacyShortcutOwned then Exit;
-  if not MigrationRegularPath(Path) then RaiseException('Shortcut path changed before snapshot.');
-  I := GetArrayLength(RecoveryShortcuts); SetArrayLength(RecoveryShortcuts, I+1);
-  RecoveryShortcuts[I].Path := Path; RecoveryShortcuts[I].Legacy := Legacy;
-  RecoveryShortcuts[I].BackupName := IntToStr(I) + '.lnk';
-  RecoveryShortcuts[I].Existed := FileExists(Path);
-  if not RecoveryShortcuts[I].Existed then Exit;
-  if not ShortcutOwned(Path, Legacy) then RaiseException('Shortcut ownership changed before snapshot.');
-  Backup := RecoveryDirectory + '\shortcuts\' + RecoveryShortcuts[I].BackupName;
-  if not RecoveryShortcutCheck(I) or not ForceDirectories(ExtractFileDir(Backup)) or
-     not CopyFile(Path, Backup, True) then RaiseException('Cannot snapshot the product shortcut.');
-  RecoveryShortcuts[I].OriginalHash := GetSHA256OfFile(Path);
-  if GetSHA256OfFile(Backup) <> RecoveryShortcuts[I].OriginalHash then
-    RaiseException('Shortcut snapshot hash mismatch.');
-end;
-
-function RecoveryRestoreShortcuts: Boolean;
-var I: Integer; Path, Backup: String;
-begin
-  Result := True;
-  for I := 0 to GetArrayLength(RecoveryShortcuts)-1 do begin
-    Path := RecoveryShortcuts[I].Path;
-    Backup := RecoveryDirectory + '\shortcuts\' + RecoveryShortcuts[I].BackupName;
-    try
-      if not RecoveryShortcutCheck(I) then RaiseException('Shortcut path changed before recovery.');
-      if FileExists(Path) then begin
-        if RecoveryShortcuts[I].Existed and
-           (GetSHA256OfFile(Path) = RecoveryShortcuts[I].OriginalHash) then Continue;
-        // A foreign shortcut that appeared after snapshot must survive rollback.
-        if RecoveryShortcuts[I].Legacy or not ShortcutOwned(Path, False) then
-          RaiseException('Changed shortcut retained: ' + Path);
-      end;
-      if RecoveryShortcuts[I].Existed then begin
-        if not FileExists(Backup) or
-           (GetSHA256OfFile(Backup) <> RecoveryShortcuts[I].OriginalHash) then
-          RaiseException('Shortcut recovery backup hash differs.');
-        if not ForceDirectories(ExtractFileDir(Path)) or not CopyFile(Backup, Path, False) or
-           (GetSHA256OfFile(Path) <> RecoveryShortcuts[I].OriginalHash) then
-          RaiseException('Cannot restore product shortcut: ' + Path);
-      end else if FileExists(Path) then begin
-        if not DeleteFile(Path) then RaiseException('Cannot remove newly created product shortcut: ' + Path);
-        RemoveDir(ExtractFileDir(Path));
-      end;
-    except Result := False; RecoveryError(GetExceptionMessage); end;
+    if (Needed > BufferSize) or (Needed < 12) then Exit;
+    NativeCopyPointer(NativeUserSid, NativeUserBuffer, SizeOf(NativeUserSid));
+    if (NativeUserSid < NativeUserBuffer) or (NativeUserSid > NativeUserBuffer + Needed - 8) then Exit;
+    if NativeIsValidSid(NativeUserSid) = 0 then Exit;
+    SidSize := NativeGetLengthSid(NativeUserSid);
+    if (SidSize < 8) or (SidSize > 68) or (SidSize > NativeUserBuffer + Needed - NativeUserSid) then Exit;
+    if NativeConvertStringSid('S-1-5-18', NativeSystemSid) = 0 then Exit;
+    if NativeConvertStringSid('S-1-5-32-544', NativeAdminsSid) = 0 then Exit;
+    if NativeConvertStringSid('S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464', NativeTrustedInstallerSid) = 0 then Exit;
+    // Construct an absolute descriptor in memory only. No existing object's
+    // owner or ACL is changed. These attributes apply exclusively at creation.
+    NativeNewAcl := NativeLocalAlloc($40, 256);
+    NativeNewDescriptor := NativeLocalAlloc($40, 64);
+    if (NativeNewAcl = 0) or (NativeNewDescriptor = 0) then Exit;
+    if NativeInitializeAcl(NativeNewAcl, 256, 2) = 0 then Exit;
+    if NativeAddAllowedAce(NativeNewAcl, 2, 3, $1F01FF, NativeUserSid) = 0 then Exit;
+    if NativeAddAllowedAce(NativeNewAcl, 2, 3, $1F01FF, NativeSystemSid) = 0 then Exit;
+    if NativeAddAllowedAce(NativeNewAcl, 2, 3, $1F01FF, NativeAdminsSid) = 0 then Exit;
+    if NativeInitializeDescriptor(NativeNewDescriptor, 1) = 0 then Exit;
+    if NativeSetDescriptorOwner(NativeNewDescriptor, NativeUserSid, 0) = 0 then Exit;
+    if NativeSetDescriptorDacl(NativeNewDescriptor, 1, NativeNewAcl, 0) = 0 then Exit;
+    if NativeSetDescriptorControl(NativeNewDescriptor, $1000, $1000) = 0 then Exit;
+    if NativeIsValidSecurityDescriptor(NativeNewDescriptor) = 0 then Exit;
+    NativeNewAttributes.Length := SizeOf(NativeNewAttributes);
+    NativeNewAttributes.Descriptor := NativeNewDescriptor;
+    NativeNewAttributes.InheritHandle := 0;
+    Result := True;
+  finally
+    CloseHandle(Token);
   end;
 end;
 
-function RecoveryPreflight: Boolean;
-var I: Integer;
+function NativeTrustedSid(Sid: UINT_PTR; StrictProduct: Boolean): Boolean;
 begin
-  Result := RecoveryCheck(RecoveryApp);
-  if not RecoveryCheck(RecoveryDirectory) then Result := False;
-  if not RecoveryCheck(RecoveryDirectory + '\PRODUCT-OWNER.txt') then Result := False;
-  if not RecoveryCheck(RecoveryDirectory + '\snapshot.json') then Result := False;
-  for I := 0 to GetArrayLength(RecoveryShortcuts)-1 do
-    if not RecoveryShortcutCheck(I) then Result := False;
-  for I := 0 to GetArrayLength(RecoveryFiles)-1 do begin
-    if not RecoveryCheck(AddBackslash(RecoveryApp) + RecoveryFiles[I].Relative) then Result := False;
-    if not RecoveryCheck(RecoveryDirectory + '\files\' + RecoveryFiles[I].Relative) then Result := False;
-  end;
+  Result := (NativeEqualSid(Sid, NativeUserSid) <> 0) or
+    (NativeEqualSid(Sid, NativeSystemSid) <> 0) or (NativeEqualSid(Sid, NativeAdminsSid) <> 0);
+  if not StrictProduct and not Result then Result := NativeEqualSid(Sid, NativeTrustedInstallerSid) <> 0;
 end;
 
-function RecoveryDelete(Path: String): Boolean;
-begin
-  Result := RecoveryCheck(Path);
-  if Result and FileExists(Path) then begin
-    Result := DeleteFile(Path);
-    if not Result then RecoveryError('Cannot remove file: ' + Path);
-  end;
-end;
-
-procedure RecoveryPrune(Directory: String);
-begin
-  while (Length(Directory) > Length(RecoveryDirectory)) and
-    (Pos(AddBackslash(RecoveryDirectory), AddBackslash(Directory)) = 1) do begin
-    if not RecoveryCheck(Directory) or not RemoveDir(Directory) then Exit;
-    Directory := ExtractFileDir(Directory);
-  end;
-end;
-
-function RecoveryCleanup: Boolean;
-var I: Integer; Path: String; Marker: AnsiString;
+function NativeRangeContains(Base: UINT_PTR; Length: LongWord; Address: UINT_PTR; Bytes: LongWord): Boolean;
 begin
   Result := False;
-  if not RecoveryPreflight then Exit;
-  if not LoadStringFromFile(RecoveryDirectory + '\PRODUCT-OWNER.txt', Marker) or
-    (Marker <> OwnerId) then Exit;
-  for I := 0 to GetArrayLength(RecoveryFiles)-1 do begin
-    Path := RecoveryDirectory + '\files\' + RecoveryFiles[I].Relative;
-    if not RecoveryDelete(Path) then Exit;
-    RecoveryPrune(ExtractFileDir(Path));
-  end;
-  if not RecoveryCheck(RecoveryDirectory + '\files') then Exit;
-  RemoveDir(RecoveryDirectory + '\files');
-  for I := 0 to GetArrayLength(RecoveryShortcuts)-1 do
-    if not RecoveryDelete(RecoveryDirectory + '\shortcuts\' + RecoveryShortcuts[I].BackupName) then Exit;
-  if not RecoveryCheck(RecoveryDirectory + '\shortcuts') then Exit;
-  RemoveDir(RecoveryDirectory + '\shortcuts');
-  if not RecoveryDelete(RecoveryDirectory + '\snapshot.json') then Exit;
-  if not RecoveryDelete(RecoveryDirectory + '\PRODUCT-OWNER.txt') then Exit;
-  Result := RecoveryCheck(RecoveryDirectory) and RemoveDir(RecoveryDirectory);
+  if (Length > 65536) or (Bytes > Length) or (Address < Base) then Exit;
+  if Base > High(Base) - Length then Exit;
+  Result := Address - Base <= Length - Bytes;
 end;
 
-function RecoveryBegin: String;
-var I: Integer; Path, Backup: String; Names, Lines: TArrayOfString; Item: TFindRec;
+function NativeBoundedSid(Sid, Base: UINT_PTR; Length: LongWord): Boolean;
+var Bytes: LongWord;
+begin
+  Result := False;
+  if not NativeRangeContains(Base, Length, Sid, 8) then Exit;
+  if NativeIsValidSid(Sid) = 0 then Exit;
+  Bytes := NativeGetLengthSid(Sid);
+  if (Bytes < 8) or (Bytes > 68) then Exit;
+  Result := NativeRangeContains(Base, Length, Sid, Bytes);
+end;
+
+function NativeVerifyHandleSecurity(Handle: THandle; Path: String; StrictProduct, RequireProtected: Boolean): Boolean;
+var Owner, Group, Dacl, Sacl, Descriptor, AceAddress, Sid: UINT_PTR;
+  Code, I, WriteMask, DescriptorSize, Revision: LongWord; Control: Word;
+  Acl: TNativeAclSize; Ace: TNativeAcePrefix; Header: TNativeAceHeader;
+begin
+  Result := False;
+  Owner := 0; Group := 0; Dacl := 0; Sacl := 0; Descriptor := 0;
+  Code := NativeGetSecurityInfo(Handle, 1, $5, Owner, Group, Dacl, Sacl, Descriptor);
+  if Code <> 0 then begin
+    if Descriptor <> 0 then NativeLocalFree(Descriptor);
+    Result := NativeWindowsRefusal('Cannot inspect security for "' + Path + '"', Code); Exit;
+  end;
+  try
+    if Descriptor = 0 then begin Result := NativeSecurityRefusal(Path, 41); Exit; end;
+    if NativeIsValidSecurityDescriptor(Descriptor) = 0 then begin
+      Result := NativeSecurityRefusal(Path, 41); Exit;
+    end;
+    if NativeGetDescriptorControl(Descriptor, Control, Revision) = 0 then begin
+      Result := NativeSecurityRefusal(Path, 42); Exit;
+    end;
+    // GetSecurityInfo's returned owner and DACL must live in its one bounded
+    // self-relative allocation, which is retained until the last SID check.
+    if (Control and $8000) = 0 then begin Result := NativeSecurityRefusal(Path, 42); Exit; end;
+    if RequireProtected and ((Control and $1000) = 0) then begin Result := NativeSecurityRefusal(Path, 42); Exit; end;
+    DescriptorSize := NativeGetDescriptorLength(Descriptor);
+    if (DescriptorSize < 20) or (DescriptorSize > 65536) then begin
+      Result := NativeSecurityRefusal(Path, 42); Exit;
+    end;
+    if not NativeBoundedSid(Owner, Descriptor, DescriptorSize) then begin Result := NativeSecurityRefusal(Path, 41); Exit; end;
+    if StrictProduct then begin
+      if NativeEqualSid(Owner, NativeUserSid) = 0 then begin Result := NativeSecurityRefusal(Path, 41); Exit; end;
+    end
+    else if not NativeTrustedSid(Owner, False) then begin Result := NativeSecurityRefusal(Path, 41); Exit; end;
+    if not NativeRangeContains(Descriptor, DescriptorSize, Dacl, 8) then begin Result := NativeSecurityRefusal(Path, 42); Exit; end;
+    if NativeIsValidAcl(Dacl) = 0 then begin Result := NativeSecurityRefusal(Path, 42); Exit; end;
+    if NativeGetAclInformation(Dacl, Acl, SizeOf(Acl), 2) = 0 then begin
+      Result := NativeWindowsRefusal('Cannot inspect permissions for "' + Path + '"', DLLGetLastError); Exit;
+    end;
+    if (Acl.BytesInUse < 8) or (Acl.BytesInUse > 65535) or (Acl.AceCount > 8191) then begin
+      Result := NativeSecurityRefusal(Path, 42); Exit;
+    end;
+    if not NativeRangeContains(Descriptor, DescriptorSize, Dacl, Acl.BytesInUse) then begin
+      Result := NativeSecurityRefusal(Path, 42); Exit;
+    end;
+    WriteMask := NativeAncestorWriteMask;
+    if StrictProduct then WriteMask := NativeProductWriteMask;
+    if Acl.AceCount > 0 then for I := 0 to Acl.AceCount-1 do begin
+      AceAddress := 0;
+      if NativeGetAce(Dacl, I, AceAddress) = 0 then begin Result := NativeSecurityRefusal(Path, 42); Exit; end;
+      if (AceAddress < Dacl + 8) or not NativeRangeContains(Dacl, Acl.BytesInUse, AceAddress, 4) then begin
+        Result := NativeSecurityRefusal(Path, 42); Exit;
+      end;
+      NativeCopyAceHeader(Header, AceAddress, SizeOf(Header));
+      if (Header.Size < 4) or not NativeRangeContains(Dacl, Acl.BytesInUse, AceAddress, Header.Size) then begin
+        Result := NativeSecurityRefusal(Path, 42); Exit;
+      end;
+      if (Header.AceType <> 0) and (Header.AceType <> 1) then begin Result := NativeSecurityRefusal(Path, 42); Exit; end;
+      // INHERIT_ONLY cannot affect an ancestor itself. Product policy remains
+      // strict for these entries too, matching the native private-path guard.
+      if not StrictProduct and ((Header.Flags and $8) <> 0) then Continue;
+      if Header.AceType = 1 then Continue;
+      if Header.Size < 16 then begin Result := NativeSecurityRefusal(Path, 42); Exit; end;
+      NativeCopyAcePrefix(Ace, AceAddress, SizeOf(Ace));
+      if (Ace.Mask and WriteMask) = 0 then Continue;
+      Sid := AceAddress + 8;
+      if not NativeBoundedSid(Sid, AceAddress, Header.Size) then begin
+        Result := NativeSecurityRefusal(Path, 42); Exit;
+      end;
+      if not NativeTrustedSid(Sid, StrictProduct) then begin Result := NativeSecurityRefusal(Path, 42); Exit; end;
+    end;
+    Result := True;
+  finally
+    if Descriptor <> 0 then NativeLocalFree(Descriptor);
+  end;
+end;
+
+function NativeVerifyHandleType(Handle: THandle; Path: String; Directory: Boolean): Boolean;
+var Info: TNativeFileInfo;
+begin
+  Result := False;
+  NativeAcquireError := 'Unsafe or changed path type: "' + Path + '".';
+  if NativeGetFileType(Handle) <> 1 then Exit;
+  if NativeGetFileInformation(Handle, Info) = 0 then begin
+    Result := NativeWindowsRefusal('Cannot inspect opened path "' + Path + '"', DLLGetLastError); Exit;
+  end;
+  if (Info.Attributes and $400) <> 0 then Exit;
+  if Directory then Result := (Info.Attributes and $10) <> 0
+  else Result := ((Info.Attributes and $10) = 0) and (Info.Links = 1) and
+    (Info.SizeHigh = 0) and (Info.SizeLow = 0);
+end;
+
+function NativeVerifyReadFileType(Handle: THandle; Path: String; Maximum: LongWord): Boolean;
+var Info: TNativeFileInfo;
+begin
+  Result := False;
+  NativeAcquireError := 'Protected file is not a bounded regular single-link file: "' + Path + '".';
+  if NativeGetFileType(Handle) <> 1 then Exit;
+  if NativeGetFileInformation(Handle, Info) = 0 then begin
+    Result := NativeWindowsRefusal('Cannot inspect protected file "' + Path + '"', DLLGetLastError); Exit;
+  end;
+  Result := ((Info.Attributes and $410) = 0) and (Info.Links = 1) and
+    (Info.SizeHigh = 0) and (Info.SizeLow > 0) and (Info.SizeLow <= Maximum);
+end;
+
+function NativePinReadFile(Path: String; Maximum: LongWord; var Handle: THandle): Boolean;
+begin
+  Result := False;
+  // Read-data access plus READ-only sharing blocks both replacement and an
+  // already-open or new content writer during stamp/hash/copy verification.
+  Handle := CreateFileW(Path, $20081, 1, 0, 3, $00200080, 0);
+  if Handle = THandle(-1) then begin
+    Handle := 0; Result := NativeWindowsRefusal('Cannot pin protected file "' + Path + '"', DLLGetLastError); Exit;
+  end;
+  Result := NativeVerifyReadFileType(Handle, Path, Maximum) and
+    NativeVerifyHandleSecurity(Handle, Path, True, False) and
+    NativeVerifyReadFileType(Handle, Path, Maximum);
+  if not Result then begin CloseHandle(Handle); Handle := 0; end;
+end;
+
+procedure NativeKeepPin(Handle: THandle);
+var I: Integer;
+begin
+  I := GetArrayLength(NativePathPins);
+  SetArrayLength(NativePathPins, I+1); NativePathPins[I] := Handle;
+end;
+
+function NativeStrictProductPath(Path: String): Boolean;
+begin
+  Result := (Path = NativeState) or
+    (Path = ExpandConstant('{localappdata}\LightImageTool')) or
+    (Path = RemoveBackslashUnlessRoot(ExpandConstant('{app}')));
+end;
+
+function NativeCanonicalLocalPath(Path: String): Boolean;
+var Remaining, Part, Stem: String; I, Separator, Components: Integer;
+begin
+  Result := False;
+  if (Length(Path) < 3) or (Length(Path) > 32760) then Exit;
+  if not (((Path[1] >= 'A') and (Path[1] <= 'Z')) or
+          ((Path[1] >= 'a') and (Path[1] <= 'z'))) then Exit;
+  if (Path[2] <> ':') or (Path[3] <> '\') then Exit;
+  if Length(Path) = 3 then begin Result := True; Exit; end;
+  if Path[Length(Path)] = '\' then Exit;
+  Remaining := Copy(Path, 4, Length(Path)-3);
+  Components := 2;
+  while Remaining <> '' do begin
+    Components := Components + 1;
+    if Components > 128 then Exit;
+    Separator := Pos('\', Remaining);
+    if Separator = 0 then begin Part := Remaining; Remaining := ''; end
+    else begin Part := Copy(Remaining, 1, Separator-1); Delete(Remaining, 1, Separator); end;
+    if (Part = '') or (Part = '.') or (Part = '..') or (Length(Part) > 255) then Exit;
+    if (Part[Length(Part)] = '.') or (Part[Length(Part)] = ' ') then Exit;
+    for I := 1 to Length(Part) do
+      if (Ord(Part[I]) < 32) or (Ord(Part[I]) = 127) or (Pos(Part[I], '<>:"/|?*') <> 0) then Exit;
+    Separator := Pos('.', Part);
+    Stem := Uppercase(Part);
+    if Separator > 0 then Stem := Uppercase(Copy(Part, 1, Separator-1));
+    if (Stem = 'CON') or (Stem = 'PRN') or (Stem = 'AUX') or (Stem = 'NUL') then Exit;
+    if Length(Stem) = 4 then
+      if ((Copy(Stem, 1, 3) = 'COM') or (Copy(Stem, 1, 3) = 'LPT')) and
+         (Pos(Stem[4], '123456789' + #$00B9 + #$00B2 + #$00B3) <> 0) then Exit;
+  end;
+  Result := True;
+end;
+
+function PinNativeAncestors(Path: String): Boolean;
+var Handle: THandle; Parent: String; J: Integer; Code: LongWord; Paths: TStringList;
+begin
+  Result := False;
+  if not NativeCanonicalLocalPath(Path) then begin
+    NativeAcquireError := 'Protected paths must use canonical absolute local-drive names without aliases: "' + Path + '".'; Exit;
+  end;
+  Paths := TStringList.Create;
+  try
+    while Path <> '' do begin
+      if Paths.Count >= 256 then begin NativeAcquireError := 'Protected path has too many ancestors.'; Exit; end;
+      Paths.Add(Path);
+      Parent := ExtractFileDir(Path);
+      if Parent = Path then Break;
+      Path := Parent;
+    end;
+    // FILE_LIST_DIRECTORY is essential: metadata-only handles do not enforce
+    // deny-delete sharing on Windows. Each opened handle, not a path precheck,
+    // proves directory type, no reparse, and the appropriate owner/DACL policy.
+    for J := Paths.Count-1 downto 0 do begin
+      Path := Paths[J];
+      // READ-only sharing rejects new or already-open directory data writers.
+      // Attribute-only rights are still rejected by NativeVerifyHandleSecurity.
+      Handle := CreateFileW(Path, $20081, 1, 0, 3, $02200000, 0);
+      if Handle = THandle(-1) then begin
+        Code := DLLGetLastError;
+        if (Code = 2) or (Code = 3) then Continue;
+        Result := NativeWindowsRefusal('Cannot pin directory "' + Path + '"', Code); Exit;
+      end;
+      if not NativeVerifyHandleType(Handle, Path, True) or
+         not NativeVerifyHandleSecurity(Handle, Path, NativeStrictProductPath(Path), False) or
+         not NativeVerifyHandleType(Handle, Path, True) then begin
+        CloseHandle(Handle); Exit;
+      end;
+      NativeKeepPin(Handle);
+    end;
+    Result := True;
+  finally
+    Paths.Free;
+  end;
+end;
+
+function PinExistingNativeLock(Path: String): Boolean;
+var Handle: THandle; Code: LongWord;
+begin
+  Result := False;
+  // FILE_READ_DATA makes this a lifetime share-enforcing leaf pin too.
+  Handle := CreateFileW(Path, $20081, 3, 0, 3, $00200080, 0);
+  if Handle = THandle(-1) then begin
+    Code := DLLGetLastError;
+    if (Code = 2) or (Code = 3) then begin Result := True; Exit; end;
+    Result := NativeWindowsRefusal('Cannot inspect existing lock "' + Path + '"', Code); Exit;
+  end;
+  if not NativeVerifyHandleType(Handle, Path, False) or
+     not NativeVerifyHandleSecurity(Handle, Path, True, False) or
+     not NativeVerifyHandleType(Handle, Path, False) then begin CloseHandle(Handle); Exit; end;
+  NativeKeepPin(Handle); Result := True;
+end;
+
+function EnsureNativeProductDirectory(Path: String; AllowCreate: Boolean): Boolean;
+var Handle: THandle; Code: LongWord; Created: Boolean;
+begin
+  Result := False; Created := False;
+  Handle := CreateFileW(Path, $20081, 1, 0, 3, $02200000, 0);
+  if Handle = THandle(-1) then begin
+    Code := DLLGetLastError;
+    if ((Code <> 2) and (Code <> 3)) or not AllowCreate then begin
+      Result := NativeWindowsRefusal('Cannot open required product directory "' + Path + '"', Code); Exit;
+    end;
+    // The fixed parent was already pinned and audited. Existing objects are
+    // never reset: an ALREADY_EXISTS race is reopened and checked by handle.
+    Created := NativeCreateDirectory(Path, NativeNewAttributes) <> 0;
+    if not Created then begin
+      Code := DLLGetLastError;
+      if Code <> 183 then begin Result := NativeWindowsRefusal('Cannot create private directory "' + Path + '"', Code); Exit; end;
+    end;
+    Handle := CreateFileW(Path, $20081, 1, 0, 3, $02200000, 0);
+    if Handle = THandle(-1) then begin Result := NativeWindowsRefusal('Cannot pin product directory "' + Path + '"', DLLGetLastError); Exit; end;
+  end;
+  if not NativeVerifyHandleType(Handle, Path, True) or
+     not NativeVerifyHandleSecurity(Handle, Path, True, Created) or
+     not NativeVerifyHandleType(Handle, Path, True) then begin CloseHandle(Handle); Exit; end;
+  NativeKeepPin(Handle); Result := True;
+end;
+
+function TakeNativeLock(Path: String; var Handle: THandle; AllowCreate: Boolean): Boolean;
+var Creation, Code: LongWord; Created: Boolean;
+begin
+  Result := False;
+  // OPEN_ALWAYS only after the private parent and any existing leaf were
+  // audited. OPEN_REPARSE_POINT applies to the object actually opened.
+  Creation := 3;
+  if AllowCreate then Creation := 4;
+  Handle := NativeCreateSecureFile(Path, $C0000000, 3, NativeNewAttributes, Creation, $00200080, 0);
+  Code := DLLGetLastError;
+  Created := AllowCreate and (Code = 0);
+  if Handle = THandle(-1) then begin
+    Handle := 0; Result := NativeWindowsRefusal('Cannot open lock "' + Path + '"', Code); Exit;
+  end;
+  if NativeVerifyHandleType(Handle, Path, False) and NativeVerifyHandleSecurity(Handle, Path, True, Created) and
+     NativeVerifyHandleType(Handle, Path, False) then begin
+    // Covers the same full byte range as Rust File::try_lock/LockFileEx.
+    Result := NativeLockFile(Handle, 0, 0, $FFFFFFFF, $FFFFFFFF) <> 0;
+    if not Result then begin
+      Code := DLLGetLastError;
+      if Code = 33 then NativeAcquireError := 'Another application, worker or installer holds a required lock. Close it normally and retry.'
+      else Result := NativeWindowsRefusal('Cannot lock "' + Path + '"', Code);
+    end;
+  end;
+  if not Result then begin CloseHandle(Handle); Handle := 0; end;
+end;
+
+function AcquireNativeLocks(AllowCreate: Boolean): Boolean;
+begin
+  Result := NativeLocksHeld;
+  if Result then Exit;
+  NativeAcquireError := '';
+  NativeState := ExpandConstant('{localappdata}\LightImageTool\updater-state');
+  try
+    try
+      if not InitializeNativeSecurity then Exit;
+      // Audit every existing directory and lock before the first creation.
+      if not PinNativeAncestors(NativeState) or
+         not PinNativeAncestors(RemoveBackslashUnlessRoot(ExpandConstant('{app}'))) or
+         not PinExistingNativeLock(NativeState + '\maintenance.lock') or
+         not PinExistingNativeLock(NativeState + '\sessions.lock') then Exit;
+      if not EnsureNativeProductDirectory(ExpandConstant('{localappdata}\LightImageTool'), AllowCreate) or
+         not EnsureNativeProductDirectory(NativeState, AllowCreate) then Exit;
+      if not TakeNativeLock(NativeState + '\maintenance.lock', NativeMaintenance, AllowCreate) or
+         not TakeNativeLock(NativeState + '\sessions.lock', NativeSessions, AllowCreate) then Exit;
+      NativeLocksHeld := True;
+      NativeAcquireError := '';
+      Result := True;
+    except
+      NativeAcquireError := GetExceptionMessage;
+      Result := False;
+    end;
+  finally
+    if not Result then begin
+      Log(NativeAcquireError);
+      ReleaseNativeLocks;
+    end;
+  end;
+end;
+
+function NativeCommand(Operation: String; var Code: Integer): Boolean;
+var Parameters: String;
+begin
+  NativeLaunchError := '';
+  Code := 0;
+  Result := False;
+  if not NativeLocksHeld then begin
+    NativeLaunchError := 'Native transaction ' + Operation + ' was not launched because the required locks are not held.';
+    Log(NativeLaunchError); Exit;
+  end;
+  Parameters := '--installer-transaction ' + Operation + ' --install-dir "' +
+    RemoveBackslashUnlessRoot(ExpandConstant('{app}')) + '" --parent-pid ' +
+    IntToStr(NativeGetCurrentProcessId);
+  if (Operation = 'prepare') or (Operation = 'reconcile') then begin
+    Parameters := Parameters + ' --plan "' + NativePlan + '" --package "' + ExpandConstant('{srcexe}') + '" --explorer ';
+    if WizardIsTaskSelected('explorer') then Parameters := Parameters + '1'
+    else Parameters := Parameters + '0';
+  end;
+  // Exec returns a Windows error on False, and a process exit code on True
+  // with ewWaitUntilTerminated. Never interpret a launch error as helper output.
+  // https://jrsoftware.org/ishelp/topic_isxfunc_exec.htm
+  Result := Exec(NativeHelper, Parameters, '', SW_HIDE, ewWaitUntilTerminated, Code);
+  if not Result then begin
+    NativeLaunchError := 'Native transaction ' + Operation + ' could not launch (Windows error ' +
+      IntToStr(Code) + ': ' + SysErrorMessage(Code) + ').';
+    Log(NativeLaunchError);
+  end
+  else Log('Native transaction ' + Operation + ' returned ' + IntToStr(Code));
+end;
+
+function InstallStableLauncher: Boolean;
+begin
+  // First bounded v0.6 migration or clean install only. A normal update must
+  // keep the only recovery entry point unchanged even if its package has newer bytes.
+  Result := RecoveryReady and NativeBootstrap;
+end;
+
+function NativeReconcileExitError(Code: Integer): String;
+begin
+  Result := 'Native transaction reconcile failed with helper exit code ' + IntToStr(Code) + '.';
+  // Only decode fixed diagnostics after successful Exec, never launch errors.
+  Result := Result + NativeSecurityExplanation(Code);
+end;
+
+function RecoveryReconcile: String;
+var Code: Integer;
 begin
   Result := '';
   if RecoveryReady then Exit;
-  RecoveryErrors := '';
-  RecoveryApp := RemoveBackslashUnlessRoot(ExpandConstant('{app}'));
-  RecoveryDirectory := RecoveryApp + '\.light-image-upgrade-recovery';
-  if FileOrDirExists(RecoveryDirectory) then begin
-    Result := 'Existing recovery data was retained. Resolve it before another install: ' + RecoveryDirectory; Exit;
+  if not AcquireNativeLocks(True) then begin
+    Result := NativeAcquireError; Exit;
   end;
-  SetArrayLength(RecoveryFiles, 0); SetArrayLength(RecoveryValues, 0);
-  SetArrayLength(RecoveryShortcuts, 0); SetArrayLength(DefaultAppWrites, 0);
-  RecoveryPaths := TStringList.Create;
   try
-    PopulateRecoveryPaths(RecoveryPaths);
-    // Explicit old/new path union, never populated from an installed manifest.
-    if RecoveryPaths.IndexOf(LegacyExeName) < 0 then RecoveryPaths.Add(LegacyExeName);
-    if RecoveryPaths.IndexOf(LegacyWorkerName) < 0 then RecoveryPaths.Add(LegacyWorkerName);
-    if FindFirst(RecoveryApp + '\unins*', Item) then begin
-      try
-        repeat
-          if RecoveryUninstallerName(Item.Name) and (RecoveryPaths.IndexOf(Item.Name) < 0) then
-            RecoveryPaths.Add(Item.Name);
-        until not FindNext(Item);
-      finally FindClose(Item); end;
+    ExtractTemporaryFile('gloamere-image-recovery.exe');
+    ExtractTemporaryFile('installer-plan.json');
+    NativeHelper := ExpandConstant('{tmp}\gloamere-image-recovery.exe');
+    NativePlan := ExpandConstant('{tmp}\installer-plan.json');
+    if not NativeCommand('reconcile', Code) then
+      Result := NativeLaunchError
+    else if Code <> 0 then
+      Result := NativeReconcileExitError(Code);
+    // A persisted last-error file may be from an older command. Preserve it,
+    // but do not present its contents as evidence of this reconcile attempt.
+    if Result <> '' then begin
+      Result := Result + ' Preserve the Setup log, plus any helper logs, journals and snapshots in ' + NativeState + '.';
+      Log(Result);
     end;
-    if RecoveryPaths.Count > 5000 then RaiseException('Recovery file list exceeds bounds.');
-    RecoveryUninstallExisted := RegKeyExists(HKCU, UninstallKey);
-    if RecoveryUninstallExisted then begin
-      // Inno recreates this dedicated key; refuse subtrees we cannot snapshot.
-      if not RegGetSubkeyNames(HKCU, UninstallKey, Names) or (GetArrayLength(Names) <> 0) then
-        RaiseException('Unexpected uninstall registration subtree; no payload was changed.');
-      if not RegGetValueNames(HKCU, UninstallKey, Names) then RaiseException('Cannot read uninstall snapshot.');
-      if GetArrayLength(Names) > 128 then RaiseException('Uninstall value list exceeds bounds.');
-      for I := 0 to GetArrayLength(Names)-1 do RecoverySnapshotValue(UninstallKey, Names[I]);
-    end;
-    RecoverySnapshotMenu('.jpg'); RecoverySnapshotMenu('.jpeg'); RecoverySnapshotMenu('.png');
-    RecoverySnapshotDefaultApps;
-    if not RecoveryRegularPath(RecoveryApp) or not RecoveryRegularPath(RecoveryDirectory) then
-      RaiseException('Installation/recovery directory changed before backup.');
-    if not ForceDirectories(RecoveryDirectory + '\files') or
-      not SaveStringToFile(RecoveryDirectory + '\PRODUCT-OWNER.txt', OwnerId, False) then
-      RaiseException('Cannot create owned recovery data. No payload was changed.');
-    RecoverySnapshotShortcut(False); RecoverySnapshotShortcut(True);
-    for I := 0 to RecoveryPaths.Count-1 do begin
-      SetArrayLength(RecoveryFiles, I+1);
-      RecoveryFiles[I].Relative := RecoveryPaths[I];
-      Path := AddBackslash(RecoveryApp) + RecoveryPaths[I];
-      if not RecoveryRegularPath(Path) or DirExists(Path) then
-        RaiseException('Non-regular payload path cannot be upgraded.');
-      RecoveryFiles[I].Existed := FileExists(Path);
-      if RecoveryFiles[I].Existed then begin
-        Backup := RecoveryDirectory + '\files\' + RecoveryPaths[I];
-        if not RecoveryRegularPath(Backup) or
-          not ForceDirectories(ExtractFileDir(Backup)) or not CopyFile(Path, Backup, True) then
-          RaiseException('Cannot back up existing payload. No payload was changed.');
-        RecoveryFiles[I].OriginalHash := GetSHA256OfFile(Path);
-        if GetSHA256OfFile(Backup) <> RecoveryFiles[I].OriginalHash then
-          RaiseException('Recovery backup verification failed.');
-      end;
-    end;
-    SetArrayLength(Lines, 1);
-    Lines[0] := '{"product_id":' + RecoveryJson(OwnerId) + ',"install_path":' + RecoveryJson(RecoveryApp) + ',"files":[';
-    for I := 0 to GetArrayLength(RecoveryFiles)-1 do begin
-      if I > 0 then Lines[0] := Lines[0] + ',';
-      Lines[0] := Lines[0] + '{"path":' + RecoveryJson(RecoveryFiles[I].Relative) +
-        ',"existed":' + IntToStr(Ord(RecoveryFiles[I].Existed)) + ',"sha256":' + RecoveryJson(RecoveryFiles[I].OriginalHash) + '}';
-    end;
-    Lines[0] := Lines[0] + '],"shortcuts":[';
-    for I := 0 to GetArrayLength(RecoveryShortcuts)-1 do begin
-      if I > 0 then Lines[0] := Lines[0] + ',';
-      Lines[0] := Lines[0] + '{"path":' + RecoveryJson(RecoveryShortcuts[I].Path) +
-        ',"backup":' + RecoveryJson(RecoveryShortcuts[I].BackupName) +
-        ',"existed":' + IntToStr(Ord(RecoveryShortcuts[I].Existed)) +
-        ',"sha256":' + RecoveryJson(RecoveryShortcuts[I].OriginalHash) + '}';
-    end;
-    Lines[0] := Lines[0] + '],"registry":[';
-    for I := 0 to GetArrayLength(RecoveryValues)-1 do begin
-      if I > 0 then Lines[0] := Lines[0] + ',';
-      Lines[0] := Lines[0] + '{"key":' + RecoveryJson(RecoveryValues[I].Key) + ',"name":' + RecoveryJson(RecoveryValues[I].Name) +
-        ',"existed":' + IntToStr(Ord(RecoveryValues[I].Existed)) + ',"type":' + IntToStr(RecoveryValues[I].Kind) +
-        ',"text":' + RecoveryJson(RecoveryValues[I].Text) + ',"dword":' + IntToStr(Int64(RecoveryValues[I].Number)) + '}';
-    end;
-    Lines[0] := Lines[0] + ']}';
-    if not SaveStringsToUTF8File(RecoveryDirectory + '\snapshot.json', Lines, False) then
-      RaiseException('Cannot persist recovery metadata. No payload was changed.');
-    RecoveryReady := True;
-    Log('gloamere-image verified recovery snapshot ready before payload changes.');
   except
     Result := GetExceptionMessage;
-    if DirExists(RecoveryDirectory) and not RecoveryCleanup then
-      Result := Result + ' Retained data: ' + RecoveryDirectory;
   end;
-  RecoveryPaths.Free;
 end;
 
-function RecoveryRestore: Boolean;
-var I, WriteIndex: Integer; Path, Backup, CurrentUninstall: String; Names: TArrayOfString; Okay: Boolean;
+function RecoveryBegin: String;
+var Code: Integer;
 begin
-  Result := False;
-  if not RecoveryPreflight then Exit;
-  Result := True;
-  for I := 0 to GetArrayLength(RecoveryFiles)-1 do begin
-    Path := AddBackslash(RecoveryApp) + RecoveryFiles[I].Relative;
-    Backup := RecoveryDirectory + '\files\' + RecoveryFiles[I].Relative;
-    try
-      if not RecoveryCheck(Path) or not RecoveryCheck(Backup) then
-        RaiseException('Path changed before restoration: ' + Path);
-      if RecoveryFiles[I].Existed then begin
-        if not FileExists(Path) or (GetSHA256OfFile(Path) <> RecoveryFiles[I].OriginalHash) then begin
-          if not FileExists(Backup) or (GetSHA256OfFile(Backup) <> RecoveryFiles[I].OriginalHash) then
-            RaiseException('Recovery backup hash differs: ' + RecoveryFiles[I].Relative);
-          if not ForceDirectories(ExtractFileDir(Path)) or not CopyFile(Backup, Path, False) then
-            RaiseException('Cannot restore: ' + RecoveryFiles[I].Relative);
-        end;
-        if GetSHA256OfFile(Path) <> RecoveryFiles[I].OriginalHash then RaiseException('Restored hash differs.');
-      end else if not RecoveryDelete(Path) then RaiseException('Cannot remove new payload: ' + Path);
-    except Result := False; RecoveryError(GetExceptionMessage); end;
+  Result := '';
+  if RecoveryReady then Exit;
+  if DirExists(ExpandConstant('{app}\.light-image-upgrade-recovery')) then begin
+    Result := 'An earlier installer recovery directory exists. Preserve it and repair that installation before continuing.'; Exit;
   end;
-  if not RecoveryRestoreShortcuts then Result := False;
-  if not RecoveryUninstallExisted and RegQueryStringValue(HKCU, UninstallKey, 'UninstallString', CurrentUninstall) then begin
-    Path := RemoveQuotes(CurrentUninstall);
-    if (CompareText(ExtractFileDir(Path), RecoveryApp) = 0) and RecoveryUninstallerName(ExtractFileName(Path)) then begin
-      if not RecoveryDelete(Path) then Result := False;
-      if not RecoveryDelete(ChangeFileExt(Path, '.dat')) then Result := False;
-      if not RecoveryDelete(ChangeFileExt(Path, '.msg')) then Result := False;
+  if not AcquireNativeLocks(True) then begin
+    Result := NativeAcquireError; Exit;
+  end;
+  try
+    if NativeHelper = '' then RaiseException('Native helper was not prepared.');
+    if not NativeCommand('prepare', Code) or ((Code <> 0) and (Code <> 10)) then begin
+      Result := 'The owned installation could not be safely snapshotted. No installation started. Preserve logs and recovery data in ' + NativeState; Exit;
     end;
+    NativeBootstrap := Code = 10;
+    RecoveryReady := True;
+  except
+    Result := GetExceptionMessage;
   end;
-  if RegKeyExists(HKCU, UninstallKey) then begin
-    if not RegGetValueNames(HKCU, UninstallKey, Names) then Result := False
-    else for I := 0 to GetArrayLength(Names)-1 do
-      if not RegDeleteValue(HKCU, UninstallKey, Names[I]) then Result := False;
-  end;
-  for I := 0 to GetArrayLength(RecoveryValues)-1 do begin
-    if RecoveryValues[I].DefaultAppValue then begin
-      WriteIndex := DefaultAppWriteIndex(RecoveryValues[I].Key, RecoveryValues[I].Name);
-      // Our code never wrote this value; preserve concurrent changes.
-      if WriteIndex < 0 then Continue;
-      if DefaultAppWrites[WriteIndex].Removed then begin
-        // A deleted legacy discovery/menu value is restored only while still absent.
-        if RegValueExists(HKCU, RecoveryValues[I].Key, RecoveryValues[I].Name) then begin
-          Result := False;
-          RecoveryError('Changed deleted product value retained: ' + RecoveryValues[I].Key + '\' + RecoveryValues[I].Name);
-          Continue;
-        end;
-      end else if not MatchesValue(RecoveryValues[I].Key, RecoveryValues[I].Name, DefaultAppWrites[WriteIndex].Text) then begin
-        Result := False;
-        RecoveryError('Changed default-app registration retained: ' + RecoveryValues[I].Key + '\' + RecoveryValues[I].Name);
-        Continue;
-      end;
-    end;
-    if RecoveryValues[I].Existed then begin
-      if RecoveryValues[I].Kind = 1 then
-        Okay := RegWriteStringValue(HKCU, RecoveryValues[I].Key, RecoveryValues[I].Name, RecoveryValues[I].Text)
-      else Okay := RegWriteDWordValue(HKCU, RecoveryValues[I].Key, RecoveryValues[I].Name, RecoveryValues[I].Number);
-    end else begin
-      Okay := True;
-      if RegValueExists(HKCU, RecoveryValues[I].Key, RecoveryValues[I].Name) then
-        Okay := RegDeleteValue(HKCU, RecoveryValues[I].Key, RecoveryValues[I].Name);
-    end;
-    if not Okay then Result := False;
-  end;
-  if not RecoveryUninstallExisted then RegDeleteKeyIfEmpty(HKCU, UninstallKey);
-  for I := GetArrayLength(RecoveryValues)-1 downto 0 do begin
-    // Candidate values can live under a shared parent; never prune those here.
-    if not RecoveryValues[I].DefaultAppValue then
-      RegDeleteKeyIfEmpty(HKCU, RecoveryValues[I].Key);
-  end;
-  PruneDefaultAppKeys(DefaultAppWritesWithin(DefaultAppRoot), DefaultAppWritesWithin(DefaultAppProgIdKey));
-  // Only fixed product menu leaves, never shared registry parents.
-  if DefaultAppWritesWithin(MenuKey('.jpg')) then begin
-    RegDeleteKeyIfEmpty(HKCU, MenuKey('.jpg') + '\command'); RegDeleteKeyIfEmpty(HKCU, MenuKey('.jpg'));
-  end;
-  if DefaultAppWritesWithin(MenuKey('.jpeg')) then begin
-    RegDeleteKeyIfEmpty(HKCU, MenuKey('.jpeg') + '\command'); RegDeleteKeyIfEmpty(HKCU, MenuKey('.jpeg'));
-  end;
-  if DefaultAppWritesWithin(MenuKey('.png')) then begin
-    RegDeleteKeyIfEmpty(HKCU, MenuKey('.png') + '\command'); RegDeleteKeyIfEmpty(HKCU, MenuKey('.png'));
-  end;
+end;
+
+procedure RecoveryStart;
+var Code: Integer;
+begin
+  if not RecoveryReady or not NativeCommand('begin', Code) or (Code <> 0) then
+    RaiseException('Cannot durably begin installation. Preserve the native recovery journal.');
+  if not PinNativeAncestors(ExpandConstant('{app}')) then
+    RaiseException('Installation directory changed before file copy.');
+  RecoveryStarted := True;
+end;
+
+procedure RecoveryInstalled;
+var Code: Integer;
+begin
+  if not NativeCommand('pending-health', Code) or (Code <> 0) then
+    RaiseException('Installed files or registration did not pass readback. Preserve the native recovery journal.');
+  NativePendingHealth := True;
 end;
 
 procedure DeinitializeSetup;
-var Restored: Boolean;
+var Code: Integer;
 begin
-  if not RecoveryReady then Exit;
-  Restored := True;
-  if not RecoverySuccess and RecoveryStarted then begin
-    Log('gloamere-image explicit recovery begins after failed install.');
-    Restored := RecoveryRestore;
-    if Restored then Log('gloamere-image explicit recovery restored every payload hash and installer-written registry value.');
+  try
+    if RecoveryReady and not RecoverySuccess then begin
+      if not NativeCommand('recover', Code) or (Code <> 0) then begin
+        Log('Recovery incomplete; preserve ' + NativeState);
+        SuppressibleMsgBox('Installation recovery needs attention. No restart or forced close was requested. Preserve logs and all recovery data in ' + NativeState,
+          mbError, MB_OK, IDOK);
+      end;
+    end;
+    // Even successful Setup keeps every snapshot until actual UI health.
+    if RecoverySuccess then Log('Installation staged. Waiting for next-launch UI health confirmation; snapshot retained.');
+  finally
+    ReleaseNativeLocks;
   end;
-  if Restored and RecoveryCleanup then Exit;
-  Log('gloamere-image retained recovery data: ' + RecoveryDirectory + #13#10 + RecoveryErrors);
-  SuppressibleMsgBox('Recovery data was retained. Close the app and preserve this directory: ' + RecoveryDirectory + #13#10 + RecoveryErrors, mbError, MB_OK, IDOK);
+end;
+
+function VerifiedInstalledLauncher: Boolean;
+var Path, Hash: String; Lines: TArrayOfString; I: Integer;
+begin
+  Result := False;
+  ReleaseNativeBootstrapPins;
+  if not NativeLocksHeld then begin
+    NativeAcquireError := 'Cannot verify the launcher before protected state admission.'; Exit;
+  end;
+  try
+    Path := NativeState + '\launcher.sha256';
+    if not NativePinReadFile(Path, 256, NativeStampPin) then Exit;
+    NativeAcquireError := 'The protected launcher stamp is missing, malformed or belongs to another product.';
+    if not LoadStringsFromFile(Path, Lines) or (GetArrayLength(Lines) <> 2) then Exit;
+    if Lines[0] <> OwnerId then Exit;
+    Hash := Lines[1];
+    if Length(Hash) <> 64 then Exit;
+    for I := 1 to Length(Hash) do
+      if not (((Hash[I] >= '0') and (Hash[I] <= '9')) or ((Hash[I] >= 'a') and (Hash[I] <= 'f'))) then Exit;
+    if not NativePinReadFile(InstalledExe, NativeLauncherMaxBytes, NativeLauncherPin) then Exit;
+    NativeAcquireError := 'The stable launcher differs from its protected identity stamp.';
+    Result := GetSHA256OfFile(InstalledExe) = Hash;
+    if Result then begin NativeVerifiedLauncherHash := Hash; NativeAcquireError := ''; end;
+  finally
+    if not Result then ReleaseNativeBootstrapPins;
+  end;
+end;
+
+function NativeUninstallPreflight: Boolean;
+var Code: Integer;
+begin
+  Result := AcquireNativeLocks(False);
+  if not Result then Exit;
+  Result := False;
+  try
+    try
+      if not VerifiedInstalledLauncher then Exit;
+      NativeHelper := ExpandConstant('{tmp}\gloamere-image-uninstall-recovery.exe');
+      if not CopyFile(InstalledExe, NativeHelper, True) then begin
+        NativeAcquireError := 'Could not copy the verified stable launcher to the private uninstall temporary directory.'; Exit;
+      end;
+      if GetSHA256OfFile(NativeHelper) <> NativeVerifiedLauncherHash then begin
+        NativeAcquireError := 'The temporary uninstall helper differs from the protected launcher identity.'; Exit;
+      end;
+      // Keep both source leaves immutable until the private copy is checked,
+      // then release before native removal can remove the original launcher.
+      ReleaseNativeBootstrapPins;
+      if not NativeCommand('uninstall-check', Code) then NativeAcquireError := NativeLaunchError
+      else if Code <> 0 then NativeAcquireError := 'Native transaction uninstall-check failed with helper exit code ' +
+        IntToStr(Code) + '.' + NativeSecurityExplanation(Code)
+      else begin Result := True; NativeAcquireError := ''; end;
+    except
+      NativeAcquireError := GetExceptionMessage;
+      Result := False;
+    end;
+  finally
+    ReleaseNativeBootstrapPins;
+    if not Result then begin Log(NativeAcquireError); ReleaseNativeLocks; end;
+  end;
+end;
+
+procedure DeinitializeUninstall;
+begin
+  ReleaseNativeLocks;
+end;
+
+procedure NativeRemoveLauncher;
+var Code: Integer;
+begin
+  if not NativeCommand('uninstall-remove-launcher', Code) or (Code <> 0) then
+    Log('The changed or unavailable stable launcher was preserved after uninstall.');
+end;
+
+function NativeCanOpenDefaults: Boolean;
+begin
+  Result := NativePendingHealth and not NativeFailureDetected;
+end;
+
+function GetCustomSetupExitCode: Integer;
+begin
+  Result := 0;
+  if NativeFailureDetected then Result := 20;
 end;

@@ -1,0 +1,15 @@
+{
+  "packages": 449,
+  "bundled_notices": 823,
+  "registry_archives_verified_against_lock": 449,
+  "direct_published_notices_verified_against_locked_archive": 772,
+  "explicit_declaration_fallbacks": [
+    "btree-range-map-0.7.2",
+    "range-traits-0.3.2",
+    "static-regular-grammar-2.0.2",
+    "typed-path-0.9.3"
+  ],
+  "missing_notice_files": [],
+  "cargo_lock_sha256": "f1c16cef56b0cc73715e3bf903a019edde5d9758b66af0f7d51374e9a6b40177",
+  "inventory_sha256": "59786da488ba9b84c308e8194ddc4f3c95bd4836d6407659f10fe538138deb5c"
+}

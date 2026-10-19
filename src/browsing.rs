@@ -1,9 +1,11 @@
 //! Bounded directory/thumbnail work, independent of full-image loading.
 use crate::{Cancellation, Result, ToolError, pipeline};
 use std::{
+    cmp::Ordering,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
-    thread,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 pub const MAX_DIRECTORY_ENTRIES: usize = 10_000;
@@ -40,17 +42,71 @@ pub fn ensure_current(mut paths: Vec<PathBuf>, current: &Path) -> Result<Vec<Pat
         }
     }
     paths.push(current.to_path_buf());
-    paths.sort_by_cached_key(|p| {
-        (
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase(),
-            p.clone(),
-        )
-    });
+    sort_paths(&mut paths);
     Ok(paths)
 }
+/// Natural order is locale-independent: lowercased Unicode text, ASCII digit
+/// magnitude. Naturally equal names use shorter zero padding, then raw paths.
+/// Comparing numeric slices rather than parsing integers handles arbitrary runs.
+fn natural_cmp(left: &str, right: &str) -> Ordering {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    let (mut a, mut b) = (0, 0);
+    let mut padding_order = Ordering::Equal;
+    while a < left.len() && b < right.len() {
+        if left[a].is_ascii_digit() && right[b].is_ascii_digit() {
+            let (start_a, start_b) = (a, b);
+            while a < left.len() && left[a].is_ascii_digit() {
+                a += 1;
+            }
+            while b < right.len() && right[b].is_ascii_digit() {
+                b += 1;
+            }
+            let mut significant_a = start_a;
+            let mut significant_b = start_b;
+            while significant_a < a && left[significant_a] == b'0' {
+                significant_a += 1;
+            }
+            while significant_b < b && right[significant_b] == b'0' {
+                significant_b += 1;
+            }
+            let order = (a - significant_a)
+                .cmp(&(b - significant_b))
+                .then_with(|| left[significant_a..a].cmp(&right[significant_b..b]));
+            if order != Ordering::Equal {
+                return order;
+            }
+            if padding_order == Ordering::Equal {
+                padding_order = (a - start_a).cmp(&(b - start_b));
+            }
+        } else {
+            let order = left[a].cmp(&right[b]);
+            if order != Ordering::Equal {
+                return order;
+            }
+            a += 1;
+            b += 1;
+        }
+    }
+    (left.len() - a).cmp(&(right.len() - b)).then(padding_order)
+}
+
+fn sort_paths(paths: &mut Vec<PathBuf>) {
+    // Lowercase each name once; no filesystem order or locale is used to break ties.
+    let mut keyed: Vec<_> = paths
+        .drain(..)
+        .map(|path| {
+            let folded = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
+            (folded, path)
+        })
+        .collect();
+    keyed.sort_unstable_by(|a, b| natural_cmp(&a.0, &b.0).then_with(|| a.1.cmp(&b.1)));
+    paths.extend(keyed.into_iter().map(|(_, path)| path));
+}
+
 pub fn thumbnail_retryable(error: &ToolError) -> bool {
     match error {
         ToolError::ResourceBusy(_) => true,
@@ -69,7 +125,7 @@ pub fn supported(path: &Path) -> bool {
     path.extension().is_some_and(|e| {
         matches!(
             e.to_string_lossy().to_ascii_lowercase().as_str(),
-            "jpg" | "jpeg" | "png"
+            "jpg" | "jpeg" | "png" | "gif" | "webp"
         )
     })
 }
@@ -81,6 +137,9 @@ pub fn directory(path: &Path) -> PathBuf {
 }
 pub fn scan(path: &Path, cancel: &Cancellation) -> Result<DirectoryListing> {
     cancel.check()?;
+    if path.as_os_str().len() > pipeline::MAX_SIBLING_PATH_BYTES {
+        return Err(ToolError::Invalid("当前浏览路径超过列表大小限制".into()));
+    }
     let mut paths = vec![path.to_path_buf()];
     let mut bytes = path.as_os_str().len();
     let mut entries = std::fs::read_dir(directory(path))?;
@@ -121,15 +180,7 @@ pub fn scan(path: &Path, cancel: &Cancellation) -> Result<DirectoryListing> {
         paths.push(candidate);
     }
     cancel.check()?;
-    paths.sort_by_cached_key(|p| {
-        (
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase(),
-            p.clone(),
-        )
-    });
+    sort_paths(&mut paths);
     paths.dedup();
     Ok(DirectoryListing { paths, truncated })
 }
@@ -156,29 +207,55 @@ struct State {
     active: Option<Cancellation>,
     shutdown: bool,
 }
+
+/// Measured cooperative shutdown, not a deadline or an interruption guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownReport {
+    pub elapsed: Duration,
+    pub cancelled_active: bool,
+    pub discarded_pending: bool,
+    pub discarded_result: bool,
+    pub join_panicked: bool,
+}
+
+type ResultSlot<T> = Arc<Mutex<Option<(Cancellation, Response<T>)>>>;
+
 pub struct Worker<T> {
     shared: Arc<(Mutex<State>, Condvar)>,
-    output: Arc<Mutex<Option<Response<T>>>>,
+    output: ResultSlot<T>,
+    thread: Option<JoinHandle<()>>,
+    name: String,
+    shutdown_report: Option<ShutdownReport>,
 }
 impl<T: Send + 'static> Worker<T> {
     pub fn new(
         name: &str,
-        ctx: eframe::egui::Context,
+        _ctx: eframe::egui::Context,
         operation: fn(&Path, &Cancellation) -> Result<T>,
+    ) -> Self {
+        // Retain the constructor API but never move a Context into this worker.
+        // The UI polls while busy. A repaint call can acquire egui's Context
+        // lock and deadlock a UI-thread join during Context::run/view teardown.
+        Self::start(name, operation)
+    }
+
+    fn start(
+        name: &str,
+        operation: impl Fn(&Path, &Cancellation) -> Result<T> + Send + 'static,
     ) -> Self {
         let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let output = Arc::new(Mutex::new(None));
         let input = shared.clone();
         let result = output.clone();
-        thread::Builder::new()
+        let thread = thread::Builder::new()
             .name(name.into())
             .spawn(move || {
                 loop {
                     let request = {
                         let (lock, wake) = &*input;
-                        let mut state = lock.lock().unwrap();
+                        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
                         while state.pending.is_none() && !state.shutdown {
-                            state = wake.wait(state).unwrap();
+                            state = wake.wait(state).unwrap_or_else(|error| error.into_inner());
                         }
                         if state.shutdown {
                             break;
@@ -188,66 +265,433 @@ impl<T: Send + 'static> Worker<T> {
                         request
                     };
                     let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        request.cancel.check()?;
                         let value = operation(&request.path, &request.cancel)?;
                         request.cancel.check()?;
                         Ok(value)
                     }))
-                    .unwrap_or_else(|_| Err(ToolError::Invalid("图片列表后台异常".into())));
-                    input.0.lock().unwrap().active = None;
-                    *result.lock().unwrap() = Some(Response {
-                        generation: request.generation,
-                        path: request.path,
-                        result: value,
+                    .unwrap_or_else(|_| {
+                        Err(ToolError::Invalid("图片后台任务异常，原文件未修改".into()))
                     });
-                    ctx.request_repaint();
+                    // Serialize publication with replacement, cancel and shutdown.
+                    // All code taking both locks uses state -> output order.
+                    let mut state = input.0.lock().unwrap_or_else(|error| error.into_inner());
+                    state.active = None;
+                    if !state.shutdown && request.cancel.check().is_ok() {
+                        *result.lock().unwrap_or_else(|error| error.into_inner()) = Some((
+                            request.cancel,
+                            Response {
+                                generation: request.generation,
+                                path: request.path,
+                                result: value,
+                            },
+                        ));
+                    }
                 }
             })
             .expect("bounded browser worker");
-        Self { shared, output }
+        Self {
+            shared,
+            output,
+            thread: Some(thread),
+            name: name.into(),
+            shutdown_report: None,
+        }
     }
+}
+impl<T> Worker<T> {
     pub fn request(&self, request: Request) {
         let (lock, wake) = &*self.shared;
-        let mut state = lock.lock().unwrap();
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if state.shutdown {
+            request.cancel.cancel();
+            return;
+        }
         if let Some(active) = &state.active {
             active.cancel();
         }
         if let Some(old) = state.pending.replace(request) {
             old.cancel.cancel();
         }
+        self.output
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         drop(state);
         wake.notify_one();
     }
     pub fn take_result(&self) -> Option<Response<T>> {
-        self.output.lock().unwrap().take()
+        self.output
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .and_then(|(cancel, response)| cancel.check().is_ok().then_some(response))
+    }
+    pub fn is_busy(&self) -> bool {
+        let state = self
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Include unread results so a completion between take_result() and this
+        // check still schedules one more UI poll and cannot get stranded.
+        state.active.is_some()
+            || state.pending.is_some()
+            || self
+                .output
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
     }
     pub fn cancel(&self) {
-        let mut state = self.shared.0.lock().unwrap();
+        let mut state = self
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if let Some(active) = &state.active {
             active.cancel();
         }
         if let Some(pending) = state.pending.take() {
             pending.cancel.cancel();
         }
+        self.output
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+    /// Stop admission, cancel active/pending work, clear results and join once.
+    /// No lock is held across join. Codec/OS calls must return before this can
+    /// finish; a blocked filesystem call is not forcibly interruptible.
+    pub fn shutdown(&mut self) -> ShutdownReport {
+        if let Some(report) = self.shutdown_report {
+            return report;
+        }
+        let started = Instant::now();
+        log::info!("worker shutdown begin: {}", self.name);
+        let (cancelled_active, discarded_pending, discarded_result) = {
+            let mut state = self
+                .shared
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.shutdown = true;
+            let active = state.active.is_some();
+            if let Some(cancel) = &state.active {
+                cancel.cancel();
+            }
+            let pending = state.pending.take();
+            if let Some(request) = &pending {
+                request.cancel.cancel();
+            }
+            let discarded = self
+                .output
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+                .is_some();
+            (active, pending.is_some(), discarded)
+        };
+        self.shared.1.notify_one();
+        let join_panicked = self
+            .thread
+            .take()
+            .is_some_and(|thread| thread.join().is_err());
+        let report = ShutdownReport {
+            elapsed: started.elapsed(),
+            cancelled_active,
+            discarded_pending,
+            discarded_result,
+            join_panicked,
+        };
+        log::info!("worker shutdown complete: {} {:?}", self.name, report);
+        self.shutdown_report = Some(report);
+        report
     }
 }
 impl<T> Drop for Worker<T> {
     fn drop(&mut self) {
-        let (lock, wake) = &*self.shared;
-        let mut state = lock.lock().unwrap();
-        state.shutdown = true;
-        if let Some(active) = &state.active {
-            active.cancel();
-        }
-        if let Some(pending) = state.pending.take() {
-            pending.cancel.cancel();
-        }
-        wake.notify_one();
+        self.shutdown();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        mpsc,
+    };
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "worker did not reach expected state"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    fn request(generation: u64) -> Request {
+        Request {
+            generation,
+            path: PathBuf::from(generation.to_string()),
+            cancel: Cancellation::default(),
+        }
+    }
+    fn wait_result<T>(worker: &Worker<T>) -> Response<T> {
+        wait_until(|| worker.output.lock().unwrap().is_some());
+        worker.take_result().expect("fresh result")
+    }
+
+    #[test]
+    fn natural_order_handles_numbers_chinese_case_padding_and_prefixes() {
+        let expected = [
+            "A.png",
+            "a.png",
+            "image0.png",
+            "image00.png",
+            "image1.png",
+            "image2.png",
+            "image02.png",
+            "image002.png",
+            "image2a.png",
+            "image10.png",
+            "image99999999999999999999.png",
+            "image100000000000000000000.png",
+            "图片.png",
+            "图片2.GIF",
+            "图片2.gif",
+            "图片02.gif",
+            "图片10.webp",
+            "图片集1.png",
+        ];
+        let mut paths: Vec<_> = expected.iter().rev().map(PathBuf::from).collect();
+        sort_paths(&mut paths);
+        assert_eq!(
+            paths,
+            expected.iter().map(PathBuf::from).collect::<Vec<_>>()
+        );
+        // Different incoming enumeration orders produce the exact same order.
+        paths.rotate_left(7);
+        sort_paths(&mut paths);
+        assert_eq!(
+            paths,
+            expected.iter().map(PathBuf::from).collect::<Vec<_>>()
+        );
+        let current = PathBuf::from("image2.png");
+        let restored = ensure_current(paths, &current).unwrap();
+        assert_eq!(
+            restored,
+            expected.iter().map(PathBuf::from).collect::<Vec<_>>()
+        );
+        assert_eq!(natural_cmp("prefix", "prefix2"), Ordering::Less);
+        assert_eq!(natural_cmp("0", "00"), Ordering::Less);
+        assert_eq!(natural_cmp("2part10", "2part3"), Ordering::Greater);
+    }
+
+    #[test]
+    fn natural_comparator_is_antisymmetric_and_transitive_on_fixed_samples() {
+        let names = [
+            "", "0", "00", "a", "a0", "a00", "a0a", "a00a", "a1", "a01", "a2", "a2a", "a02", "a10",
+            "a10a", "b", "图2", "图10",
+        ];
+        for a in names {
+            for b in names {
+                assert_eq!(natural_cmp(a, b), natural_cmp(b, a).reverse());
+                for c in names {
+                    if natural_cmp(a, b) != Ordering::Greater
+                        && natural_cmp(b, c) != Ordering::Greater
+                    {
+                        assert_ne!(natural_cmp(a, c), Ordering::Greater, "{a}, {b}, {c}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn worker_replaces_500_requests_and_never_publishes_superseded_work() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut worker = Worker::start("replacement-test", move |path, _cancel| {
+            if path == Path::new("1") {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            Ok(path.to_path_buf())
+        });
+        let first = request(1);
+        let active = first.cancel.clone();
+        worker.request(first);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut previous = Vec::new();
+        for generation in 2..=501 {
+            let request = request(generation);
+            previous.push(request.cancel.clone());
+            worker.request(request);
+        }
+        assert!(active.check().is_err());
+        assert!(previous[..499].iter().all(|token| token.check().is_err()));
+        assert!(previous[499].check().is_ok());
+        assert!(worker.take_result().is_none());
+        release_tx.send(()).unwrap();
+        let result = wait_result(&worker);
+        assert_eq!(result.generation, 501);
+        assert_eq!(result.result.unwrap(), Path::new("501"));
+        assert!(worker.take_result().is_none());
+        assert!(!worker.shutdown().join_panicked);
+    }
+
+    #[test]
+    fn cancel_clears_completed_slots_and_external_cancel_cannot_be_consumed() {
+        let mut worker = Worker::start("cancel-test", |_, _| Ok(()));
+        worker.request(request(1));
+        wait_until(|| worker.output.lock().unwrap().is_some());
+        assert!(worker.is_busy(), "unread result must retain UI polling");
+        worker.cancel();
+        assert!(!worker.is_busy());
+        assert!(worker.take_result().is_none());
+        let next = request(2);
+        let cancel = next.cancel.clone();
+        worker.request(next);
+        wait_until(|| worker.output.lock().unwrap().is_some());
+        cancel.cancel();
+        assert!(worker.take_result().is_none());
+        assert!(!worker.shutdown().join_panicked);
+    }
+
+    #[test]
+    fn cancel_drops_pending_and_prevents_late_active_publication() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = Worker::start("cancel-active-test", move |_, _| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        });
+        let active = request(1);
+        let active_cancel = active.cancel.clone();
+        worker.request(active);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let pending = request(2);
+        let pending_cancel = pending.cancel.clone();
+        worker.request(pending);
+        worker.cancel();
+        assert!(active_cancel.check().is_err());
+        assert!(pending_cancel.check().is_err());
+        release_tx.send(()).unwrap();
+        wait_until(|| !worker.is_busy());
+        assert!(worker.take_result().is_none());
+    }
+
+    #[test]
+    fn shutdown_is_joined_idempotent_and_rejects_new_work() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let finished = Arc::new(AtomicBool::new(false));
+        let operation_finished = finished.clone();
+        let mut worker = Worker::start("shutdown-test", move |_, cancel| {
+            entered_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while cancel.check().is_ok() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            operation_finished.store(true, AtomicOrdering::Release);
+            Ok(())
+        });
+        worker.request(request(1));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let report = worker.shutdown();
+        assert!(finished.load(AtomicOrdering::Acquire));
+        assert!(report.cancelled_active);
+        assert!(!report.join_panicked);
+        assert_eq!(worker.shutdown(), report);
+        assert!(worker.thread.is_none());
+        assert!(!worker.is_busy());
+        assert!(worker.take_result().is_none());
+        let rejected = request(2);
+        let token = rejected.cancel.clone();
+        worker.request(rejected);
+        assert!(token.check().is_err());
+        assert!(!worker.is_busy());
+    }
+
+    #[test]
+    fn shutdown_clears_pending_and_result_slots() {
+        let mut idle = Worker::start("shutdown-output-test", |_, _| Ok(()));
+        idle.request(request(1));
+        wait_until(|| idle.output.lock().unwrap().is_some());
+        assert!(idle.shutdown().discarded_result);
+        assert!(idle.take_result().is_none());
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut active = Worker::start("shutdown-pending-test", move |_, _| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        });
+        active.request(request(1));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let pending = request(2);
+        let token = pending.cancel.clone();
+        active.request(pending);
+        let releaser = thread::spawn(move || {
+            wait_until(|| token.check().is_err());
+            release_tx.send(()).unwrap();
+        });
+        let report = active.shutdown();
+        releaser.join().unwrap();
+        assert!(report.cancelled_active);
+        assert!(report.discarded_pending);
+        assert!(!report.join_panicked);
+        assert!(active.take_result().is_none());
+    }
+
+    #[test]
+    fn context_write_lock_does_not_block_worker_join() {
+        let ctx = eframe::egui::Context::default();
+        let mut worker = Worker::new("context-lock-test", ctx.clone(), |_, _| {
+            thread::sleep(Duration::from_millis(30));
+            Ok(())
+        });
+        worker.request(request(1));
+        wait_until(|| worker.shared.0.lock().unwrap().active.is_some());
+        ctx.input_mut(|_| {
+            assert!(!worker.shutdown().join_panicked);
+        });
+    }
+
+    #[test]
+    fn drop_waits_for_active_owner_and_operation_panic_is_recoverable() {
+        let mut worker = Worker::start("panic-test", |path, _| {
+            assert_ne!(path, Path::new("1"), "injected operation failure");
+            Ok(())
+        });
+        worker.request(request(1));
+        assert!(matches!(
+            wait_result(&worker).result,
+            Err(ToolError::Invalid(_))
+        ));
+        worker.request(request(2));
+        assert!(wait_result(&worker).result.is_ok());
+        assert!(!worker.shutdown().join_panicked);
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let finished = Arc::new(AtomicBool::new(false));
+        let operation_finished = finished.clone();
+        let worker = Worker::start("drop-test", move |_, _| {
+            entered_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(30));
+            operation_finished.store(true, AtomicOrdering::Release);
+            Ok(())
+        });
+        worker.request(request(1));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(worker);
+        assert!(finished.load(AtomicOrdering::Acquire));
+    }
+
     #[test]
     fn current_outside_capped_listing_is_retained_within_both_budgets() {
         let paths = (0..MAX_DIRECTORY_IMAGES)
@@ -287,13 +731,21 @@ mod tests {
     #[test]
     fn directory_filters_orders_and_cancels() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["z.PNG", "a.jpeg", "中 文.jpg", "ignore.bmp", "ignore.txt"] {
+        for name in [
+            "z.PNG",
+            "a.jpeg",
+            "中 文.jpg",
+            "image10.WeBp",
+            "image2.GIF",
+            "ignore.bmp",
+            "ignore.txt",
+        ] {
             std::fs::write(dir.path().join(name), b"fixture").unwrap();
         }
         std::fs::create_dir(dir.path().join("folder.png")).unwrap();
         let source = dir.path().join("z.PNG");
         let listing = scan(&source, &Cancellation::default()).unwrap();
-        assert_eq!(listing.paths.len(), 3);
+        assert_eq!(listing.paths.len(), 5);
         assert_eq!(listing.paths[0].file_name().unwrap(), "a.jpeg");
         assert!(!listing.truncated);
         let cancel = Cancellation::default();

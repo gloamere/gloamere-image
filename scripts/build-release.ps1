@@ -40,20 +40,30 @@ foreach ($key in @('CARGO_ENCODED_RUSTFLAGS', 'RUSTFLAGS', 'CARGO_HOME', 'RUSTUP
     $previous[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
 }
 $stages = [ordered]@{}
-foreach ($name in @('python_preflight', 'environment_preflight', 'packaging_contracts', 'installer_contracts', 'migration_contracts', 'resource_contracts', 'format', 'clippy', 'debug_build', 'debug_tests', 'release_build', 'release_tests', 'pe_resources', 'dependency_tree', 'license_notices', 'stage_payload', 'validate_payload', 'compile_setup')) {
+foreach ($name in @('python_preflight', 'environment_preflight', 'packaging_contracts', 'installer_contracts', 'migration_contracts', 'native_installer_contracts', 'resource_contracts', 'format', 'clippy', 'debug_build', 'debug_tests', 'release_build', 'release_tests', 'pe_resources', 'dependency_tree', 'license_notices', 'stage_payload', 'validate_payload', 'compile_setup')) {
     $stages[$name] = 'not_run'
 }
 $activeStage = 'preflight'
 $failure = $null
+[UInt64]$animationSoakSeconds = 1800
+if ($env:GLOAMERE_ANIMATION_SOAK_SECONDS) {
+    if ($env:GLOAMERE_ANIMATION_SOAK_SECONDS -notmatch '^[0-9]+$' -or
+        -not [UInt64]::TryParse($env:GLOAMERE_ANIMATION_SOAK_SECONDS, [ref]$animationSoakSeconds)) {
+        throw 'GLOAMERE_ANIMATION_SOAK_SECONDS must be an unsigned integer; clear it for the default 1800-second core soak.'
+    }
+    if ($animationSoakSeconds -lt 1) { $animationSoakSeconds = 1 }
+}
+$animationSoakMode = if ($animationSoakSeconds -lt 1800) { 'short_smoke_only' } else { 'core_long_run_requested' }
 $internal = Join-Path $outputRoot 'internal'
 $release = Join-Path $outputRoot 'release'
 $logs = Join-Path $internal 'logs'
 New-Item -ItemType Directory -Path $logs -Force | Out-Null
 $report = [ordered]@{
-    product = 'gloamere-image'; version = '0.4.0'; distribution = 'Setup EXE only'
+    product = 'gloamere-image'; version = $null; distribution = 'Setup EXE only'
     started_utc = [DateTime]::UtcNow.ToString('o'); status = 'running'
     signature_status = 'NotSigned'; stages = $stages
     windows_lifecycle_qa = 'not_run'; windows_visual_qa = 'not_run'
+    animation_core_test = [ordered]@{ seconds_per_profile = $animationSoakSeconds; mode = $animationSoakMode; gui_playback_qa = 'not_run' }
     limitations = @('Compilation is not installation/upgrade/rollback/uninstall acceptance.', 'Unsigned test build; no signing or trust validation claimed.')
 }
 function Invoke-Gate([string]$Name, [string]$Executable, [string[]]$Arguments) {
@@ -74,6 +84,9 @@ function Invoke-Gate([string]$Name, [string]$Executable, [string[]]$Arguments) {
 Push-Location $projectRoot
 try {
     Invoke-Gate 'python_preflight' $python @('-c', 'import sys, tomllib; assert sys.version_info >= (3, 11), "Python 3.11+ required"')
+    $productVersion = & $python (Join-Path $PSScriptRoot 'build-installer.py') --print-version
+    if ($LASTEXITCODE -ne 0 -or $productVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Cannot resolve paired Cargo candidate versions.' }
+    $report['version'] = $productVersion
     $activeStage = 'environment_preflight'
     & (Join-Path $PSScriptRoot 'init-build-environment.ps1') -WorkspaceRoot $workspaceRoot
     $scopedCargo = Join-Path $workspaceRoot 'toolchain\cargo'
@@ -134,20 +147,22 @@ try {
     Invoke-Gate 'packaging_contracts' $python @((Join-Path $PSScriptRoot 'test-release-packaging.py'))
     Invoke-Gate 'installer_contracts' $python @((Join-Path $PSScriptRoot 'test-default-apps-installer.py'))
     Invoke-Gate 'migration_contracts' $python @((Join-Path $PSScriptRoot 'test-branding-migration.py'))
+    Invoke-Gate 'native_installer_contracts' $python @((Join-Path $PSScriptRoot 'test-native-installer.py'))
     Invoke-Gate 'resource_contracts' $python @((Join-Path $projectRoot 'build-support\test_windows_resources.py'))
     Invoke-Gate 'format' $cargo @('fmt', '--all', '--check')
     Invoke-Gate 'clippy' $cargo @('clippy', '--workspace', '--all-targets', '--locked', '--offline', '--target', $target, '--', '-D', 'warnings')
     Invoke-Gate 'debug_build' $cargo @('build', '--workspace', '--all-targets', '--locked', '--offline', '--target', $target)
-    Invoke-Gate 'debug_tests' $cargo @('test', '--workspace', '--all-targets', '--locked', '--offline', '--target', $target, '--', '--include-ignored', '--test-threads=1')
+    Write-Host ("Animation core test: {0} seconds per profile ({1}). This does not test GUI playback." -f $animationSoakSeconds, $animationSoakMode)
+    Invoke-Gate 'debug_tests' $cargo @('test', '--workspace', '--all-targets', '--locked', '--offline', '--target', $target, '--', '--include-ignored', '--nocapture', '--test-threads=1')
     Invoke-Gate 'release_build' $cargo @('build', '--workspace', '--release', '--all-targets', '--locked', '--offline', '--target', $target)
-    Invoke-Gate 'release_tests' $cargo @('test', '--workspace', '--release', '--all-targets', '--locked', '--offline', '--target', $target, '--', '--include-ignored', '--test-threads=1')
+    Invoke-Gate 'release_tests' $cargo @('test', '--workspace', '--release', '--all-targets', '--locked', '--offline', '--target', $target, '--', '--include-ignored', '--nocapture', '--test-threads=1')
     $binaryRoot = Join-Path $targetRoot ($target + '\release')
-    Invoke-Gate 'pe_resources' $python @((Join-Path $projectRoot 'build-support\verify_windows_resources.py'), '--version', '0.4.0', (Join-Path $binaryRoot 'gloamere-image.exe'), (Join-Path $binaryRoot 'gloamere-image-worker.exe'))
+    Invoke-Gate 'pe_resources' $python @((Join-Path $projectRoot 'build-support\verify_windows_resources.py'), '--version', $productVersion, (Join-Path $binaryRoot 'gloamere-image.exe'), (Join-Path $binaryRoot 'gloamere-image-ui.exe'), (Join-Path $binaryRoot 'gloamere-image-worker.exe'))
     Invoke-Gate 'dependency_tree' $cargo @('tree', '--workspace', '--locked', '--offline', '--target', $target, '--edges', 'normal,build', '--prefix', 'none', '--format', '{p}')
     $licenseRoot = Join-Path $internal 'licenses'
     Invoke-Gate 'license_notices' $python @((Join-Path $PSScriptRoot 'collect-licenses.py'), '--tree', (Join-Path $logs 'dependency_tree.log'), '--registry', (Join-Path $cargoRoot 'registry\src'), '--cache', (Join-Path $projectRoot 'third-party-notices'), '--output', $licenseRoot)
     $validation = Join-Path $internal 'VALIDATION.md'
-    $validationText = "# gloamere-image 0.4.0 build validation`n`n"
+    $validationText = "# gloamere-image $productVersion build validation`n`n"
     foreach ($entry in $stages.GetEnumerator()) { $validationText += '- ' + $entry.Key + ': ' + $entry.Value + "`n" }
     $validationText += "`nStatic CRT requested for x86_64-pc-windows-msvc. Unsigned test build.`nWindows installation, upgrade, rollback, uninstall and visual QA: NOT RUN by this command.`nInno compile outcome and artifact hash appear in the accompanying installer-build.json.`n"
     [IO.File]::WriteAllText($validation, $validationText, $utf8)

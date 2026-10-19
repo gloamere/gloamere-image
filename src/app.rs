@@ -1,7 +1,14 @@
+#[path = "app_ai.rs"]
+mod ai_ui;
+#[path = "app_update.rs"]
+mod update_ui;
 use crate::viewer_ui::{self, ActionButton, CompactAction, Icon, ToolbarLayout};
 use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
 use light_image_tool::{
     Cancellation, ToolError,
+    animation::{
+        AnimationFrame, AnimationRequest, AnimationSource, AnimationWorker, PlaybackClock,
+    },
     browsing::{self, DirectoryListing, Request as BrowserRequest, Worker as BrowserWorker},
     edit::{self, EditOp},
     export::{self, ExportFormat, ExportOptions},
@@ -41,9 +48,29 @@ fn accessible_path_input(ui: &mut egui::Ui, text: &mut String, name: &str, width
     ui.add(egui::TextEdit::singleline(text).id(id).desired_width(width));
 }
 
+#[derive(Clone, Debug, Default)]
+enum DocumentSource {
+    #[default]
+    File,
+    Clipboard,
+    ExtractedFrame {
+        name: String,
+        frame: u32,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingIntent {
+    Open(PathBuf),
+    Clipboard,
+    Restore,
+    Close,
+}
+
 enum WorkResult {
     Edited(light_image_tool::Result<light_image_tool::memory::Pixels>),
     Exported(light_image_tool::Result<PathBuf>),
+    ClipboardRead(light_image_tool::Result<light_image_tool::clipboard::ClipboardInput>),
+    ClipboardCopied(light_image_tool::Result<String>),
 }
 fn protected<T>(
     operation: impl FnOnce() -> light_image_tool::Result<T>,
@@ -57,12 +84,13 @@ struct PreviewTask {
     matte: [u8; 3],
     cancel: Cancellation,
     receiver: mpsc::Receiver<light_image_tool::Result<light_image_tool::memory::Pixels>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 struct Work {
     generation: u64,
     cancel: Cancellation,
     receiver: mpsc::Receiver<WorkResult>,
-    // Only export owns files. Keep its thread until cleanup/publication has completed.
+    // Every operation is joined; the name is retained for v0.4 test compatibility.
     export_thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Work {
@@ -102,6 +130,27 @@ struct ProvenanceTask {
     generation: u64,
     cancel: Cancellation,
     receiver: mpsc::Receiver<light_image_tool::Result<EvidenceReport>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for PreviewTask {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            log::error!("shutdown: preview worker panicked");
+        }
+    }
+}
+impl Drop for ProvenanceTask {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            log::error!("shutdown: provenance worker panicked");
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EvidenceStage {
@@ -128,6 +177,51 @@ fn evidence_stage_label(stage: EvidenceStage) -> &'static str {
         EvidenceStage::Complete => "离线核验已结束",
         EvidenceStage::Cancelled => "核验已取消，可重新核验",
         EvidenceStage::Failed => "核验任务失败，可重新核验",
+    }
+}
+struct Playback {
+    source: Arc<AnimationSource>,
+    clock: PlaybackClock,
+    cancel: Cancellation,
+    pending: Option<AnimationFrame>,
+    in_flight: Option<u64>,
+    sequence: u64,
+    manual_paused: bool,
+    requires_restart: bool,
+    suspended: bool,
+    step_requested: bool,
+    ended: bool,
+    eof_pending: bool,
+    frame_delay: std::time::Duration,
+    frame_index: u32,
+    traversal: u32,
+    elapsed: std::time::Duration,
+    warning: Option<String>,
+}
+impl Playback {
+    fn new(source: Arc<AnimationSource>) -> Self {
+        let frame_delay = source.first_delay;
+        let mut clock = PlaybackClock::new(frame_delay);
+        clock.resume(Instant::now());
+        Self {
+            source,
+            clock,
+            cancel: Cancellation::default(),
+            pending: None,
+            in_flight: None,
+            sequence: 0,
+            manual_paused: false,
+            requires_restart: false,
+            suspended: false,
+            step_requested: false,
+            ended: false,
+            eof_pending: false,
+            frame_delay,
+            frame_index: 1,
+            traversal: 1,
+            elapsed: std::time::Duration::ZERO,
+            warning: None,
+        }
     }
 }
 struct Tile {
@@ -222,15 +316,32 @@ struct ThumbnailEntry {
 pub struct ImageApp {
     brand_texture: egui::TextureHandle,
     loader: Loader,
+    animation_worker: AnimationWorker,
+    playback: Option<Playback>,
+    extract_dialog: bool,
     generation: u64,
     load_cancel: Cancellation,
     loading: bool,
     loaded: Option<LoadedImage>,
     pixels: Option<Arc<light_image_tool::memory::Pixels>>,
     tiles: Vec<Tile>,
+    canvas_unavailable: bool,
+    retired_texture_reservations: Vec<(u64, light_image_tool::memory::Reservation)>,
     undo: Vec<Arc<light_image_tool::memory::Pixels>>,
     edited: bool,
+    source: DocumentSource,
+    temporary_original: Option<Arc<light_image_tool::memory::Pixels>>,
+    temporary_color_status: String,
+    temporary_color_managed: bool,
+    exported_pixels: Option<std::sync::Weak<light_image_tool::memory::Pixels>>,
+    pending_intent: Option<PendingIntent>,
+    pending_export: bool,
+    pending_focus: bool,
+    close_approved: bool,
+    shutting_down: bool,
     siblings: Vec<PathBuf>,
+    ai: light_image_tool::ai::Controller,
+    ai_view: ai_ui::AiView,
     directory_worker: BrowserWorker<DirectoryListing>,
     directory_generation: u64,
     directory_path: Option<PathBuf>,
@@ -245,11 +356,25 @@ pub struct ImageApp {
     list_viewport_rect: Option<Rect>,
     selected_list_row_rect: Option<Rect>,
     preferences: Preferences,
+    updater: light_image_tool::updater::client::Client,
+    model_updater: light_image_tool::updater::model_client::ModelClient,
+    update_health_sent: bool,
+    update_health_probe: Option<light_image_tool::updater::launch::HealthProbe>,
+    update_normal_exit: bool,
+    update_modal_open: bool,
+    update_shutdown_observed: bool,
     settings_path: Option<PathBuf>,
     settings_warning: Option<String>,
     position: usize,
     zoom: f32,
     fit: bool,
+    long_image: bool,
+    fit_width: bool,
+    long_scroll: f32,
+    long_to_bottom: bool,
+    canvas_viewport: Option<Rect>,
+    fullscreen_activity: f64,
+    toolbar_hidden: bool,
     pan: Vec2,
     editing: bool,
     info_open: bool,
@@ -277,6 +402,7 @@ pub struct ImageApp {
     crop_apply_rect: Option<Rect>,
     resize: [u32; 2],
     keep_ratio: bool,
+    resize_tool: bool,
     format: ExportFormat,
     quality: u8,
     matte: [u8; 3],
@@ -402,8 +528,20 @@ impl ImageApp {
         }
         let persistent = smoke.is_none();
         let mut app = Self::from_context(cc.egui_ctx.clone(), adapter, initial, smoke);
+        app.update_shutdown_observed =
+            light_image_tool::updater::platform::install_shutdown_observer(cc).is_ok();
         if persistent {
             app.settings_path = settings::user_settings_path();
+            app.updater = light_image_tool::updater::client::Client::load(
+                light_image_tool::updater::launch::state_directory()
+                    .and_then(|p| p.parent().map(|d| d.join("update-settings.json"))),
+            );
+            app.ai = light_image_tool::ai::Controller::new(
+                app.settings_path
+                    .as_ref()
+                    .map(|path| path.with_file_name("ai-records.sqlite")),
+            );
+            app.ai_sync_scope();
             if let Some(path) = &app.settings_path {
                 match settings::load(path) {
                     Ok(preferences) => app.preferences = preferences,
@@ -415,6 +553,10 @@ impl ImageApp {
         app
     }
     fn cancel_background(&mut self) {
+        if let Some(playback) = &self.playback {
+            playback.cancel.cancel();
+        }
+        self.animation_worker.stop();
         self.directory_worker.cancel();
         self.thumbnail_worker.cancel();
         self.load_cancel.cancel();
@@ -429,10 +571,45 @@ impl ImageApp {
         }
     }
     fn shutdown_background(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
+        let started = Instant::now();
+        log::info!("shutdown: admission stopped; cancellation begins");
         self.cancel_background();
-        // Finish file-owning work before returning to main's process-exit boundary.
-        // Work also owns this join when poll removes a completed/stale/failed task.
         drop(self.work.take());
+        log::info!(
+            "shutdown: edit/export owners joined; elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        drop(self.preview_task.take());
+        drop(self.evidence_task.take());
+        log::info!(
+            "shutdown: preview/provenance owners joined; elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        self.animation_worker.shutdown();
+        self.playback = None;
+        log::info!(
+            "shutdown: animation joined; elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        self.loader.shutdown();
+        self.directory_worker.shutdown();
+        self.thumbnail_worker.shutdown();
+        self.ai.shutdown();
+        log::info!(
+            "shutdown: loader/browser joined; elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        self.tiles.clear();
+        self.thumbnail_cache.clear();
+        self.preview_texture = None;
+        log::info!(
+            "shutdown: app textures released to renderer; GPU teardown follows outside app; elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
     }
     fn from_context(
         ctx: egui::Context,
@@ -443,15 +620,32 @@ impl ImageApp {
         let mut app = Self {
             brand_texture: viewer_ui::load_brand_texture(&ctx),
             loader: Loader::new(ctx.clone()),
+            animation_worker: AnimationWorker::new(ctx.clone()),
+            playback: None,
+            extract_dialog: false,
             generation: 0,
             load_cancel: Cancellation::default(),
             loading: false,
             loaded: None,
             pixels: None,
             tiles: Vec::new(),
+            canvas_unavailable: false,
+            retired_texture_reservations: Vec::new(),
             undo: Vec::new(),
             edited: false,
+            source: DocumentSource::File,
+            temporary_original: None,
+            temporary_color_status: String::new(),
+            temporary_color_managed: true,
+            exported_pixels: None,
+            pending_intent: None,
+            pending_export: false,
+            pending_focus: false,
+            close_approved: false,
+            shutting_down: false,
             siblings: Vec::new(),
+            ai: light_image_tool::ai::Controller::new(None),
+            ai_view: ai_ui::AiView::default(),
             directory_worker: BrowserWorker::new("directory-scanner", ctx.clone(), browsing::scan),
             directory_generation: 0,
             directory_path: None,
@@ -470,11 +664,25 @@ impl ImageApp {
             list_viewport_rect: None,
             selected_list_row_rect: None,
             preferences: Preferences::default(),
+            updater: light_image_tool::updater::client::Client::default(),
+            model_updater: light_image_tool::updater::model_client::ModelClient::default(),
+            update_health_sent: false,
+            update_health_probe: None,
+            update_normal_exit: false,
+            update_modal_open: false,
+            update_shutdown_observed: false,
             settings_path: None,
             settings_warning: None,
             position: 0,
             zoom: 1.0,
             fit: true,
+            long_image: false,
+            fit_width: false,
+            long_scroll: 0.0,
+            long_to_bottom: false,
+            canvas_viewport: None,
+            fullscreen_activity: 0.0,
+            toolbar_hidden: false,
             pan: Vec2::ZERO,
             editing: false,
             info_open: false,
@@ -502,6 +710,7 @@ impl ImageApp {
             crop_apply_rect: None,
             resize: [1, 1],
             keep_ratio: true,
+            resize_tool: false,
             format: ExportFormat::Png,
             quality: 92,
             matte: [255; 3],
@@ -549,6 +758,8 @@ impl ImageApp {
 
     fn prepare_browser(&mut self, path: &PathBuf) {
         let parent = browsing::directory(path);
+        let scope_changed =
+            self.directory_path.as_ref() != Some(&parent) || !self.siblings.contains(path);
         if self.directory_path.as_ref() != Some(&parent) {
             self.directory_generation += 1;
             self.directory_path = Some(parent);
@@ -572,6 +783,12 @@ impl ImageApp {
             }
         }
         self.requested_path = Some(path.clone());
+        if scope_changed {
+            self.ai_sync_scope();
+        } else {
+            self.ai.set_current(path);
+            self.ai_rebuild_view();
+        }
         if let Some(position) = self.siblings.iter().position(|p| p == path) {
             self.position = position;
         }
@@ -582,12 +799,58 @@ impl ImageApp {
             self.prepare_browser(&path);
         }
     }
+    fn unsaved(&self) -> bool {
+        self.edited
+            && !self
+                .exported_pixels
+                .as_ref()
+                .zip(self.pixels.as_ref())
+                .is_some_and(|(saved, current)| saved.ptr_eq(&Arc::downgrade(current)))
+    }
+    fn original_pixels(&self) -> Option<Arc<light_image_tool::memory::Pixels>> {
+        self.temporary_original
+            .clone()
+            .or_else(|| self.loaded.as_ref().map(|l| l.pixels.clone()))
+    }
     fn open(&mut self, path: PathBuf) {
+        if self.shutting_down || self.pending_intent.is_some() {
+            return;
+        }
+        if self.unsaved() {
+            self.pending_intent = Some(PendingIntent::Open(path));
+            self.pending_focus = true;
+            return;
+        }
+        self.open_now(path);
+    }
+    fn open_now(&mut self, path: PathBuf) {
+        if let Some(playback) = self.playback.take() {
+            playback.cancel.cancel();
+        }
+        self.animation_worker.stop();
+        self.extract_dialog = false;
         self.prepare_browser(&path);
         self.crop_selecting = false;
         self.crop_anchor = None;
         self.close_export();
         self.undo.clear();
+        self.exported_pixels = None;
+        if self
+            .pixels
+            .as_ref()
+            .is_some_and(|p| u64::from(p.width()) * u64::from(p.height()) > 4_000_000)
+        {
+            for tile in self.tiles.drain(..) {
+                self.retired_texture_reservations
+                    .push((self.frames + 2, tile._reservation));
+            }
+            self.pixels = None;
+            self.loaded = None;
+            self.temporary_original = None;
+        }
+        self.thumbnail_worker.cancel();
+        self.thumbnail_busy = None;
+        self.thumbnail_cache.clear();
         self.load_cancel.cancel();
         self.load_cancel = Cancellation::default();
         if let Some(work) = &self.work {
@@ -609,10 +872,261 @@ impl ImageApp {
             cancel: self.load_cancel.clone(),
         });
     }
+    fn request_intent(&mut self, intent: PendingIntent, ctx: &egui::Context) {
+        if self.shutting_down || self.pending_intent.is_some() {
+            return;
+        }
+        if self.unsaved() {
+            self.pending_intent = Some(intent);
+            self.pending_focus = true;
+            self.more_open = false;
+        } else {
+            self.perform_intent(intent, ctx);
+        }
+    }
+    fn perform_intent(&mut self, intent: PendingIntent, ctx: &egui::Context) {
+        match intent {
+            PendingIntent::Open(path) => self.open_now(path),
+            PendingIntent::Clipboard => self.open_clipboard_now(ctx),
+            PendingIntent::Restore => {
+                self.pixels = self.original_pixels();
+                self.undo.clear();
+                self.edited = !matches!(self.source, DocumentSource::File);
+                self.exported_pixels = None;
+                self.refresh_texture(ctx);
+                let [w, h] = self.dimensions();
+                self.resize = [w, h];
+                self.crop = [0, 0, w, h];
+            }
+            PendingIntent::Close => {
+                self.close_approved = true;
+                self.update_normal_exit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+    fn open_clipboard_now(&mut self, ctx: &egui::Context) {
+        if self.work.is_some() || self.loading {
+            return;
+        }
+        let cancel = Cancellation::default();
+        let token = cancel.clone();
+        let (tx, receiver) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let result = protected(
+                || {
+                    token.check()?;
+                    let input = light_image_tool::clipboard::ClipboardAdapter::new()
+                        .read_image_or_file()
+                        .map_err(|e| ToolError::Invalid(e.to_string()))?;
+                    token.check()?;
+                    Ok(input)
+                },
+                "剪贴板读取异常；当前图像未修改",
+            );
+            let _ = tx.try_send(WorkResult::ClipboardRead(result));
+        });
+        self.work = Some(Work {
+            generation: self.generation,
+            cancel,
+            receiver,
+            export_thread: Some(thread),
+        });
+        self.status = "正在读取剪贴板图像…".into();
+        ctx.request_repaint();
+    }
+    fn copy_image(&mut self, ctx: &egui::Context) {
+        if self.work.is_some() || self.loading {
+            return;
+        }
+        let Some(pixels) = self.pixels.clone() else {
+            return;
+        };
+        let success = if self.playback.is_some() {
+            "已复制当前帧（完整静态像素）"
+        } else {
+            "已复制完整图像像素"
+        }
+        .to_string();
+        let cancel = Cancellation::default();
+        let token = cancel.clone();
+        let (tx, receiver) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let result = protected(
+                || {
+                    token.check()?;
+                    light_image_tool::clipboard::ClipboardAdapter::new()
+                        .copy_pixels_cancellable(&pixels, &token)
+                        .map(|()| success)
+                        .map_err(|e| match e {
+                            light_image_tool::clipboard::ClipboardError::Cancelled => {
+                                ToolError::Cancelled
+                            }
+                            e => ToolError::Invalid(e.to_string()),
+                        })
+                },
+                "剪贴板写入异常；请重试或导出 PNG 副本",
+            );
+            let _ = tx.try_send(WorkResult::ClipboardCopied(result));
+        });
+        self.work = Some(Work {
+            generation: self.generation,
+            cancel,
+            receiver,
+            export_thread: Some(thread),
+        });
+        self.status = "正在复制完整图像像素…".into();
+        ctx.request_repaint();
+    }
+    fn copy_path(&mut self, ctx: &egui::Context) {
+        if self.work.is_some() || self.loading {
+            return;
+        }
+        let Some(path) = self
+            .loaded
+            .as_ref()
+            .map(|l| l.path.to_string_lossy().into_owned())
+        else {
+            return;
+        };
+        let cancel = Cancellation::default();
+        let token = cancel.clone();
+        let (tx, receiver) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let result = protected(
+                || {
+                    token.publish(|| {
+                        light_image_tool::clipboard::ClipboardAdapter::new()
+                            .copy_text(&path)
+                            .map_err(|e| ToolError::Invalid(e.to_string()))?;
+                        Ok("已复制文件路径".into())
+                    })
+                },
+                "路径复制未完成，请重试",
+            );
+            let _ = tx.try_send(WorkResult::ClipboardCopied(result));
+        });
+        self.work = Some(Work {
+            generation: self.generation,
+            cancel,
+            receiver,
+            export_thread: Some(thread),
+        });
+        self.status = "正在复制文件路径…".into();
+        ctx.request_repaint();
+    }
+    fn set_temporary_image(
+        &mut self,
+        image: light_image_tool::clipboard::ClipboardImage,
+        ctx: &egui::Context,
+    ) {
+        self.cancel_background();
+        self.generation += 1;
+        self.directory_generation += 1;
+        self.directory_worker.cancel();
+        self.directory_scanning = false;
+        self.thumbnail_busy = None;
+        self.thumbnail_cache.clear();
+        self.siblings.clear();
+        self.ai.set_scope(&[], None);
+        self.ai_rebuild_view();
+        self.directory_path = None;
+        self.requested_path = None;
+        self.position = 0;
+        self.loaded = None;
+        self.evidence = None;
+        self.evidence_attempted = true;
+        self.evidence_stage = EvidenceStage::NotStarted;
+        self.playback = None;
+        self.source = DocumentSource::Clipboard;
+        self.temporary_color_status = image.color_status;
+        if !image.warnings.is_empty() {
+            self.temporary_color_status
+                .push_str(&format!("；{}", image.warnings.join("；")));
+        }
+        self.temporary_color_managed = image.color_managed;
+        self.temporary_original = Some(image.pixels.clone());
+        self.pixels = Some(image.pixels);
+        self.undo.clear();
+        self.edited = true;
+        self.exported_pixels = None;
+        self.loading = false;
+        self.fit_window();
+        self.resize = self.dimensions();
+        self.crop = [0, 0, self.resize[0], self.resize[1]];
+        self.refresh_texture(ctx);
+        self.status = "剪贴板图片 · 尚未保存 · 未读取原文件来源".into();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+            "gloamere-image · 剪贴板图片".into(),
+        ));
+    }
+    fn unsaved_dialog(&mut self, ctx: &egui::Context) {
+        if self.pending_intent.is_none() || self.pending_export {
+            return;
+        }
+        let mut visible = true;
+        let mut choice = 0;
+        egui::Window::new("有未导出的改动")
+            .open(&mut visible)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .max_width((ctx.viewport_rect().width() - 40.0).max(240.0))
+            .show(ctx, |ui| {
+                ui.label("继续会丢弃当前编辑。原图保持不变。");
+                if ui
+                    .add_enabled(self.work.is_none(), egui::Button::new("导出副本后继续"))
+                    .clicked()
+                {
+                    choice = 1;
+                }
+                if ui
+                    .add_enabled(self.work.is_none(), egui::Button::new("放弃改动并继续"))
+                    .clicked()
+                {
+                    choice = 2;
+                }
+                let cancel = ui.button("取消");
+                if self.pending_focus {
+                    self.pending_focus = false;
+                    cancel.request_focus();
+                }
+                if cancel.clicked() {
+                    choice = 3;
+                }
+            });
+        if !visible {
+            self.pending_intent = None;
+            return;
+        }
+        self.resolve_pending_choice(choice, ctx);
+    }
+    fn resolve_pending_choice(&mut self, choice: u8, ctx: &egui::Context) {
+        match choice {
+            1 => {
+                self.pending_export = true;
+                self.begin_export();
+                if !self.export_dialog {
+                    self.pending_export = false;
+                    self.pending_intent = None;
+                }
+            }
+            2 => {
+                if let Some(intent) = self.pending_intent.take() {
+                    self.perform_intent(intent, ctx);
+                }
+            }
+            3 => self.pending_intent = None,
+            _ => {}
+        }
+    }
     fn open_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("gloamere-image · 打开图片")
-            .add_filter("JPEG / PNG", &["jpg", "jpeg", "png"])
+            .add_filter(
+                "JPEG / PNG / GIF / WebP",
+                &["jpg", "jpeg", "png", "gif", "webp"],
+            )
             .pick_file()
         {
             self.open(path);
@@ -636,6 +1150,7 @@ impl ImageApp {
             .map(|l| &l.pixels)
             .into_iter()
             .chain(self.pixels.iter())
+            .chain(self.temporary_original.iter())
             .chain(self.undo.iter())
         {
             if !unique.iter().any(|p| Arc::ptr_eq(p, pixels)) {
@@ -683,13 +1198,14 @@ impl ImageApp {
             "browser_fixed_reservation_bytes": self._browser_reservation.bytes(),
             "thumbnail_cpu_gpu_estimate_bytes": self.thumbnail_cache.iter().filter_map(|entry| entry.texture.as_ref()).map(|texture| texture.size()[0] as u64 * texture.size()[1] as u64 * 8).sum::<u64>(),
             "preview_reservation_bytes": self.preview_reservation.as_ref().map_or(0, |r| r.bytes()),
+            "texture_handoff_reservations_bytes": self.retired_texture_reservations.iter().map(|(_, r)| r.bytes()).sum::<u64>(),
             "total_resident_logical_estimate_bytes": self.resident_estimate(),
             "owned_total_bytes": light_image_tool::memory::in_use(),
             "owned_peak_bytes": light_image_tool::memory::peak(),
             "driver_allocator_and_delayed_resource_release": "not measured separately; logical estimates are not process memory limits"
         })
     }
-    fn update_preview(&mut self, ctx: &egui::Context) {
+    fn update_preview(&mut self, _ctx: &egui::Context) {
         if !self.export_dialog || self.format != ExportFormat::Jpeg || !self.current_has_alpha {
             self.preview_matte = None;
             self.preview_texture = None;
@@ -716,9 +1232,8 @@ impl ImageApp {
         let matte = self.matte;
         let cancel = Cancellation::default();
         let token = cancel.clone();
-        let wake = ctx.clone();
         let (tx, rx) = mpsc::sync_channel(1);
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                 || -> light_image_tool::Result<_> {
                     let mut reservation = light_image_tool::memory::reserve(4 * 1024 * 1024)?;
@@ -740,13 +1255,13 @@ impl ImageApp {
             ))
             .unwrap_or_else(|_| Err(ToolError::Invalid("预览后台异常".into())));
             let _ = tx.send(result);
-            wake.request_repaint();
         });
         self.preview_task = Some(PreviewTask {
             generation: self.generation,
             matte,
             cancel,
             receiver: rx,
+            thread: Some(thread),
         });
     }
     fn poll_preview(&mut self, ctx: &egui::Context) {
@@ -793,17 +1308,12 @@ impl ImageApp {
         }
     }
     fn navigate(&mut self, step: isize) {
-        if self.siblings.is_empty() {
-            return;
+        if let Some(next) = self.ai_navigation_target(step) {
+            self.select_image(next);
         }
-        let next =
-            (self.position as isize + step).rem_euclid(self.siblings.len() as isize) as usize;
-        self.position = next;
-        self.open(self.siblings[next].clone());
     }
     fn select_image(&mut self, position: usize) {
         if let Some(path) = self.siblings.get(position).cloned() {
-            self.position = position;
             self.open(path);
         }
     }
@@ -822,6 +1332,7 @@ impl ImageApp {
             self.directory_scanning = false;
             match response.result {
                 Ok(listing) => {
+                    let previous_paths = self.siblings.clone();
                     self.siblings = if let Some(path) = &self.requested_path {
                         browsing::ensure_current(listing.paths, path)
                             .unwrap_or_else(|_| vec![path.clone()])
@@ -835,6 +1346,9 @@ impl ImageApp {
                         .truncated
                         .then(|| "目录较大，列表已到安全上限；可直接打开其他图片".into());
                     self.locate_current = true;
+                    if self.siblings != previous_paths {
+                        self.ai_sync_scope();
+                    }
                 }
                 Err(ToolError::Cancelled) => {}
                 Err(error) => {
@@ -908,12 +1422,14 @@ impl ImageApp {
         });
     }
     fn image_list(&mut self, ui: &mut egui::Ui) {
+        self.ai_list_header(ui);
+        let indices = self.ai_visible_indices();
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), 28.0),
             egui::Layout::left_to_right(egui::Align::Min),
             |ui| {
                 ui.label(egui::RichText::new("同目录图片").strong());
-                ui.weak(format!("{} / {}", self.position + 1, self.siblings.len()));
+                ui.weak(format!("{} / {}", indices.len(), self.siblings.len()));
             },
         );
         ui.allocate_ui_with_layout(
@@ -937,6 +1453,8 @@ impl ImageApp {
                     .clicked()
                     && let Some(path) = self.requested_path.clone()
                 {
+                    self.ai.refresh();
+                    self.ai_rebuild_view();
                     self.directory_generation += 1;
                     self.directory_scanning = true;
                     self.thumbnail_worker.cancel();
@@ -964,12 +1482,17 @@ impl ImageApp {
         let row_height = 62.0;
         let mut scroll = egui::ScrollArea::vertical()
             .animated(false)
-            .stick_to_bottom(self.position + 1 == self.siblings.len())
+            .stick_to_bottom(indices.last() == Some(&self.position))
             .id_salt("directory-rows")
             .auto_shrink([false, false]);
         if self.locate_current {
             scroll = scroll.vertical_scroll_offset(
-                self.position.saturating_sub(1) as f32 * (row_height + ui.spacing().item_spacing.y),
+                indices
+                    .iter()
+                    .position(|index| *index == self.position)
+                    .unwrap_or(0)
+                    .saturating_sub(1) as f32
+                    * (row_height + ui.spacing().item_spacing.y),
             );
             self.locate_current = false;
         }
@@ -977,12 +1500,15 @@ impl ImageApp {
         let mut request = None;
         let mut visible = Vec::new();
         self.selected_list_row_rect = None;
-        let output = scroll.show_rows(ui, row_height, self.siblings.len(), |ui, rows| {
-            for index in rows {
+        let output = scroll.show_rows(ui, row_height, indices.len(), |ui, rows| {
+            for row in rows {
+                let index = indices[row];
                 let path = self.siblings[index].clone();
                 visible.push(path.clone());
-                let (rect, response) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), row_height),
+                let (_, rect) = ui.allocate_space(Vec2::new(ui.available_width(), row_height));
+                let response = ui.interact(
+                    rect,
+                    ui.make_persistent_id(("directory-row", &path)),
                     egui::Sense::click(),
                 );
                 let selected = self.requested_path.as_ref() == Some(&path);
@@ -1046,6 +1572,20 @@ impl ImageApp {
                 } else if request.is_none() {
                     request = Some(path.clone());
                 }
+                let decision = self.ai.decision(&path);
+                if self.ai.settings().show_badges
+                    && let Some(badge) = &decision.badge
+                {
+                    let label = ai_ui::thumbnail_badge_label(&decision, badge);
+                    viewer_ui::paint_ai_badge(
+                        &ui.painter_at(image_rect),
+                        image_rect.left_bottom() - Vec2::new(0.0, 19.0),
+                        label,
+                        decision.suspected,
+                        decision.manual_active,
+                        false,
+                    );
+                }
                 let text_rect = Rect::from_min_max(
                     rect.min + Vec2::new(64.0, 4.0),
                     rect.max - Vec2::splat(5.0),
@@ -1055,21 +1595,14 @@ impl ImageApp {
                 text_painter.text(
                     text_rect.min + Vec2::new(0.0, 4.0),
                     egui::Align2::LEFT_TOP,
-                    name.as_ref(),
+                    &*name,
                     egui::FontId::proportional(16.0),
                     Color32::from_gray(45),
                 );
                 text_painter.text(
                     text_rect.min + Vec2::new(0.0, 29.0),
                     egui::Align2::LEFT_TOP,
-                    format!(
-                        "{} · {}",
-                        index + 1,
-                        path.extension()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_uppercase()
-                    ),
+                    format!("{} · {}", index + 1, decision.label),
                     egui::FontId::proportional(14.0),
                     Color32::from_gray(99),
                 );
@@ -1078,12 +1611,14 @@ impl ImageApp {
                         egui::WidgetType::SelectableLabel,
                         true,
                         selected,
-                        format!("{} {}", index + 1, name),
+                        format!("{} {} · {}", index + 1, name, decision.label),
                     )
                 });
-                response
-                    .clone()
-                    .on_hover_text(path.file_name().unwrap_or_default().to_string_lossy());
+                response.clone().on_hover_text(format!(
+                    "{}\n{}",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    decision.label
+                ));
                 if response.clicked()
                     || (response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                 {
@@ -1091,6 +1626,7 @@ impl ImageApp {
                 }
             }
         });
+        self.ai.prioritize_visible(&visible);
         self.list_viewport_rect = Some(output.inner_rect);
         if let Some(smoke) = &self.smoke {
             let trace = serde_json::json!({"viewport":self.list_viewport_rect.map(|r|[r.min.x,r.min.y,r.max.x,r.max.y]),"selected":self.selected_list_row_rect.map(|r|[r.min.x,r.min.y,r.max.x,r.max.y]),"offset":[output.state.offset.x,output.state.offset.y],"content_size":[output.content_size.x,output.content_size.y]});
@@ -1132,11 +1668,12 @@ impl ImageApp {
         }
         if let Some(previous) = self.undo.pop() {
             self.pixels = Some(previous);
-            self.edited = self
-                .loaded
-                .as_ref()
-                .zip(self.pixels.as_ref())
-                .is_some_and(|(l, p)| !Arc::ptr_eq(&l.pixels, p));
+            self.edited = !matches!(self.source, DocumentSource::File)
+                || self
+                    .original_pixels()
+                    .as_ref()
+                    .zip(self.pixels.as_ref())
+                    .is_some_and(|(original, current)| !Arc::ptr_eq(original, current));
             self.refresh_texture(ctx);
             let [w, h] = self.dimensions();
             self.resize = [w, h];
@@ -1149,29 +1686,65 @@ impl ImageApp {
         self.crop_selecting = false;
         self.crop_anchor = None;
         self.close_export();
-        self.tiles.clear();
+        let same_grid = self.pixels.as_ref().is_some_and(|image| {
+            let expected = image.width().div_ceil(2048) * image.height().div_ceil(2048);
+            self.tiles.len() == expected as usize
+                && self.tiles.iter().all(|t| {
+                    t.w == 2048.min(image.width().saturating_sub(t.x))
+                        && t.h == 2048.min(image.height().saturating_sub(t.y))
+                })
+        });
+        if !same_grid {
+            for tile in self.tiles.drain(..) {
+                self.retired_texture_reservations
+                    .push((self.frames + 2, tile._reservation));
+            }
+        }
         if let Some(image) = &self.pixels {
             self.current_has_alpha = image.pixels().any(|p| p[3] < 255);
             // Existing egui texture path, tiles avoid device texture size limits without downsampling.
             const TILE: u32 = 2048;
             let mut reservation = match light_image_tool::memory::reserve(
-                image.as_raw().len() as u64 * 2 + light_image_tool::memory::OVERHEAD,
+                image.as_raw().len() as u64 * if same_grid { 1 } else { 2 }
+                    + light_image_tool::memory::OVERHEAD,
             ) {
                 Ok(r) => r,
                 Err(e) => {
+                    self.canvas_unavailable = true;
+                    for tile in self.tiles.drain(..) {
+                        self.retired_texture_reservations
+                            .push((self.frames + 2, tile._reservation));
+                    }
                     self.error = Some(e.to_string());
                     return;
                 }
             };
+            self.canvas_unavailable = false;
             for y in (0..image.height()).step_by(TILE as usize) {
                 for x in (0..image.width()).step_by(TILE as usize) {
                     let w = TILE.min(image.width() - x);
                     let h = TILE.min(image.height() - y);
-                    let tile = image::imageops::crop_imm(&***image, x, y, w, h).to_image();
-                    let color = egui::ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
-                        tile.as_raw(),
-                    );
+                    let mut colors = Vec::with_capacity((w * h) as usize);
+                    for row in y..y + h {
+                        let start = ((u64::from(row) * u64::from(image.width()) + u64::from(x)) * 4)
+                            as usize;
+                        for pixel in image.as_raw()[start..start + w as usize * 4]
+                            .as_chunks::<4>()
+                            .0
+                        {
+                            colors.push(Color32::from_rgba_unmultiplied(
+                                pixel[0], pixel[1], pixel[2], pixel[3],
+                            ));
+                        }
+                    }
+                    let color = egui::ColorImage::new([w as usize, h as usize], colors);
+                    if same_grid {
+                        let index = ((y / TILE) * image.width().div_ceil(TILE) + x / TILE) as usize;
+                        self.tiles[index]
+                            .texture
+                            .set(color, egui::TextureOptions::LINEAR);
+                        continue;
+                    }
                     let texture = ctx.load_texture(
                         format!("image-{}-{x}-{y}", self.generation),
                         color,
@@ -1189,9 +1762,15 @@ impl ImageApp {
                     });
                 }
             }
+            if same_grid {
+                self.retired_texture_reservations
+                    .push((self.frames + 1, reservation));
+            }
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        self.ai_poll(ctx);
+        self.poll_animation(ctx);
         self.poll_browser(ctx);
         self.poll_preview(ctx);
         let evidence_result = self.evidence_task.as_ref().map(|t| t.receiver.try_recv());
@@ -1247,9 +1826,24 @@ impl ImageApp {
         if let Some(response) = self.loader.take_result() {
             self.apply_load_response(response, ctx);
         }
+        if self.loading && !self.loader.is_busy() {
+            self.loading = false;
+            if self.load_cancel.check().is_err() {
+                self.restore_browser_selection();
+                self.status = "已取消打开".into();
+            }
+        }
+        if self.thumbnail_busy.is_some() && !self.thumbnail_worker.is_busy() {
+            self.thumbnail_busy = None;
+        }
+        if self.directory_scanning && !self.directory_worker.is_busy() {
+            self.directory_scanning = false;
+        }
         let done = self.work.as_ref().map(|w| w.receiver.try_recv());
         if let Some(Err(mpsc::TryRecvError::Disconnected)) = &done {
             self.work = None;
+            self.pending_intent = None;
+            self.pending_export = false;
             self.error = Some("后台操作意外退出；可以重新打开、编辑或导出".into());
             self.status = "操作已结束，原图未修改".into();
             return;
@@ -1260,7 +1854,11 @@ impl ImageApp {
             if work.generation != self.generation {
                 return;
             }
-            if matches!(&result, WorkResult::Edited(_)) && work.cancel.check().is_err() {
+            if matches!(
+                &result,
+                WorkResult::Edited(_) | WorkResult::ClipboardRead(_)
+            ) && work.cancel.check().is_err()
+            {
                 self.status = "操作已取消".into();
                 return;
             }
@@ -1286,16 +1884,43 @@ impl ImageApp {
                     self.refresh_texture(ctx);
                 }
                 WorkResult::Exported(Ok(path)) => {
+                    self.exported_pixels = self.pixels.as_ref().map(Arc::downgrade);
                     self.status = format!("已导出新副本：{}", path.display());
                     self.notice_until = Some(Instant::now() + std::time::Duration::from_secs(6));
                     ctx.request_repaint_after(std::time::Duration::from_secs(6));
                     log::info!("export committed: {}", path.display());
+                    if self.pending_export {
+                        self.pending_export = false;
+                        if let Some(intent) = self.pending_intent.take() {
+                            self.perform_intent(intent, ctx);
+                        }
+                    }
+                }
+                WorkResult::ClipboardRead(Ok(input)) => match input {
+                    light_image_tool::clipboard::ClipboardInput::Pixels(image) => {
+                        self.set_temporary_image(image, ctx)
+                    }
+                    light_image_tool::clipboard::ClipboardInput::File(path) => self.open_now(path),
+                },
+                WorkResult::ClipboardCopied(Ok(message)) => {
+                    self.status = message;
+                    self.notice_until = Some(Instant::now() + std::time::Duration::from_secs(2));
+                    ctx.request_repaint_after(std::time::Duration::from_secs(2));
                 }
                 WorkResult::Edited(Err(ToolError::Cancelled))
-                | WorkResult::Exported(Err(ToolError::Cancelled)) => {
+                | WorkResult::Exported(Err(ToolError::Cancelled))
+                | WorkResult::ClipboardRead(Err(ToolError::Cancelled))
+                | WorkResult::ClipboardCopied(Err(ToolError::Cancelled)) => {
+                    self.pending_intent = None;
+                    self.pending_export = false;
                     self.status = "操作已取消".into()
                 }
-                WorkResult::Edited(Err(e)) | WorkResult::Exported(Err(e)) => {
+                WorkResult::Edited(Err(e))
+                | WorkResult::Exported(Err(e))
+                | WorkResult::ClipboardRead(Err(e))
+                | WorkResult::ClipboardCopied(Err(e)) => {
+                    self.pending_intent = None;
+                    self.pending_export = false;
                     self.error = Some(e.to_string())
                 }
             }
@@ -1342,9 +1967,16 @@ impl ImageApp {
                 } else {
                     EvidenceStage::NotStarted
                 };
+                self.playback = image.animation.clone().map(Playback::new);
                 self.loaded = Some(image);
+                self.source = DocumentSource::File;
+                self.temporary_original = None;
+                self.exported_pixels = None;
                 self.undo.clear();
                 self.edited = false;
+                self.long_image = false;
+                self.fit_width = false;
+                self.long_scroll = 0.0;
                 self.fit = true;
                 self.pan = Vec2::ZERO;
                 let [w, h] = self.dimensions();
@@ -1357,18 +1989,22 @@ impl ImageApp {
                 self.status = "已取消打开".into();
             }
             Err(e) => {
-                self.restore_browser_selection();
+                // Retain the attempted row after failure so Next can move beyond a bad file.
                 self.error = Some(e.to_string());
                 self.status = if self.loaded.is_some() {
                     "打开失败；上一张图片仍可查看"
                 } else {
-                    "打开失败；请选择另一张 JPEG / PNG 图片"
+                    "打开失败；请选择另一张 JPEG / PNG / GIF / WebP 图片"
                 }
                 .into();
             }
         }
     }
-    fn start_edit(&mut self, op: EditOp, ctx: &egui::Context) {
+    fn start_edit(&mut self, op: EditOp, _ctx: &egui::Context) {
+        if self.playback.is_some() {
+            self.extract_dialog = true;
+            return;
+        }
         if self.work.is_some() || self.loading {
             return;
         }
@@ -1386,50 +2022,392 @@ impl ImageApp {
         self.evict_history(extra);
         let cancel = Cancellation::default();
         let token = cancel.clone();
-        let wake = ctx.clone();
         let (tx, rx) = mpsc::sync_channel(1);
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             let result = protected(|| edit::apply(&pixels, &op, &token), "编辑异常；原图未修改");
             let _ = tx.send(WorkResult::Edited(result));
-            wake.request_repaint();
         });
         self.work = Some(Work {
             generation: self.generation,
             cancel,
             receiver: rx,
-            export_thread: None,
+            export_thread: Some(thread),
         });
         self.status = "正在处理编辑副本…".into();
     }
-    fn begin_export(&mut self) {
-        if self.loading || self.work.is_some() {
+    fn request_animation_frame(&mut self, restart: bool) {
+        let Some(playback) = &mut self.playback else {
+            return;
+        };
+        if playback.in_flight.is_some() || playback.ended {
             return;
         }
-        if let Some(image) = &self.loaded {
-            if !image.color_managed {
-                self.error = Some("此图片的 ICC 未完整处理，暂不能导出校准的色彩副本".into());
+        playback.sequence = playback.sequence.wrapping_add(1);
+        let id = playback.sequence;
+        playback.in_flight = Some(id);
+        self.animation_worker.request(AnimationRequest {
+            generation: self.generation,
+            request_id: id,
+            source: playback.source.clone(),
+            cancel: playback.cancel.clone(),
+            restart,
+        });
+    }
+    fn update_animation_activity(&mut self, ctx: &egui::Context) {
+        let blocked = self.loading
+            || self.editing
+            || self.export_dialog
+            || self.path_dialog
+            || self.more_open
+            || self.error.is_some()
+            || self.pending_intent.is_some()
+            || self.extract_dialog
+            || self.ai_view.confirm.is_some()
+            || self.work.is_some()
+            || ctx.input(|i| !i.raw.focused || i.viewport().minimized == Some(true));
+        if let Some(playback) = &mut self.playback {
+            if blocked && !playback.suspended {
+                playback.clock.pause();
+                playback.suspended = true;
+            } else if !blocked && playback.suspended {
+                playback.suspended = false;
+                if !playback.manual_paused && !playback.ended {
+                    playback.clock.resume(Instant::now());
+                }
+            }
+        }
+    }
+    fn toggle_playback(&mut self) {
+        if let Some(playback) = &mut self.playback {
+            if playback.ended || playback.requires_restart {
+                self.restart_animation();
                 return;
             }
-            self.export_name = export::suggest_path(&image.path, self.format)
+            playback.manual_paused = !playback.manual_paused;
+            if playback.manual_paused {
+                playback.clock.pause();
+            } else if !playback.suspended {
+                playback.clock.resume(Instant::now());
+            }
+        }
+    }
+    fn step_animation(&mut self) {
+        if let Some(playback) = &mut self.playback {
+            if playback.ended || playback.requires_restart {
+                return;
+            }
+            playback.manual_paused = true;
+            playback.clock.pause();
+            playback.step_requested = true;
+        }
+    }
+    fn restart_animation(&mut self) {
+        let Some(playback) = &mut self.playback else {
+            return;
+        };
+        playback.cancel.cancel();
+        self.animation_worker.stop();
+        playback.cancel = Cancellation::default();
+        playback.pending = None;
+        playback.in_flight = None;
+        playback.ended = false;
+        playback.eof_pending = false;
+        playback.requires_restart = false;
+        playback.manual_paused = false;
+        playback.step_requested = true;
+        playback.warning = None;
+        playback.clock = PlaybackClock::new(playback.source.first_delay);
+        if !playback.suspended {
+            playback.clock.resume(Instant::now());
+        }
+        self.request_animation_frame(true);
+    }
+    fn poll_animation(&mut self, ctx: &egui::Context) {
+        self.update_animation_activity(ctx);
+        if let Some(response) = self.animation_worker.take_result()
+            && response.generation == self.generation
+            && let Some(playback) = &mut self.playback
+            && playback.in_flight == Some(response.request_id)
+        {
+            playback.in_flight = None;
+            match response.result {
+                Ok(Some(frame)) => playback.pending = Some(frame),
+                Ok(None) => {
+                    playback.eof_pending = true;
+                }
+                Err(error) => {
+                    playback.clock.pause();
+                    playback.manual_paused = true;
+                    playback.requires_restart = true;
+                    playback.step_requested = false;
+                    playback.warning = Some(format!(
+                        "动画已暂停，保留最后正确帧：{error}；只能从头重新播放"
+                    ));
+                }
+            }
+        }
+        let now = Instant::now();
+        if let Some(playback) = &mut self.playback
+            && playback.eof_pending
+            && !playback.suspended
+            && (playback.clock.due(now) || playback.step_requested)
+        {
+            playback.ended = true;
+            playback.clock.pause();
+            playback.step_requested = false;
+            playback.eof_pending = false;
+            playback.elapsed = playback.elapsed.saturating_add(playback.frame_delay);
+        }
+        let display = self.playback.as_ref().is_some_and(|p| {
+            !p.suspended && (p.step_requested || p.clock.due(now)) && p.pending.is_some()
+        });
+        if display {
+            let playback = self.playback.as_mut().unwrap();
+            let frame = playback.pending.take().unwrap();
+            playback.step_requested = false;
+            playback.frame_index = frame.frame_index;
+            playback.traversal = frame.traversal;
+            playback.elapsed = frame.elapsed;
+            playback.frame_delay = frame.delay;
+            if frame.delay_normalized {
+                playback.warning = Some("部分帧延时不足 20 ms，按 20 ms 播放".into());
+            }
+            if !playback.clock.accept_frame(frame.delay, now) {
+                playback.manual_paused = true;
+                playback.warning = Some("解码或绘制延迟过大，动画已暂停；可从头播放".into());
+            }
+            self.pixels = Some(frame.pixels.clone());
+            if let Some(loaded) = &mut self.loaded {
+                loaded.pixels = frame.pixels;
+            }
+            self.refresh_texture(ctx);
+        }
+        let needs = self.playback.as_ref().is_some_and(|p| {
+            !p.suspended
+                && !p.ended
+                && !p.eof_pending
+                && p.pending.is_none()
+                && p.in_flight.is_none()
+                && (p.clock.is_playing() || p.step_requested)
+        });
+        if needs {
+            self.request_animation_frame(false);
+        }
+        if let Some(playback) = &self.playback {
+            if playback.in_flight.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(8));
+            } else if let Some(delay) = playback.clock.wake_after(now) {
+                ctx.request_repaint_after(delay.max(std::time::Duration::from_millis(1)));
+            }
+        }
+    }
+    fn playback_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(playback) = &self.playback else {
+            return;
+        };
+        let paused = playback.manual_paused || playback.ended;
+        let busy = playback.ended
+            || playback.requires_restart
+            || (playback.in_flight.is_some() && playback.step_requested);
+        let label = format!(
+            "{:.2}s · 第 {} 帧{}",
+            playback.elapsed.as_secs_f64(),
+            playback.frame_index,
+            if playback.ended { " · 结束" } else { "" }
+        );
+        let warning = playback.warning.clone();
+        ui.horizontal_centered(|ui| {
+            if ui
+                .add(CompactAction::new(
+                    if paused { Icon::Play } else { Icon::Pause },
+                    if paused {
+                        "播放动画"
+                    } else {
+                        "暂停动画"
+                    },
+                ))
+                .clicked()
+            {
+                self.toggle_playback();
+            }
+            if ui
+                .add_enabled(!busy, CompactAction::new(Icon::Step, "下一帧（暂停）"))
+                .clicked()
+            {
+                self.step_animation();
+            }
+            if ui
+                .add(CompactAction::new(Icon::Restart, "从头播放"))
+                .clicked()
+            {
+                self.restart_animation();
+            }
+            ui.small(label).on_hover_text(
+                warning.unwrap_or_else(|| "按文件时序播放；总时长尚未完整统计".into()),
+            );
+        });
+    }
+    fn extract_current_frame(&mut self, ctx: &egui::Context) {
+        let Some(playback) = self.playback.take() else {
+            self.extract_dialog = false;
+            return;
+        };
+        playback.cancel.cancel();
+        self.animation_worker.stop();
+        let name = self.document_name();
+        let frame = playback.frame_index;
+        self.temporary_color_status = playback.source.color_status.clone();
+        self.temporary_color_managed = playback.source.color_managed;
+        self.temporary_original = self.pixels.clone();
+        self.loaded = None;
+        self.source = DocumentSource::ExtractedFrame { name, frame };
+        self.generation += 1;
+        self.directory_generation += 1;
+        self.directory_worker.cancel();
+        self.directory_scanning = false;
+        self.siblings.clear();
+        self.ai.set_scope(&[], None);
+        self.ai_rebuild_view();
+        self.requested_path = None;
+        self.directory_path = None;
+        self.position = 0;
+        self.thumbnail_worker.cancel();
+        self.thumbnail_busy = None;
+        self.thumbnail_cache.clear();
+        if let Some(task) = &self.evidence_task {
+            task.cancel.cancel();
+        }
+        self.evidence = None;
+        self.evidence_attempted = true;
+        self.undo.clear();
+        self.edited = true;
+        self.exported_pixels = None;
+        self.extract_dialog = false;
+        self.editing = true;
+        self.info_open = false;
+        self.status = "当前帧 · 静态副本 · 尚未保存".into();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+            "gloamere-image · {}",
+            self.document_name()
+        )));
+    }
+    fn fit_window(&mut self) {
+        self.fit = true;
+        self.fit_width = false;
+        self.long_image = false;
+        self.long_scroll = 0.0;
+        self.pan = Vec2::ZERO;
+    }
+    fn enter_long_image(&mut self) {
+        if self.pixels.is_none() {
+            return;
+        }
+        self.long_image = true;
+        self.fit_width = true;
+        self.fit = false;
+        self.long_scroll = 0.0;
+        self.pan = Vec2::ZERO;
+        self.status = "长图模式：滚轮纵向滚动，Ctrl+滚轮缩放；F 返回适应窗口".into();
+        self.notice_until = Some(Instant::now() + std::time::Duration::from_secs(3));
+    }
+    fn actual_pixels(&mut self) {
+        if self.long_image {
+            let anchor = self
+                .canvas_viewport
+                .map_or(0.0, |r| r.height() / 2.0 - 12.0);
+            self.long_scroll = (anchor + self.long_scroll) / self.zoom - anchor;
+        } else {
+            self.pan = Vec2::ZERO;
+        }
+        self.fit = false;
+        self.fit_width = false;
+        self.zoom = 1.0;
+    }
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !self.fullscreen;
+        self.fullscreen_activity = ctx.input(|i| i.time);
+        self.toolbar_hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        if self.fullscreen {
+            self.status = "全屏 · Esc 逐层返回；F11 退出全屏".into();
+            self.notice_until = Some(Instant::now() + std::time::Duration::from_secs(2));
+        }
+    }
+    fn document_name(&self) -> String {
+        match &self.source {
+            DocumentSource::File => self
+                .loaded
+                .as_ref()
+                .map(|l| {
+                    l.path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_else(|| "未打开图片".into()),
+            DocumentSource::Clipboard => "剪贴板图片".into(),
+            DocumentSource::ExtractedFrame { name, frame } => {
+                format!("{name} · 第 {frame} 帧 · 静态副本")
+            }
+        }
+    }
+    fn color_managed(&self) -> bool {
+        self.loaded
+            .as_ref()
+            .map_or(self.temporary_color_managed, |l| l.color_managed)
+    }
+    fn suggested_export(&self) -> String {
+        if let Some(image) = &self.loaded {
+            return export::suggest_path(&image.path, self.format)
                 .to_string_lossy()
                 .into();
-            self.export_dialog = true;
-            self.export_generation = Some(self.generation);
         }
+        // A suggested destination is not a claimed source path.
+        let stem = match self.source {
+            DocumentSource::ExtractedFrame { .. } => "当前帧-副本",
+            _ => "剪贴板图片-副本",
+        };
+        format!(
+            "{stem}.{}",
+            if self.format == ExportFormat::Png {
+                "png"
+            } else {
+                "jpg"
+            }
+        )
+    }
+    fn begin_export(&mut self) {
+        if self.playback.is_some() {
+            self.extract_dialog = true;
+            return;
+        }
+        if self.loading || self.work.is_some() || self.pixels.is_none() {
+            return;
+        }
+        if !self.color_managed() {
+            self.error = Some("此图片的 ICC 未完整处理，暂不能导出校准的色彩副本".into());
+            return;
+        }
+        self.export_name = self.suggested_export();
+        self.export_dialog = true;
+        self.export_generation = Some(self.generation);
     }
     fn start_export(&mut self, ctx: &egui::Context) {
         if self.work.is_some() || self.loading {
             return;
         }
-        let (Some(pixels), Some(loaded)) = (self.pixels.clone(), self.loaded.as_ref()) else {
+        let Some(pixels) = self.pixels.clone() else {
             return;
         };
-        if self.export_generation != Some(self.generation) || !loaded.color_managed {
+        if self.export_generation != Some(self.generation) || !self.color_managed() {
             self.close_export();
+            self.pending_intent = None;
+            self.pending_export = false;
             self.error = Some("导出确认已失效或 ICC 未校准，请重新打开当前图片的导出窗口".into());
             return;
         }
-        let original = loaded.path.clone();
+        let original = self.loaded.as_ref().map(|l| l.path.clone());
         self.evict_history(pixels.as_raw().len() as u64 * 4 + light_image_tool::memory::OVERHEAD);
         let options = ExportOptions {
             destination: PathBuf::from(&self.export_name),
@@ -1437,17 +2415,19 @@ impl ImageApp {
             quality: self.quality,
             matte: self.matte,
         };
-        self.work = Some(Work::spawn_export(self.generation, move |token| {
-            export::save_new(&pixels, &original, &options, &token)
-        }));
-        // Export completion is polled on the UI thread so shutdown can join without
-        // waiting on an egui lock held by this thread.
+        self.work = Some(Work::spawn_export(
+            self.generation,
+            move |token| match original {
+                Some(original) => export::save_new(&pixels, &original, &options, &token),
+                None => export::save_temporary(&pixels, &options, &token),
+            },
+        ));
         ctx.request_repaint();
         self.close_export();
         self.status = "正在导出新副本…".into();
     }
 
-    fn start_provenance(&mut self, ctx: &egui::Context) {
+    fn start_provenance(&mut self, _ctx: &egui::Context) {
         if self.loading || self.evidence_task.is_some() || self.evidence_attempted {
             return;
         }
@@ -1458,20 +2438,19 @@ impl ImageApp {
         let hash = image.source_sha256.clone();
         let cancel = Cancellation::default();
         let token = cancel.clone();
-        let wake = ctx.clone();
         let (tx, rx) = mpsc::sync_channel(1);
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 provenance::inspect(&path, &hash, &token)
             }))
             .unwrap_or_else(|_| Err(ToolError::Invalid("来源核验异常；结果不完整".into())));
             let _ = tx.send(result);
-            wake.request_repaint();
         });
         self.evidence_task = Some(ProvenanceTask {
             generation: self.generation,
             cancel,
             receiver: rx,
+            thread: Some(thread),
         });
         self.evidence_attempted = true;
         self.evidence_stage = EvidenceStage::Running;
@@ -1576,7 +2555,12 @@ impl ImageApp {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let ready = self.pixels.is_some() && !self.loading && self.work.is_none();
-        let modal = self.path_dialog || self.export_dialog || self.error.is_some();
+        let modal = self.path_dialog
+            || self.export_dialog
+            || self.error.is_some()
+            || self.pending_intent.is_some()
+            || self.extract_dialog
+            || self.ai_view.confirm.is_some();
         let (area, _) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), viewer_ui::TOOLBAR_HEIGHT),
             egui::Sense::hover(),
@@ -1596,7 +2580,7 @@ impl ImageApp {
                 };
                 format!("{w} × {h}  ·  {size}")
             } else {
-                "JPEG / PNG".into()
+                "JPEG / PNG / GIF / WebP".into()
             };
             viewer_ui::edge_label(ui, rect, &text, false).on_hover_text(text);
         }
@@ -1614,10 +2598,12 @@ impl ImageApp {
             );
         }
         for (index, icon) in Icon::ALL.into_iter().enumerate() {
-            let enabled = !modal
-                && !(icon == Icon::More && self.more_trigger_release_blocked)
+            if !layout.visible[index] {
+                continue;
+            }
+            let enabled = !(modal || icon == Icon::More && self.more_trigger_release_blocked)
                 && match icon {
-                    Icon::Previous | Icon::Next => !self.siblings.is_empty(),
+                    Icon::Previous | Icon::Next => !self.ai_visible_indices().is_empty(),
                     Icon::Undo => ready && !self.undo.is_empty(),
                     Icon::Rotate | Icon::Export => ready,
                     Icon::Minus | Icon::Plus | Icon::Fit | Icon::Actual => self.pixels.is_some(),
@@ -1643,22 +2629,17 @@ impl ImageApp {
                     Icon::Previous => self.navigate(-1),
                     Icon::Next => self.navigate(1),
                     Icon::Minus => {
+                        self.fit_width = false;
                         self.fit = false;
                         self.zoom = (self.zoom / 1.25).max(0.01);
                     }
                     Icon::Plus => {
+                        self.fit_width = false;
                         self.fit = false;
                         self.zoom = (self.zoom * 1.25).min(32.0);
                     }
-                    Icon::Fit => {
-                        self.fit = true;
-                        self.pan = Vec2::ZERO;
-                    }
-                    Icon::Actual => {
-                        self.fit = false;
-                        self.zoom = 1.0;
-                        self.pan = Vec2::ZERO;
-                    }
+                    Icon::Fit => self.fit_window(),
+                    Icon::Actual => self.actual_pixels(),
                     Icon::Rotate => self.start_edit(EditOp::Rotate90, &ctx),
                     Icon::Undo => self.undo_edit(&ctx),
                     Icon::Export => self.begin_export(),
@@ -1695,7 +2676,7 @@ impl ImageApp {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_width(270.0);
-                    ui.spacing_mut().interact_size.y = 28.0;
+                    ui.spacing_mut().interact_size.y = 34.0;
                     ui.spacing_mut().item_spacing.y = 4.0;
                     ui.spacing_mut().button_padding = Vec2::new(6.0, 4.0);
                     egui::ScrollArea::vertical()
@@ -1732,17 +2713,120 @@ impl ImageApp {
                             }
                             let edit = ui.add_enabled(
                                 ready,
-                                ActionButton::new(Icon::Crop, "裁剪 / 缩放")
-                                    .selected(self.editing)
-                                    .menu(),
+                                ActionButton::new(
+                                    Icon::Crop,
+                                    if self.playback.is_some() {
+                                        "提取当前帧为静态副本"
+                                    } else {
+                                        "裁剪 / 缩放"
+                                    },
+                                )
+                                .selected(self.editing)
+                                .menu(),
                             );
                             #[cfg(test)]
                             {
                                 self.menu_edit_rect = Some(edit.rect);
                             }
                             if edit.clicked() {
-                                self.editing = !self.editing;
+                                if self.playback.is_some() {
+                                    self.extract_dialog = true;
+                                } else {
+                                    self.editing = !self.editing;
+                                }
                                 self.info_open = false;
+                                close = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    ready,
+                                    ActionButton::new(
+                                        Icon::Copy,
+                                        if self.playback.is_some() {
+                                            "复制当前帧 · Ctrl+C"
+                                        } else {
+                                            "复制图像 · Ctrl+C"
+                                        },
+                                    )
+                                    .menu(),
+                                )
+                                .clicked()
+                            {
+                                self.copy_image(ctx);
+                                close = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    ready && self.loaded.is_some(),
+                                    ActionButton::new(Icon::Copy, "复制文件路径").menu(),
+                                )
+                                .on_disabled_hover_text("临时图像没有原文件路径")
+                                .clicked()
+                            {
+                                self.copy_path(ctx);
+                                close = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !self.loading && self.work.is_none(),
+                                    ActionButton::new(Icon::Paste, "从剪贴板打开 · Ctrl+V").menu(),
+                                )
+                                .clicked()
+                            {
+                                self.request_intent(PendingIntent::Clipboard, ctx);
+                                close = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    ready,
+                                    ActionButton::new(Icon::FitWidth, "长图适应宽度")
+                                        .selected(self.long_image)
+                                        .menu(),
+                                )
+                                .clicked()
+                            {
+                                self.enter_long_image();
+                                close = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    ready,
+                                    ActionButton::new(Icon::Actual, "实际像素 1:1 · 1").menu(),
+                                )
+                                .clicked()
+                            {
+                                self.actual_pixels();
+                                close = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    ready,
+                                    ActionButton::new(Icon::Rotate, "右转 90° · R").menu(),
+                                )
+                                .clicked()
+                            {
+                                self.start_edit(EditOp::Rotate90, ctx);
+                                close = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    ready && !self.undo.is_empty(),
+                                    ActionButton::new(Icon::Undo, "撤销 · Ctrl+Z").menu(),
+                                )
+                                .clicked()
+                            {
+                                self.undo_edit(ctx);
+                                close = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    ready,
+                                    ActionButton::new(Icon::Export, "导出新副本 · Ctrl+Shift+S")
+                                        .menu(),
+                                )
+                                .clicked()
+                            {
+                                self.begin_export();
                                 close = true;
                             }
                             if ui
@@ -1776,12 +2860,16 @@ impl ImageApp {
                                 )
                                 .clicked()
                             {
-                                self.fullscreen = !self.fullscreen;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
-                                    self.fullscreen,
-                                ));
+                                self.toggle_fullscreen(ctx);
                                 close = true;
                             }
+                            ui.separator();
+                            ui.collapsing("AI 筛选与本地检查", |ui| {
+                                self.ai_filter_choices(ui);
+                                ui.separator();
+                                self.ai_settings_ui(ui);
+                                self.update_settings_ui(ui);
+                            });
                             ui.separator();
                             ui.label("画布背景");
                             egui::Grid::new("canvas-background-menu")
@@ -1851,8 +2939,7 @@ impl ImageApp {
             ctx.memory_mut(|memory| memory.request_focus(viewer_ui::icon_id(Icon::More)));
         }
     }
-    fn inspector(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
+    fn inspector_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.heading(if self.editing {
@@ -1870,39 +2957,116 @@ impl ImageApp {
                 self.crop_anchor = None;
             }
         });
-        if self.editing {
-            ui.label("裁剪 · 旋转 · 缩放，导出到新副本");
+        let sticky_crop = self.editing && self.crop_selecting;
+        #[cfg(test)]
+        {
+            self.crop_apply_rect = None;
         }
-        ui.add_space(8.0);
-        if let Some(image) = &self.loaded {
-            let path = image.path.clone();
-            let [w, h] = self.dimensions();
-            ui.label(
-                egui::RichText::new(path.file_name().unwrap_or_default().to_string_lossy())
-                    .strong(),
-            );
-            ui.label(format!("{w} × {h} 像素"));
-            ui.label(format!(
-                "{:?} · {:.2} MiB",
-                image.format,
-                image.file_bytes as f64 / 1048576.0
-            ));
-            ui.label(if image.format == image::ImageFormat::Jpeg {
-                "透明度不适用（JPEG 不含 alpha）"
-            } else if self.current_has_alpha {
-                "含透明像素"
-            } else {
-                "无透明像素"
-            });
-            ui.label(format!("EXIF 方向：{}（已应用）", image.orientation));
-            ui.label(&image.color_status);
-            for warning in &image.warnings {
-                ui.colored_label(Color32::from_rgb(150, 91, 16), warning);
-            }
+        let footer = if self.editing { 58.0 } else { 0.0 };
+        let height = (ui.available_height() - footer).max(16.0);
+        egui::ScrollArea::vertical()
+            .max_height(height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.inspector(ui));
+        if self.editing {
             ui.separator();
+            ui.horizontal(|ui| {
+                if sticky_crop {
+                    let response = ui.add_enabled(
+                        self.work.is_none() && !self.loading,
+                        CompactAction::new(Icon::CropApply, "应用裁剪"),
+                    );
+                    #[cfg(test)]
+                    {
+                        self.crop_apply_rect = Some(response.rect);
+                    }
+                    if response.clicked() {
+                        self.apply_crop(&ui.ctx().clone());
+                    }
+                }
+                if ui
+                    .add_enabled(
+                        self.work.is_none() && !self.loading,
+                        CompactAction::new(Icon::Export, "导出新副本"),
+                    )
+                    .clicked()
+                {
+                    self.begin_export();
+                }
+                ui.small(if self.unsaved() {
+                    "有未导出的改动"
+                } else {
+                    "只写入新副本"
+                });
+            });
+        }
+    }
+    fn inspector(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if self.pixels.is_some() {
+            let path = self.loaded.as_ref().map(|l| l.path.clone());
+            let [w, h] = self.dimensions();
+            if !self.editing {
+                ui.label(egui::RichText::new(self.document_name()).strong());
+                ui.label(format!("{w} × {h} 像素"));
+                ui.separator();
+                self.ai_details(ui);
+                ui.separator();
+                if let Some(image) = &self.loaded {
+                    ui.label(format!(
+                        "{:?} · {:.2} MiB",
+                        image.format,
+                        image.file_bytes as f64 / 1048576.0
+                    ));
+                }
+                ui.label(
+                    if self
+                        .loaded
+                        .as_ref()
+                        .is_some_and(|image| image.format == image::ImageFormat::Jpeg)
+                    {
+                        "透明度不适用（JPEG 不含 alpha）"
+                    } else if self.current_has_alpha {
+                        "含透明像素"
+                    } else {
+                        "无透明像素"
+                    },
+                );
+                if let Some(image) = &self.loaded {
+                    ui.label(format!("EXIF 方向：{}（已应用）", image.orientation));
+                    ui.label(&image.color_status);
+                    for warning in &image.warnings {
+                        ui.colored_label(Color32::from_rgb(150, 91, 16), warning);
+                    }
+                } else {
+                    ui.label(&self.temporary_color_status);
+                    ui.small("临时像素没有可信原文件字节、EXIF 或 C2PA；复制不继承有效签名。");
+                }
+                ui.separator();
+            }
             if self.editing {
                 ui.add_enabled_ui(self.work.is_none() && !self.loading, |ui| {
                     ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add(
+                                CompactAction::new(Icon::Crop, "裁剪参数")
+                                    .selected(!self.resize_tool),
+                            )
+                            .clicked()
+                        {
+                            self.resize_tool = false;
+                        }
+                        if ui
+                            .add(
+                                CompactAction::new(Icon::ResizeApply, "缩放参数")
+                                    .selected(self.resize_tool),
+                            )
+                            .clicked()
+                        {
+                            self.resize_tool = true;
+                            self.crop_selecting = false;
+                            self.crop_anchor = None;
+                        }
                         if ui
                             .add(
                                 CompactAction::new(Icon::Rotate, "顺时针旋转 90°")
@@ -1925,66 +3089,70 @@ impl ImageApp {
                             self.start_edit(EditOp::FlipHorizontal, &ctx);
                         }
                     });
-                    if ui
-                        .add(
-                            CompactAction::new(Icon::Crop, "拖拽选择裁剪")
-                                .selected(self.crop_selecting)
-                                .help("拖拽选择裁剪：左键选择，右键平移。Esc 返回浏览平移。"),
-                        )
-                        .clicked()
-                    {
-                        self.crop_selecting = !self.crop_selecting;
-                        self.crop_anchor = None;
-                    }
-                    if self.crop_selecting {
-                        ui.label("左键框选 · 右键平移 · 应用后才裁剪");
-                    }
-                    ui.label("裁剪（当前图片像素坐标）");
-                    egui::Grid::new("crop").num_columns(2).show(ui, |ui| {
-                        for (i, label) in ["左 X", "上 Y", "宽", "高"].iter().enumerate() {
-                            ui.label(*label);
-                            ui.add(egui::DragValue::new(&mut self.crop[i]).range(0..=32768));
-                            ui.end_row();
-                        }
-                    });
-                    if !self.crop_selecting
-                        && ui
-                            .add(CompactAction::new(Icon::CropApply, "应用裁剪"))
+                    if !self.resize_tool {
+                        if ui
+                            .add(
+                                CompactAction::new(Icon::Crop, "拖拽选择裁剪")
+                                    .selected(self.crop_selecting)
+                                    .help("拖拽选择裁剪：左键选择，右键平移。Esc 返回浏览平移。"),
+                            )
                             .clicked()
-                    {
-                        self.apply_crop(&ctx);
-                    }
-                    ui.separator();
-                    ui.label("缩放尺寸");
-                    ui.checkbox(&mut self.keep_ratio, "锁定宽高比");
-                    let before = self.resize;
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut self.resize[0]).range(1..=32768));
-                        ui.label("×");
-                        ui.add(egui::DragValue::new(&mut self.resize[1]).range(1..=32768));
-                    });
-                    if self.keep_ratio {
-                        if before[0] != self.resize[0] {
-                            self.resize[1] = (self.resize[0] as f64 * h as f64 / w as f64)
-                                .round()
-                                .max(1.0) as u32;
-                        } else if before[1] != self.resize[1] {
-                            self.resize[0] = (self.resize[1] as f64 * w as f64 / h as f64)
-                                .round()
-                                .max(1.0) as u32;
+                        {
+                            self.crop_selecting = !self.crop_selecting;
+                            self.crop_anchor = None;
                         }
-                    }
-                    if ui
-                        .add(CompactAction::new(Icon::ResizeApply, "应用缩放"))
-                        .clicked()
-                    {
-                        self.start_edit(
-                            EditOp::Resize {
-                                width: self.resize[0],
-                                height: self.resize[1],
-                            },
-                            &ctx,
-                        );
+                        if self.crop_selecting {
+                            ui.label("左键框选 · 右键平移 · 应用后才裁剪");
+                        }
+                        ui.label("裁剪（当前图片像素坐标）");
+                        egui::Grid::new("crop").num_columns(2).show(ui, |ui| {
+                            for (i, label) in ["左 X", "上 Y", "宽", "高"].iter().enumerate() {
+                                ui.label(*label);
+                                ui.add(egui::DragValue::new(&mut self.crop[i]).range(0..=32768));
+                                ui.end_row();
+                            }
+                        });
+                        if !self.crop_selecting
+                            && ui
+                                .add(CompactAction::new(Icon::CropApply, "应用裁剪"))
+                                .clicked()
+                        {
+                            self.apply_crop(&ctx);
+                        }
+                    } else {
+                        ui.label("缩放尺寸");
+                        ui.checkbox(&mut self.keep_ratio, "锁定宽高比");
+                        let before = self.resize;
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut self.resize[0]).range(1..=32768));
+                            ui.label("×");
+                            ui.add(egui::DragValue::new(&mut self.resize[1]).range(1..=32768));
+                        });
+                        if self.keep_ratio {
+                            if before[0] != self.resize[0] {
+                                self.resize[1] = (self.resize[0] as f64 * h as f64 / w as f64)
+                                    .round()
+                                    .max(1.0)
+                                    as u32;
+                            } else if before[1] != self.resize[1] {
+                                self.resize[0] = (self.resize[1] as f64 * w as f64 / h as f64)
+                                    .round()
+                                    .max(1.0)
+                                    as u32;
+                            }
+                        }
+                        if ui
+                            .add(CompactAction::new(Icon::ResizeApply, "应用缩放"))
+                            .clicked()
+                        {
+                            self.start_edit(
+                                EditOp::Resize {
+                                    width: self.resize[0],
+                                    height: self.resize[1],
+                                },
+                                &ctx,
+                            );
+                        }
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -2005,27 +3173,31 @@ impl ImageApp {
                             )
                             .clicked()
                         {
-                            self.pixels = self.loaded.as_ref().map(|l| l.pixels.clone());
-                            self.undo.clear();
-                            self.edited = false;
-                            self.refresh_texture(&ctx);
-                            let [w, h] = self.dimensions();
-                            self.resize = [w, h];
-                            self.crop = [0, 0, w, h];
+                            self.request_intent(PendingIntent::Restore, &ctx);
                         }
                     });
                 });
                 ui.separator();
             }
-            ui.heading("来源证据");
-            if self.edited {
-                ui.colored_label(
-                    Color32::from_rgb(150, 91, 16),
-                    "编辑副本：原图签名不适用于当前像素",
-                );
+            if !self.editing {
+                ui.heading("来源证据");
+                if self.edited {
+                    ui.colored_label(
+                        Color32::from_rgb(150, 91, 16),
+                        "编辑副本：原图签名不适用于当前像素",
+                    );
+                }
+                if matches!(self.source, DocumentSource::File) {
+                    self.evidence_ui(ui);
+                }
+                ui.separator();
+            } else if ui
+                .add(ActionButton::new(Icon::Info, "信息与来源").menu())
+                .clicked()
+            {
+                self.editing = false;
+                self.info_open = true;
             }
-            self.evidence_ui(ui);
-            ui.separator();
             ui.small("仅本地处理 · 无图片上传 · 无遥测");
             ui.small(concat!("未签名测试版 ", env!("CARGO_PKG_VERSION")));
             ui.collapsing("运行信息", |ui| {
@@ -2035,12 +3207,14 @@ impl ImageApp {
                     "本次运行 {:.0} 秒",
                     self.start.elapsed().as_secs_f64()
                 ));
-                ui.small(path.to_string_lossy());
+                if let Some(path) = &path {
+                    ui.small(path.to_string_lossy());
+                }
             });
         } else {
             ui.label("打开一张本地图片后，在这里核对尺寸、透明度与来源。");
             ui.separator();
-            ui.small("支持 JPEG / PNG");
+            ui.small("支持 JPEG / PNG / GIF / WebP");
             ui.small("单图最多 1600 万像素、64 MiB");
         }
     }
@@ -2065,6 +3239,7 @@ impl ImageApp {
         }
         let (area, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        self.canvas_viewport = Some(area);
         let painter = ui.painter_at(area);
         let (background, checker) = self.preferences.background.colors();
         painter.rect_filled(
@@ -2094,14 +3269,18 @@ impl ImageApp {
             painter.text(
                 area.center() - Vec2::new(0.0, 35.0),
                 egui::Align2::CENTER_CENTER,
-                "把图片拖到这里",
+                if self.loading {
+                    "正在解码图片…"
+                } else {
+                    "拖入图片，或 Ctrl+O"
+                },
                 egui::FontId::proportional(25.0),
                 text_color,
             );
             painter.text(
                 area.center() + Vec2::new(0.0, 10.0),
                 egui::Align2::CENTER_CENTER,
-                "JPEG / PNG · 本地查看与编辑 · 导出新副本",
+                "也可显式粘贴剪贴板图片 · Ctrl+V",
                 egui::FontId::proportional(15.0),
                 text_color,
             );
@@ -2110,10 +3289,38 @@ impl ImageApp {
             }
             return;
         }
+        if self.canvas_unavailable {
+            let panel = Rect::from_center_size(
+                area.center(),
+                Vec2::new(
+                    (area.width() - 24.0).clamp(140.0, 380.0),
+                    area.height().min(86.0),
+                ),
+            );
+            painter.rect_filled(panel, 6.0, Color32::from_rgb(248, 250, 249));
+            painter.text(
+                panel.center() - Vec2::new(0.0, 20.0),
+                egui::Align2::CENTER_CENTER,
+                "画布上传未完成；未显示旧图片",
+                egui::FontId::proportional(15.0),
+                Color32::from_rgb(70, 80, 76),
+            );
+            let retry =
+                Rect::from_center_size(panel.center() + Vec2::new(0.0, 18.0), Vec2::splat(32.0));
+            if ui
+                .put(retry, CompactAction::new(Icon::Refresh, "重试画布上传"))
+                .clicked()
+            {
+                self.refresh_texture(&ui.ctx().clone());
+            }
+            return;
+        }
         let [w, h] = self.dimensions();
         let ppp = ui.ctx().pixels_per_point();
         let base = Vec2::new(w as f32 / ppp, h as f32 / ppp);
-        if self.fit {
+        if self.long_image && self.fit_width {
+            self.zoom = ((area.width() - 40.0) / base.x).clamp(0.01, 32.0);
+        } else if self.fit {
             self.zoom = ((area.width() - 40.0) / base.x)
                 .min((area.height() - 40.0) / base.y)
                 .clamp(0.01, 1.0);
@@ -2124,27 +3331,58 @@ impl ImageApp {
         if response.dragged()
             && (!self.crop_selecting || response.dragged_by(egui::PointerButton::Secondary))
         {
-            self.pan += ui.input(|i| i.pointer.delta());
+            let delta = ui.input(|i| i.pointer.delta());
+            if self.long_image {
+                self.long_scroll -= delta.y;
+                self.pan.x += delta.x;
+            } else {
+                self.pan += delta;
+            }
             self.fit = false;
         }
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll.abs() > 0.01 {
-                let old = self.zoom;
-                self.zoom = (self.zoom * (scroll * 0.002).exp()).clamp(0.01, 32.0);
-                self.fit = false;
-                if let Some(mouse) = ui.input(|i| i.pointer.hover_pos()) {
-                    self.pan = (mouse - area.center())
-                        - (mouse - area.center() - self.pan) * (self.zoom / old);
+                if self.long_image && !ui.input(|i| i.modifiers.ctrl) {
+                    self.long_scroll -= scroll;
+                } else {
+                    let old = self.zoom;
+                    self.zoom = (self.zoom * (scroll * 0.002).exp()).clamp(0.01, 32.0);
+                    self.fit = false;
+                    self.fit_width = false;
+                    if let Some(mouse) = ui.input(|i| i.pointer.hover_pos()) {
+                        if self.long_image {
+                            let anchor = mouse.y - area.top() - 12.0;
+                            self.long_scroll =
+                                (anchor + self.long_scroll) * self.zoom / old - anchor;
+                            self.pan.x = (mouse.x - area.center().x)
+                                - (mouse.x - area.center().x - self.pan.x) * self.zoom / old;
+                        } else {
+                            self.pan = (mouse - area.center())
+                                - (mouse - area.center() - self.pan) * (self.zoom / old);
+                        }
+                    }
                 }
             }
         }
         if response.double_clicked() && !self.crop_selecting {
-            self.fit = true;
-            self.pan = Vec2::ZERO;
+            self.fit_window();
         }
         let size = base * self.zoom;
-        let top = area.center() + self.pan - size / 2.0;
+        let max_scroll = (size.y - area.height() + 24.0).max(0.0);
+        if self.long_to_bottom {
+            self.long_scroll = max_scroll;
+            self.long_to_bottom = false;
+        }
+        self.long_scroll = self.long_scroll.clamp(0.0, max_scroll);
+        let top = if self.long_image {
+            Pos2::new(
+                area.center().x + self.pan.x - size.x / 2.0,
+                area.top() + 12.0 - self.long_scroll,
+            )
+        } else {
+            area.center() + self.pan - size / 2.0
+        };
         let rect = Rect::from_min_size(top, size);
         self.canvas_image_rect = Some(rect);
         if self.crop_selecting
@@ -2187,6 +3425,70 @@ impl ImageApp {
                 );
             }
         }
+        if self.long_image {
+            let label = if self.fit_width {
+                "长图 · 适应宽度"
+            } else {
+                "长图 · 滚轮纵向滚动"
+            };
+            let state_rect = Rect::from_min_size(
+                area.left_top() + Vec2::new(10.0, 10.0),
+                Vec2::new(if self.fit_width { 142.0 } else { 174.0 }, 26.0),
+            );
+            painter.rect_filled(state_rect, 5.0, Color32::from_rgb(247, 250, 248));
+            painter.rect_stroke(
+                state_rect,
+                5.0,
+                egui::Stroke::new(1.0, Color32::from_rgb(211, 219, 215)),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                state_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(13.0),
+                Color32::from_rgb(44, 67, 58),
+            );
+            if max_scroll > 0.0 {
+                let rail = Rect::from_min_size(
+                    area.right_top() + Vec2::new(-32.0, 58.0),
+                    Vec2::new(28.0, (area.height() - 110.0).clamp(32.0, 180.0)),
+                );
+                let response = ui.interact(
+                    rail,
+                    egui::Id::new("long-image-position"),
+                    egui::Sense::click_and_drag(),
+                );
+                let thumb_height =
+                    (rail.height() * area.height() / size.y).clamp(12.0, rail.height());
+                let thumb_y =
+                    rail.top() + (rail.height() - thumb_height) * self.long_scroll / max_scroll;
+                painter.rect_filled(
+                    rail.shrink2(Vec2::new(7.0, 0.0)),
+                    5.0,
+                    Color32::from_black_alpha(38),
+                );
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        Pos2::new(rail.left() + 5.0, thumb_y),
+                        Vec2::new(18.0, thumb_height),
+                    ),
+                    4.0,
+                    Color32::from_rgb(36, 116, 94),
+                );
+                if (response.clicked() || response.dragged())
+                    && let Some(pointer) = response.interact_pointer_pos()
+                {
+                    self.long_scroll = ((pointer.y - rail.top() - thumb_height / 2.0)
+                        / (rail.height() - thumb_height).max(1.0))
+                    .clamp(0.0, 1.0)
+                        * max_scroll;
+                }
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Slider, true, "长图阅读位置")
+                });
+            }
+        }
         if self.crop_selecting
             && let Some(selection) = crate::crop_selection::screen_rect(rect, [w, h], self.crop)
         {
@@ -2222,13 +3524,35 @@ impl ImageApp {
                 );
             }
         }
-        if self.loading {
-            painter.text(
+        if self.loading
+            || self
+                .requested_path
+                .as_ref()
+                .zip(self.loaded.as_ref())
+                .is_some_and(|(requested, loaded)| requested != &loaded.path)
+        {
+            let warning = if self.loading {
+                "正在解码新图片；画面仍是上一张"
+            } else {
+                "打开失败；画面仍是上一张"
+            };
+            let warning_rect = Rect::from_center_size(
                 area.center(),
+                Vec2::new((area.width() - 24.0).clamp(160.0, 370.0), 38.0),
+            );
+            painter.rect_filled(warning_rect, 6.0, Color32::from_rgb(248, 250, 249));
+            painter.rect_stroke(
+                warning_rect,
+                6.0,
+                egui::Stroke::new(1.0, Color32::from_rgb(211, 219, 215)),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                warning_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "正在加载…",
-                egui::FontId::proportional(20.0),
-                text_color,
+                warning,
+                egui::FontId::proportional(15.0),
+                Color32::from_rgb(44, 67, 58),
             );
         }
     }
@@ -2422,6 +3746,28 @@ impl ImageApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.ai_clear_dialog(ctx);
+        if self.extract_dialog {
+            let mut visible = true;
+            let mut extract = false;
+            egui::Window::new("提取当前帧为静态副本")
+                .open(&mut visible)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .max_width((ctx.viewport_rect().width() - 40.0).max(240.0))
+                .show(ctx, |ui| {
+                    ui.label(
+                        "只提取当前合成画面。随后编辑或导出 PNG / JPEG 静态副本，不保留动画。",
+                    );
+                    ui.small("动画原件保持只读，副本不继承原有效签名。");
+                    extract = ui.button("提取当前帧并编辑").clicked();
+                });
+            self.extract_dialog = visible;
+            if extract {
+                self.extract_current_frame(ctx);
+            }
+        }
         if self.path_dialog {
             let mut visible = true;
             let mut open = false;
@@ -2433,7 +3779,7 @@ impl ImageApp {
                 .default_width(480.0)
                 .max_width((ctx.viewport_rect().width() - 32.0).max(200.0))
                 .show(ctx, |ui| {
-                    ui.label("粘贴或输入 JPEG / PNG 的完整路径");
+                    ui.label("粘贴或输入 JPEG / PNG / GIF / WebP 的本地完整路径");
                     accessible_path_input(
                         ui,
                         &mut self.open_path,
@@ -2474,12 +3820,8 @@ impl ImageApp {
                                 );
                                 ui.selectable_value(&mut self.format, ExportFormat::Jpeg, "JPEG");
                             });
-                            if before != self.format
-                                && let Some(l) = &self.loaded
-                            {
-                                self.export_name = export::suggest_path(&l.path, self.format)
-                                    .to_string_lossy()
-                                    .into();
+                            if before != self.format {
+                                self.export_name = self.suggested_export();
                             }
                             if self.format == ExportFormat::Jpeg {
                                 ui.add(egui::Slider::new(&mut self.quality, 1..=100).text("质量"));
@@ -2543,6 +3885,11 @@ impl ImageApp {
                         .clicked();
                 });
             self.export_dialog = visible;
+            if !visible {
+                self.close_export();
+                self.pending_intent = None;
+                self.pending_export = false;
+            }
             if save {
                 self.start_export(ctx);
             }
@@ -2570,12 +3917,14 @@ impl ImageApp {
 impl eframe::App for ImageApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
-        if self
-            .work
-            .as_ref()
-            .is_some_and(|work| work.export_thread.is_some())
+        if self.loading
+            || self.directory_scanning
+            || self.thumbnail_busy.is_some()
+            || self.work.is_some()
+            || self.preview_task.is_some()
+            || self.evidence_task.is_some()
         {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         if let Err(error) = self.qa_workflow(ctx) {
             if let Some(smoke) = &mut self.smoke {
@@ -2690,6 +4039,16 @@ impl eframe::App for ImageApp {
     }
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.frames += 1;
+        if !self.update_health_sent && self.frames >= 2 {
+            self.update_health_probe = light_image_tool::updater::launch::start_ui_health(
+                self.settings_warning.is_none(),
+                self.frames,
+            );
+            self.update_health_sent = true;
+        }
+        self.retired_texture_reservations
+            .retain(|(frame, _)| *frame >= self.frames);
+        self.update_animation_activity(ui.ctx());
         if self.smoke.is_some() && self.frames <= 12 {
             log::info!(
                 "smoke frame={} elapsed_ms={} loading={} evidence_ready={} idle_started={}",
@@ -2701,6 +4060,36 @@ impl eframe::App for ImageApp {
             );
         }
         let ctx = ui.ctx().clone();
+        self.update_modal_open = ctx.memory(|m| m.top_modal_layer().is_some());
+        self.updater.poll(
+            self.start.elapsed().as_secs(),
+            self.work.is_some() || self.ai.is_busy(),
+        );
+        self.model_updater.poll(
+            &self.updater,
+            &mut self.ai,
+            self.start.elapsed().as_secs(),
+            self.work.is_some(),
+        );
+        if let Some(notice) = self.updater.take_completion_notice() {
+            self.status = notice;
+        }
+        if self.updater.is_busy() || self.model_updater.is_busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        } else if self.updater.is_waiting_for_resources()
+            || (self.updater.is_configured()
+                && (self.updater.preferences.automatic_app_updates
+                    || self.updater.preferences.automatic_installed_model_updates))
+        {
+            ctx.request_repaint_after(std::time::Duration::from_secs(30));
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.unsaved() {
+            self.update_normal_exit = true;
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.close_approved && self.unsaved() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_intent(PendingIntent::Close, &ctx);
+        }
         let more_was_open = self.more_open;
         if self.restore_more_focus {
             ctx.request_repaint();
@@ -2713,15 +4102,25 @@ impl eframe::App for ImageApp {
             self.restore_more_focus = false;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.more_open {
+            if egui::Popup::is_any_open(&ctx) {
+                egui::Popup::close_all(&ctx);
+            } else if self.more_open {
                 self.more_open = false;
                 ctx.memory_mut(|memory| memory.request_focus(viewer_ui::icon_id(Icon::More)));
             } else if self.error.is_some() {
                 self.error = None;
+            } else if self.ai_view.confirm.is_some() {
+                self.ai_view.confirm = None;
+            } else if self.extract_dialog {
+                self.extract_dialog = false;
+            } else if self.pending_intent.is_some() && !self.pending_export {
+                self.pending_intent = None;
             } else if self.path_dialog {
                 self.path_dialog = false;
             } else if self.export_dialog {
                 self.close_export();
+                self.pending_intent = None;
+                self.pending_export = false;
             } else if self.crop_selecting {
                 self.crop_selecting = false;
                 self.crop_anchor = None;
@@ -2734,7 +4133,7 @@ impl eframe::App for ImageApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             }
         }
-        if self.info_open || self.editing {
+        if self.info_open {
             self.start_provenance(&ctx);
         }
         let viewer_keyboard =
@@ -2743,6 +4142,9 @@ impl eframe::App for ImageApp {
             && !self.path_dialog
             && !self.export_dialog
             && self.error.is_none()
+            && self.pending_intent.is_none()
+            && !self.extract_dialog
+            && self.ai_view.confirm.is_none()
             && ctx.input(|i| i.key_pressed(egui::Key::F10))
         {
             self.more_open = !self.more_open;
@@ -2759,11 +4161,36 @@ impl eframe::App for ImageApp {
             });
         }
         if viewer_keyboard
+            && !egui::Popup::is_any_open(&ctx)
             && !self.more_open
             && !self.path_dialog
             && !self.export_dialog
             && self.error.is_none()
+            && self.pending_intent.is_none()
+            && !self.extract_dialog
+            && self.ai_view.confirm.is_none()
         {
+            if self.playback.is_some()
+                && ctx.input(|i| i.key_pressed(egui::Key::Space))
+                && !ctx.memory(|m| m.focused().is_some())
+            {
+                self.toggle_playback();
+            }
+            if !ctx.text_edit_focused() {
+                let paste = ctx.input(|i| {
+                    (i.modifiers.command && i.key_pressed(egui::Key::V))
+                        || i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
+                });
+                let copy = ctx.input(|i| {
+                    (i.modifiers.command && i.key_pressed(egui::Key::C))
+                        || i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+                });
+                if paste {
+                    self.request_intent(PendingIntent::Clipboard, &ctx);
+                } else if copy {
+                    self.copy_image(&ctx);
+                }
+            }
             if ctx
                 .input(|i| i.key_pressed(egui::Key::R) && !i.modifiers.command && !i.modifiers.alt)
             {
@@ -2775,16 +4202,32 @@ impl eframe::App for ImageApp {
                 self.start_edit(operation, &ctx);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
-                self.navigate(1);
+                if self.long_image {
+                    self.long_scroll += self.canvas_viewport.map_or(200.0, |r| r.height() * 0.9);
+                } else {
+                    self.navigate(1);
+                }
             }
             if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
-                self.navigate(-1);
+                if self.long_image {
+                    self.long_scroll -= self.canvas_viewport.map_or(200.0, |r| r.height() * 0.9);
+                } else {
+                    self.navigate(-1);
+                }
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
-                self.select_image(0);
+                if self.long_image && ctx.input(|i| i.modifiers.ctrl) {
+                    self.long_scroll = 0.0;
+                } else {
+                    self.ai_select_boundary(false);
+                }
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::End)) && !self.siblings.is_empty() {
-                self.select_image(self.siblings.len() - 1);
+            if ctx.input(|i| i.key_pressed(egui::Key::End)) {
+                if self.long_image && ctx.input(|i| i.modifiers.ctrl) {
+                    self.long_to_bottom = true;
+                } else {
+                    self.ai_select_boundary(true);
+                }
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
                 self.navigate(1);
@@ -2796,13 +4239,10 @@ impl eframe::App for ImageApp {
                 self.open_dialog();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::F)) {
-                self.fit = true;
-                self.pan = Vec2::ZERO;
+                self.fit_window();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Num1)) {
-                self.fit = false;
-                self.zoom = 1.0;
-                self.pan = Vec2::ZERO;
+                self.actual_pixels();
             }
             if ctx
                 .input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::S))
@@ -2813,26 +4253,71 @@ impl eframe::App for ImageApp {
                 self.undo_edit(&ctx);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
-                self.fullscreen = !self.fullscreen;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                self.toggle_fullscreen(&ctx);
             }
         }
-        if let Some(path) =
-            ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
+        if self.ai_view.confirm.is_none()
+            && let Some(path) =
+                ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
         {
             self.open(path);
         }
         self.update_preview(&ctx);
-        let dialog_open = self.path_dialog || self.export_dialog || self.error.is_some();
-        egui::Panel::bottom("viewer-toolbar")
-            .exact_size(viewer_ui::TOOLBAR_HEIGHT)
-            .frame(egui::Frame::NONE.fill(Color32::WHITE))
-            .show(ui, |ui| self.toolbar(ui));
-        if self.preferences.list_visible && !self.siblings.is_empty() {
+        let dialog_open = self.path_dialog
+            || self.export_dialog
+            || self.error.is_some()
+            || self.pending_intent.is_some()
+            || self.extract_dialog
+            || self.ai_view.confirm.is_some();
+        let now = ctx.input(|i| i.time);
+        let viewport_bottom = ctx.viewport_rect().bottom();
+        let interacting = ctx.input(|i| {
+            i.pointer.delta() != Vec2::ZERO
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+        }) || ctx.input(|i| {
+            i.pointer
+                .hover_pos()
+                .is_some_and(|p| p.y >= viewport_bottom - 60.0)
+        });
+        let pinned = dialog_open
+            || self.more_open
+            || self.editing
+            || self.info_open
+            || ctx.memory(|m| m.focused().is_some());
+        if interacting || pinned || !self.fullscreen {
+            self.fullscreen_activity = now;
+        }
+        self.toolbar_hidden = self.fullscreen && !pinned && now - self.fullscreen_activity >= 1.8;
+        if self.fullscreen && !self.toolbar_hidden && !pinned {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                (1.8 - (now - self.fullscreen_activity)).max(0.01),
+            ));
+        }
+        if !self.toolbar_hidden {
+            egui::Panel::bottom("viewer-toolbar")
+                .exact_size(viewer_ui::TOOLBAR_HEIGHT)
+                .frame(egui::Frame::NONE.fill(Color32::WHITE))
+                .show(ui, |ui| self.toolbar(ui));
+        }
+        if self.playback.is_some() && !self.toolbar_hidden {
+            egui::Panel::bottom("animation-controls")
+                .exact_size(44.0)
+                .frame(egui::Frame::NONE.fill(Color32::from_rgb(244, 247, 245)))
+                .show(ui, |ui| self.playback_controls(ui));
+        }
+        let width = ctx.viewport_rect().width();
+        let panel_open = self.info_open || self.editing;
+        let list_visible = self.preferences.list_visible
+            && width >= 640.0
+            && !self.siblings.is_empty()
+            && (!panel_open || width >= 1100.0);
+        if list_visible {
             egui::Panel::left("image-list")
                 .default_size(210.0)
-                .min_size(160.0)
-                .max_size(300.0)
+                .min_size(180.0)
+                .max_size(280.0)
                 .resizable(true)
                 .show(ui, |ui| {
                     if dialog_open {
@@ -2840,53 +4325,51 @@ impl eframe::App for ImageApp {
                     }
                     self.image_list(ui);
                 });
+        } else {
+            self.list_viewport_rect = None;
+            self.selected_list_row_rect = None;
+            self.thumbnail_worker.cancel();
+            self.thumbnail_busy = None;
         }
-        if self.info_open || self.editing {
-            egui::Panel::right("inspector")
-                .default_size(280.0)
-                .min_size(240.0)
-                .show(ui, |ui| {
-                    if dialog_open {
-                        ui.disable();
-                    }
-                    let sticky_crop = self.editing && self.crop_selecting;
-                    #[cfg(test)]
-                    {
-                        self.crop_apply_rect = None;
-                    }
-                    let footer_height = if sticky_crop { 140.0 } else { 0.0 };
-                    let body_height = (ui.available_height() - footer_height).max(0.0);
-                    egui::ScrollArea::vertical()
-                        .scroll_bar_visibility(
-                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
-                        )
-                        .max_height(body_height)
-                        .show(ui, |ui| self.inspector(ui));
-                    if sticky_crop {
-                        ui.add_space((body_height - ui.min_rect().height()).max(0.0));
-                        ui.separator();
-                        ui.label(format!("选区 {} × {} 像素", self.crop[2], self.crop[3]));
-                        let response = ui.add_enabled(
-                            self.work.is_none() && !self.loading,
-                            CompactAction::new(Icon::CropApply, "应用裁剪"),
-                        );
-                        #[cfg(test)]
-                        {
-                            self.crop_apply_rect = Some(response.rect);
+        if panel_open {
+            if width < 800.0 {
+                let height = (ctx.viewport_rect().height() - 132.0).clamp(120.0, 260.0);
+                egui::Panel::bottom("inspector-drawer")
+                    .exact_size(height)
+                    .show(ui, |ui| {
+                        if dialog_open {
+                            ui.disable();
                         }
-                        if response.clicked() {
-                            self.apply_crop(&ctx);
+                        self.inspector_panel(ui);
+                    });
+            } else {
+                egui::Panel::right("inspector")
+                    .default_size(264.0)
+                    .min_size(248.0)
+                    .max_size(320.0)
+                    .show(ui, |ui| {
+                        if dialog_open {
+                            ui.disable();
                         }
-                        ui.small("Esc 返回浏览平移");
-                    }
-                });
+                        self.inspector_panel(ui);
+                    });
+            }
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 let area = ui.available_rect_before_wrap();
                 self.canvas(ui);
-                if !self.siblings.is_empty() {
+                self.ai_canvas_overlay(ui, area);
+                if !self.siblings.is_empty()
+                    && !self.canvas_unavailable
+                    && !self.loading
+                    && self
+                        .requested_path
+                        .as_ref()
+                        .zip(self.loaded.as_ref())
+                        .is_none_or(|(requested, loaded)| requested == &loaded.path)
+                {
                     let label = format!(
                         "{} / {}{}",
                         self.position + 1,
@@ -2955,6 +4438,7 @@ impl eframe::App for ImageApp {
             ctx.request_repaint();
         }
         self.dialogs(&ctx);
+        self.unsaved_dialog(&ctx);
         if !ctx.input(|input| input.pointer.primary_down()) {
             self.more_trigger_release_blocked = false;
         }
@@ -3049,10 +4533,37 @@ impl eframe::App for ImageApp {
                 }
             }
         }
-        // No periodic repaint while idle. Exports poll only while active; other workers wake once.
+        if self.ai.is_busy() {
+            // Commands can start a scan/import during UI, after this frame's logic ran.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        // No periodic repaint while idle. Poll AI only while a bounded job is active.
     }
     fn on_exit(&mut self) {
+        let conditions = light_image_tool::updater::client::ExitConditions {
+            unsaved: self.unsaved() && !self.close_approved,
+            exporting: self.work.is_some(),
+            modal: self.pending_intent.is_some()
+                || self.export_dialog
+                || self.extract_dialog
+                || self.ai_view.confirm.is_some()
+                || self.update_modal_open,
+            workers_active: false,
+            other_instances: false,
+        };
+        self.model_updater.shutdown();
         self.shutdown_background();
+        drop(self.update_health_probe.take());
+        if self.update_normal_exit
+            && self.update_shutdown_observed
+            && !light_image_tool::updater::platform::session_ending()
+            && let Err(error) = self.updater.record_exit(
+                &conditions,
+                light_image_tool::updater::client::ExitReason::NormalUserExit,
+            )
+        {
+            log::info!("退出安装暂缓：{error}");
+        }
         log::info!(
             "shutdown: frames={} elapsed_s={:.3}",
             self.frames,
@@ -3119,7 +4630,12 @@ mod tests {
         ] {
             pointer_ui_size(&mut app, &ctx, vec![], size);
             let layout = app.toolbar_layout.as_ref().unwrap();
-            for button in layout.buttons {
+            for button in layout
+                .buttons
+                .iter()
+                .zip(layout.visible)
+                .filter_map(|(r, visible)| visible.then_some(*r))
+            {
                 assert!(
                     Rect::from_min_size(Pos2::ZERO, size).contains_rect(button),
                     "screen={size:?}, button={button:?}"
@@ -3129,6 +4645,8 @@ mod tests {
                 layout
                     .buttons
                     .iter()
+                    .zip(layout.visible)
+                    .filter_map(|(button, visible)| visible.then_some(button))
                     .all(|button| button.bottom() > size.y - 52.0)
             );
             assert!(app.canvas_image_rect.unwrap().center().y < size.y * 0.5);
@@ -3259,7 +4777,7 @@ mod tests {
         }
     }
     #[test]
-    fn final_directory_row_is_fully_visible_in_minimum_window() {
+    fn final_directory_row_is_fully_visible_when_panels_can_coexist() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("last.png");
         fixture(&path, false);
@@ -3276,7 +4794,7 @@ mod tests {
         app.info_open = true;
         for _ in 0..8 {
             let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 550.0))),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 780.0))),
                 ..Default::default()
             };
             let mut frame = eframe::Frame::_new_kittest();
@@ -3507,17 +5025,17 @@ mod tests {
         assert!(app.thumbnail_busy.is_none());
     }
     #[test]
-    fn failed_cross_directory_open_restores_displayed_list_selection() {
+    fn failed_cross_directory_open_retains_attempted_selection_and_marks_old_canvas() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.png");
         fixture(&source, false);
         let (mut app, ctx) = app_with(&source);
         let missing = dir.path().join("other/missing.png");
-        app.open(missing);
+        app.open(missing.clone());
         wait(&mut app, &ctx);
         assert!(app.error.is_some());
-        assert_eq!(app.requested_path.as_ref(), Some(&source));
-        assert_eq!(app.directory_path.as_ref(), Some(&dir.path().to_path_buf()));
+        assert_eq!(app.requested_path.as_ref(), Some(&missing));
+        assert_eq!(app.directory_path.as_ref(), Some(&dir.path().join("other")));
         assert_eq!(app.loaded.as_ref().unwrap().path, source);
     }
     #[test]
@@ -3878,6 +5396,9 @@ mod tests {
         app.crop_selecting = true;
         app.crop_anchor = Some([1.0, 1.0]);
         app.open(b.clone());
+        assert_eq!(app.pending_intent, Some(PendingIntent::Open(b.clone())));
+        assert!(app.edited && app.crop_selecting);
+        app.resolve_pending_choice(2, &ctx);
         assert!(!app.crop_selecting && app.crop_anchor.is_none());
         wait(&mut app, &ctx);
         assert_eq!(app.loaded.as_ref().unwrap().path, b);
@@ -4127,6 +5648,7 @@ mod tests {
             generation: app.generation,
             cancel: cancel.clone(),
             receiver,
+            thread: None,
         });
         let mut report = EvidenceReport::incomplete(hash.clone(), "queued success");
         report.state = EvidenceState::NoCredential;
@@ -4143,6 +5665,7 @@ mod tests {
             matte: app.matte,
             cancel: cancel.clone(),
             receiver,
+            thread: None,
         });
         tx.send(Ok(light_image_tool::memory::Pixels::from_image(
             image::RgbaImage::new(2, 2),
@@ -4427,6 +5950,7 @@ mod tests {
             generation: app.generation,
             cancel: evidence.clone(),
             receiver,
+            thread: None,
         });
         let (_tx, receiver) = mpsc::sync_channel(1);
         app.preview_task = Some(PreviewTask {
@@ -4434,6 +5958,7 @@ mod tests {
             matte: [255; 3],
             cancel: preview.clone(),
             receiver,
+            thread: None,
         });
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _app = app;
@@ -4464,6 +5989,7 @@ mod tests {
                 generation: app.generation,
                 cancel: Cancellation::default(),
                 receiver: rx,
+                thread: None,
             });
             tx.send(result).unwrap();
             app.poll(&ctx);
@@ -4479,6 +6005,7 @@ mod tests {
             generation: app.generation,
             cancel: Cancellation::default(),
             receiver: rx,
+            thread: None,
         });
         drop(tx);
         app.poll(&ctx);
@@ -4499,6 +6026,563 @@ mod tests {
             evidence_stage_label(EvidenceStage::Cancelled),
             evidence_stage_label(EvidenceStage::Complete)
         );
+    }
+    #[test]
+    fn dirty_navigation_preserves_first_intent_and_cancel_keeps_current_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.png");
+        let b = dir.path().join("b.png");
+        let c = dir.path().join("c.png");
+        for path in [&a, &b, &c] {
+            fixture(path, false);
+        }
+        let (mut app, ctx) = app_with(&a);
+        app.siblings = vec![a.clone(), b.clone(), c.clone()];
+        app.start_edit(EditOp::Rotate90, &ctx);
+        wait(&mut app, &ctx);
+        let edited = app.pixels.clone().unwrap();
+        app.navigate(1);
+        app.select_image(2);
+        assert_eq!(app.pending_intent, Some(PendingIntent::Open(b)));
+        assert_eq!(app.position, 0);
+        assert!(!app.loading);
+        raw_ui(
+            &mut app,
+            &ctx,
+            Some(egui::Key::Escape),
+            egui::Modifiers::NONE,
+        );
+        assert!(app.pending_intent.is_none());
+        assert!(app.unsaved());
+        assert!(Arc::ptr_eq(app.pixels.as_ref().unwrap(), &edited));
+        assert_eq!(app.loaded.as_ref().unwrap().path, a);
+    }
+    #[test]
+    fn export_then_continue_waits_for_publication_and_failure_abandons_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.png");
+        let b = dir.path().join("b.png");
+        fixture(&a, false);
+        fixture(&b, false);
+        let (mut app, ctx) = app_with(&a);
+        app.start_edit(EditOp::Rotate90, &ctx);
+        wait(&mut app, &ctx);
+        app.open(b.clone());
+        app.resolve_pending_choice(1, &ctx);
+        assert!(app.pending_export && app.export_dialog);
+        assert!(!app.loading);
+        app.export_name = a.to_string_lossy().into_owned(); // no overwrite, continuation must stop
+        app.start_export(&ctx);
+        wait(&mut app, &ctx);
+        assert!(app.error.is_some() && app.pending_intent.is_none() && !app.pending_export);
+        assert_eq!(app.loaded.as_ref().unwrap().path, a);
+        assert!(app.unsaved());
+        app.error = None;
+        app.open(b.clone());
+        app.resolve_pending_choice(1, &ctx);
+        let out = dir.path().join("safe-copy.png");
+        app.export_name = out.to_string_lossy().into_owned();
+        app.start_export(&ctx);
+        assert_eq!(app.loaded.as_ref().unwrap().path, a);
+        wait(&mut app, &ctx);
+        assert!(out.is_file());
+        assert_eq!(app.loaded.as_ref().unwrap().path, b);
+        assert!(app.pending_intent.is_none() && !app.unsaved());
+    }
+    #[test]
+    fn closing_export_confirmation_never_continues_a_dirty_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.png");
+        fixture(&a, false);
+        let (mut app, ctx) = app_with(&a);
+        app.start_edit(EditOp::Rotate90, &ctx);
+        wait(&mut app, &ctx);
+        app.request_intent(PendingIntent::Close, &ctx);
+        app.resolve_pending_choice(1, &ctx);
+        raw_ui(
+            &mut app,
+            &ctx,
+            Some(egui::Key::Escape),
+            egui::Modifiers::NONE,
+        );
+        assert!(!app.close_approved && !app.export_dialog && !app.pending_export);
+        assert!(app.pending_intent.is_none() && app.unsaved());
+    }
+    #[test]
+    fn undo_to_exported_pixels_does_not_warn_again_but_later_edit_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.png");
+        fixture(&a, false);
+        let (mut app, ctx) = app_with(&a);
+        app.start_edit(EditOp::Rotate90, &ctx);
+        wait(&mut app, &ctx);
+        app.begin_export();
+        app.export_name = dir.path().join("copy.png").to_string_lossy().into_owned();
+        app.start_export(&ctx);
+        wait(&mut app, &ctx);
+        assert!(!app.unsaved());
+        assert!(app.edited);
+        app.start_edit(EditOp::Rotate90, &ctx);
+        wait(&mut app, &ctx);
+        assert!(app.unsaved());
+        app.undo_edit(&ctx);
+        assert!(!app.unsaved());
+    }
+    #[test]
+    fn temporary_session_exports_without_claiming_a_file_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = ImageApp::from_context(ctx.clone(), "test".into(), None, None);
+        let pixels = Arc::new(
+            light_image_tool::memory::Pixels::from_image(image::RgbaImage::from_pixel(
+                4,
+                2,
+                image::Rgba([40, 70, 90, 128]),
+            ))
+            .unwrap(),
+        );
+        app.source = DocumentSource::Clipboard;
+        app.temporary_original = Some(pixels.clone());
+        app.pixels = Some(pixels.clone());
+        app.edited = true;
+        assert!(app.loaded.is_none() && app.unsaved());
+        app.begin_export();
+        assert!(app.export_dialog);
+        let output = dir.path().join("clipboard.png");
+        app.export_name = output.to_string_lossy().into_owned();
+        app.start_export(&ctx);
+        wait(&mut app, &ctx);
+        assert!(app.loaded.is_none() && !app.unsaved());
+        let copy = light_image_tool::pipeline::load(&output, &Cancellation::default()).unwrap();
+        assert_eq!(copy.pixels.as_raw(), pixels.as_raw());
+    }
+    #[test]
+    fn all_owned_background_jobs_join_without_egui_lock_inversion() {
+        let ctx = egui::Context::default();
+        let mut app = ImageApp::from_context(ctx.clone(), "test".into(), None, None);
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, receiver) = mpsc::sync_channel(1);
+        let signal = done.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            signal.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(tx);
+        });
+        app.preview_task = Some(PreviewTask {
+            generation: 0,
+            matte: [255; 3],
+            cancel: Cancellation::default(),
+            receiver,
+            thread: Some(thread),
+        });
+        ctx.memory_mut(|_| app.shutdown_background());
+        assert_eq!(done.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(app.shutting_down);
+        app.shutdown_background();
+    }
+    fn animation_app() -> (tempfile::TempDir, ImageApp, egui::Context) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("motion.gif");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut encoder =
+                gif::Encoder::new(file, 4, 3, &[255, 0, 0, 0, 255, 0, 0, 0, 255]).unwrap();
+            encoder.set_repeat(gif::Repeat::Infinite).unwrap();
+            for index in 0..3 {
+                encoder
+                    .write_frame(&gif::Frame {
+                        width: 4,
+                        height: 3,
+                        delay: 10,
+                        buffer: std::borrow::Cow::Owned(vec![index; 12]),
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+        }
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = ImageApp::from_context(ctx.clone(), "animation-test".into(), None, None);
+        let loaded = light_image_tool::pipeline::load(&path, &Cancellation::default()).unwrap();
+        app.apply_load_response(
+            light_image_tool::worker::LoadResponse {
+                generation: 0,
+                result: Ok(loaded),
+                siblings: vec![],
+            },
+            &ctx,
+        );
+        (dir, app, ctx)
+    }
+    fn pump_animation(app: &mut ImageApp, ctx: &egui::Context, expected: u32) {
+        let start = Instant::now();
+        loop {
+            pointer_ui(app, ctx, vec![]);
+            app.poll(ctx);
+            let playback = app.playback.as_ref().unwrap();
+            assert!(
+                playback
+                    .warning
+                    .as_ref()
+                    .is_none_or(|s| !s.contains("最后正确帧")),
+                "{:?}",
+                playback.warning
+            );
+            if playback.frame_index == expected {
+                break;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(3));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn animation_pause_single_step_restart_and_third_frame_are_bounded() {
+        let (_dir, mut app, ctx) = animation_app();
+        app.toggle_playback(); // user pause
+        for expected in [2, 3, 1, 2, 3] {
+            app.step_animation();
+            pump_animation(&mut app, &ctx, expected);
+            assert!(app.playback.as_ref().unwrap().manual_paused);
+            assert!(Arc::ptr_eq(
+                &app.loaded.as_ref().unwrap().pixels,
+                app.pixels.as_ref().unwrap()
+            ));
+        }
+        let before = app.playback.as_ref().unwrap().frame_index;
+        for _ in 0..5 {
+            pointer_ui(&mut app, &ctx, vec![]);
+            app.poll(&ctx);
+        }
+        assert_eq!(app.playback.as_ref().unwrap().frame_index, before);
+        app.restart_animation();
+        pump_animation(&mut app, &ctx, 1);
+        assert!(!app.playback.as_ref().unwrap().manual_paused);
+    }
+    #[test]
+    fn animation_modal_suspension_does_not_override_manual_pause() {
+        let (_dir, mut app, ctx) = animation_app();
+        app.toggle_playback();
+        app.more_open = true;
+        pointer_ui(&mut app, &ctx, vec![]);
+        assert!(app.playback.as_ref().unwrap().suspended);
+        app.more_open = false;
+        pointer_ui(&mut app, &ctx, vec![]);
+        assert!(app.playback.as_ref().unwrap().manual_paused);
+        assert!(!app.playback.as_ref().unwrap().clock.is_playing());
+    }
+    #[test]
+    fn animation_requires_explicit_static_extraction_before_edit_or_export() {
+        let (_dir, mut app, ctx) = animation_app();
+        app.start_edit(EditOp::Rotate90, &ctx);
+        assert!(app.extract_dialog && app.work.is_none() && !app.edited);
+        app.extract_dialog = false;
+        app.begin_export();
+        assert!(app.extract_dialog && !app.export_dialog);
+        app.extract_current_frame(&ctx);
+        assert!(app.playback.is_none() && app.loaded.is_none() && app.unsaved() && app.editing);
+        assert!(matches!(
+            app.source,
+            DocumentSource::ExtractedFrame { frame: 1, .. }
+        ));
+        app.start_edit(EditOp::Rotate90, &ctx);
+        wait(&mut app, &ctx);
+        assert_eq!(app.dimensions(), [3, 4]);
+    }
+    #[test]
+    fn animation_texture_ids_are_reused_for_same_canvas_frames() {
+        let (_dir, mut app, ctx) = animation_app();
+        app.toggle_playback();
+        let ids: Vec<_> = app.tiles.iter().map(|tile| tile.texture.id()).collect();
+        app.step_animation();
+        pump_animation(&mut app, &ctx, 2);
+        assert_eq!(
+            app.tiles
+                .iter()
+                .map(|tile| tile.texture.id())
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+    #[test]
+    fn long_image_reaches_both_ends_and_keeps_page_keys_separate_from_navigation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.png");
+        image::RgbaImage::from_pixel(480, 30000, image::Rgba([70, 80, 90, 255]))
+            .save(&path)
+            .unwrap();
+        let (mut app, ctx) = app_with(&path);
+        configure(&ctx);
+        app.enter_long_image();
+        pointer_ui_size(&mut app, &ctx, vec![], Vec2::new(400.0, 600.0));
+        assert!(app.long_image && app.fit_width && app.long_scroll == 0.0);
+        let origin = app.canvas_image_rect.unwrap();
+        raw_ui(
+            &mut app,
+            &ctx,
+            Some(egui::Key::PageDown),
+            egui::Modifiers::NONE,
+        );
+        assert!(app.long_scroll > 0.0 && !app.loading);
+        raw_ui(&mut app, &ctx, Some(egui::Key::End), egui::Modifiers::CTRL);
+        assert!(
+            app.canvas_image_rect.unwrap().bottom() <= app.canvas_viewport.unwrap().bottom() + 1.0
+        );
+        raw_ui(&mut app, &ctx, Some(egui::Key::Home), egui::Modifiers::CTRL);
+        assert_eq!(app.long_scroll, 0.0);
+        assert!(origin.top() >= 0.0);
+        app.actual_pixels();
+        assert!(app.long_image && !app.fit_width && app.zoom == 1.0);
+        app.fit_window();
+        assert!(!app.long_image && app.fit);
+    }
+    #[test]
+    fn narrow_drawer_keeps_toolbar_and_restores_user_list_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("a.png");
+        fixture(&source, false);
+        let (mut app, ctx) = app_with(&source);
+        configure(&ctx);
+        app.preferences.list_visible = true;
+        app.siblings = vec![source];
+        app.editing = true;
+        pointer_ui_size(&mut app, &ctx, vec![], Vec2::new(400.0, 320.0));
+        assert!(app.preferences.list_visible && app.list_viewport_rect.is_none());
+        assert!(app.canvas_viewport.unwrap().height() > 70.0);
+        assert_eq!(
+            app.toolbar_layout
+                .as_ref()
+                .unwrap()
+                .visible
+                .iter()
+                .filter(|v| **v)
+                .count(),
+            7
+        );
+        app.editing = false;
+        pointer_ui_size(&mut app, &ctx, vec![], Vec2::new(1180.0, 780.0));
+        assert!(app.list_viewport_rect.is_some());
+        app.toggle_list();
+        app.editing = true;
+        pointer_ui_size(&mut app, &ctx, vec![], Vec2::new(400.0, 320.0));
+        app.editing = false;
+        pointer_ui_size(&mut app, &ctx, vec![], Vec2::new(1180.0, 780.0));
+        assert!(!app.preferences.list_visible && app.list_viewport_rect.is_none());
+    }
+    #[test]
+    fn clipboard_paste_during_dirty_session_waits_without_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.png");
+        fixture(&path, false);
+        let (mut app, ctx) = app_with(&path);
+        app.start_edit(EditOp::Rotate90, &ctx);
+        wait(&mut app, &ctx);
+        raw_ui(&mut app, &ctx, Some(egui::Key::V), egui::Modifiers::COMMAND);
+        assert_eq!(app.pending_intent, Some(PendingIntent::Clipboard));
+        assert!(app.work.is_none() && app.loaded.as_ref().unwrap().path == path);
+        app.resolve_pending_choice(3, &ctx);
+        assert!(app.unsaved());
+    }
+    #[test]
+    fn cancelled_load_has_terminal_ui_state_without_a_worker_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.png");
+        fixture(&path, false);
+        let ctx = egui::Context::default();
+        let mut app = ImageApp::from_context(ctx.clone(), "test".into(), None, None);
+        app.open(path);
+        app.load_cancel.cancel();
+        app.loader.cancel();
+        wait(&mut app, &ctx);
+        assert!(!app.loading);
+        assert!(app.status.contains("取消"));
+    }
+    #[test]
+    fn finite_animation_eof_waits_for_final_frame_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("finite.gif");
+        {
+            let mut encoder = gif::Encoder::new(
+                std::fs::File::create(&path).unwrap(),
+                2,
+                1,
+                &[255, 0, 0, 0, 255, 0],
+            )
+            .unwrap();
+            for index in 0..2 {
+                encoder
+                    .write_frame(&gif::Frame {
+                        width: 2,
+                        height: 1,
+                        delay: 500,
+                        buffer: std::borrow::Cow::Owned(vec![index; 2]),
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut app = ImageApp::from_context(ctx.clone(), "finite".into(), None, None);
+        app.apply_load_response(
+            light_image_tool::worker::LoadResponse {
+                generation: 0,
+                result: light_image_tool::pipeline::load(&path, &Cancellation::default()),
+                siblings: vec![],
+            },
+            &ctx,
+        );
+        app.toggle_playback();
+        app.step_animation();
+        pump_animation(&mut app, &ctx, 2);
+        {
+            let p = app.playback.as_mut().unwrap();
+            p.manual_paused = false;
+            p.clock.resume(Instant::now());
+        }
+        let start = Instant::now();
+        while !app.playback.as_ref().unwrap().eof_pending {
+            pointer_ui(&mut app, &ctx, vec![]);
+            app.poll(&ctx);
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!app.playback.as_ref().unwrap().ended);
+        assert!(app.playback.as_ref().unwrap().clock.is_playing());
+        app.playback
+            .as_mut()
+            .unwrap()
+            .clock
+            .resume(Instant::now() - std::time::Duration::from_secs(6));
+        app.poll(&ctx);
+        assert!(app.playback.as_ref().unwrap().ended);
+        assert_eq!(
+            app.playback.as_ref().unwrap().elapsed,
+            std::time::Duration::from_secs(10)
+        );
+    }
+    #[test]
+    fn same_size_upload_budget_failure_cannot_display_old_texture_as_new_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.png");
+        let b = dir.path().join("b.png");
+        fixture(&a, false);
+        fixture(&b, false);
+        let (mut app, ctx) = app_with(&a);
+        app.refresh_texture(&ctx);
+        assert!(!app.tiles.is_empty());
+        let image = light_image_tool::pipeline::load(&b, &Cancellation::default()).unwrap();
+        let available =
+            light_image_tool::memory::OPERATION_BUDGET - light_image_tool::memory::in_use();
+        let pressure = light_image_tool::memory::reserve(available).unwrap();
+        app.apply_load_response(
+            light_image_tool::worker::LoadResponse {
+                generation: app.generation,
+                result: Ok(image),
+                siblings: vec![],
+            },
+            &ctx,
+        );
+        assert!(app.canvas_unavailable && app.tiles.is_empty());
+        assert_eq!(app.loaded.as_ref().unwrap().path, b);
+        drop(pressure);
+        app.error = None;
+        app.refresh_texture(&ctx);
+        assert!(!app.canvas_unavailable && !app.tiles.is_empty());
+    }
+    #[test]
+    fn native_close_event_is_cancelled_until_dirty_choice_is_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.png");
+        fixture(&path, false);
+        let (mut app, ctx) = app_with(&path);
+        app.start_edit(EditOp::Rotate90, &ctx);
+        wait(&mut app, &ctx);
+        let mut input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 550.0))),
+            focused: true,
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut output = ctx.run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|c| matches!(c, egui::ViewportCommand::CancelClose))
+        );
+        output.textures_delta.clear();
+        assert_eq!(app.pending_intent, Some(PendingIntent::Close));
+        assert!(!app.close_approved);
+        app.resolve_pending_choice(3, &ctx);
+        assert!(app.unsaved() && !app.close_approved);
+        app.request_intent(PendingIntent::Close, &ctx);
+        app.resolve_pending_choice(2, &ctx);
+        assert!(app.close_approved);
+    }
+    #[test]
+    fn text_edit_copy_and_paste_keep_text_semantics_without_clipboard_image_task() {
+        let ctx = egui::Context::default();
+        let mut app = ImageApp::from_context(ctx.clone(), "focus".into(), None, None);
+        let mut value = String::new();
+        let id = egui::Id::new("external-test-text");
+        for events in [
+            vec![],
+            vec![egui::Event::Paste("plain text".into())],
+            vec![egui::Event::Copy],
+        ] {
+            let mut frame = eframe::Frame::_new_kittest();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 550.0))),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut value).id(id))
+                    .request_focus();
+                eframe::App::ui(&mut app, ui, &mut frame);
+            });
+            output.textures_delta.clear();
+            assert!(app.work.is_none() && app.pending_intent.is_none());
+        }
+        assert_eq!(value, "plain text");
+    }
+    #[test]
+    fn fullscreen_idle_hides_chrome_and_edge_or_modal_restores_it() {
+        let ctx = egui::Context::default();
+        let mut app = ImageApp::from_context(ctx.clone(), "fullscreen".into(), None, None);
+        app.fullscreen = true;
+        let render = |app: &mut ImageApp, time: f64, events: Vec<egui::Event>| {
+            let mut frame = eframe::Frame::_new_kittest();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 320.0))),
+                    time: Some(time),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |ui| eframe::App::ui(app, ui, &mut frame),
+            );
+            output.textures_delta.clear();
+        };
+        render(&mut app, 0.0, vec![]);
+        render(&mut app, 2.0, vec![]);
+        assert!(app.toolbar_hidden);
+        render(
+            &mut app,
+            2.1,
+            vec![egui::Event::PointerMoved(Pos2::new(10.0, 315.0))],
+        );
+        assert!(!app.toolbar_hidden);
+        app.path_dialog = true;
+        render(&mut app, 4.2, vec![egui::Event::PointerGone]);
+        assert!(!app.toolbar_hidden);
     }
 }
 

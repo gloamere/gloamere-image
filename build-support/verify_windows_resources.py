@@ -16,6 +16,7 @@ import struct
 SIZES = {16, 20, 24, 32, 40, 48, 64, 128, 256}
 IDENTITIES = {
     "gloamere-image.exe": "gloamere-image",
+    "gloamere-image-ui.exe": "gloamere-image viewer",
     "gloamere-image-worker.exe": "gloamere-image metadata and provenance worker",
 }
 

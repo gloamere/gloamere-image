@@ -42,10 +42,15 @@ fn actual_worker_faults_are_errors_cancel_timeout_and_recover() {
             });
         }
         let bytes = if mode == "blocked-input" {
-            vec![7; 32 * 1024 * 1024]
+            // Exceeds the measured Windows anonymous pipe buffer (4 KiB) by 512x.
+            // Keep this an IPC-cancellation test, rather than a 32 MiB Debug hash benchmark.
+            vec![7; 2 * 1024 * 1024]
         } else {
             fixture.to_vec()
         };
+        let payload_bytes = bytes.len();
+        let mut peer_ready = None;
+        let mut cancellation_response_ms = None;
         let start = Instant::now();
         let result = inspect_snapshot(bytes, &helper, &cancel);
         let elapsed = start.elapsed();
@@ -53,11 +58,14 @@ fn actual_worker_faults_are_errors_cancel_timeout_and_recover() {
         if mode == "blocked-input" {
             assert!(matches!(error, ToolError::Cancelled));
             let (entered, requested) = ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let response = requested.elapsed();
+            peer_ready = Some(entered);
+            cancellation_response_ms = Some(response.as_millis());
             assert!(
                 entered,
                 "cancellation must exercise an actual blocked IPC peer"
             );
-            assert!(requested.elapsed() < Duration::from_millis(750));
+            assert!(response < Duration::from_millis(750));
             assert!(elapsed < Duration::from_secs(6));
         } else if mode == "hang" {
             assert!(elapsed >= Duration::from_secs(20) && elapsed < Duration::from_secs(23));
@@ -75,7 +83,7 @@ fn actual_worker_faults_are_errors_cancel_timeout_and_recover() {
             baseline,
             "IPC snapshot retained after {mode}"
         );
-        results.push(serde_json::json!({"mode":mode,"elapsed_ms":elapsed.as_millis(),"error":error.to_string(),"snapshot_budget_released":true}));
+        results.push(serde_json::json!({"mode":mode,"payload_bytes":payload_bytes,"peer_ready":peer_ready,"cancellation_response_ms":cancellation_response_ms,"elapsed_ms":elapsed.as_millis(),"error":error.to_string(),"snapshot_budget_released":true}));
     }
     let report = inspect_snapshot(
         fixture.to_vec(),

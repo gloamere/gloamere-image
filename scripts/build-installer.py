@@ -15,11 +15,31 @@ import re
 import stat
 import subprocess
 import tempfile
+import tomllib
 import unicodedata
 from pathlib import Path
 
 PRODUCT = "gloamere-image"
-VERSION = "0.4.0"
+PROJECT = Path(__file__).resolve().parent.parent
+
+
+def candidate_version(project: Path = PROJECT) -> str:
+    """Use paired Cargo package versions, not a second release-version constant."""
+    versions = []
+    for relative in ("Cargo.toml", "crates/provenance-worker/Cargo.toml"):
+        package = tomllib.loads((project / relative).read_text("utf-8"))["package"]
+        version = package["version"]
+        if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+            raise ValueError("Candidate version must be a three-part numeric version")
+        if any(int(part) > 65535 for part in version.split(".")):
+            raise ValueError("Candidate version exceeds Windows resource bounds")
+        versions.append(version)
+    if versions[0] != versions[1]:
+        raise ValueError("Main and worker candidate versions must match")
+    return versions[0]
+
+
+VERSION = candidate_version()
 PRODUCT_ID = "9CCB6F43-7782-4F69-9E91-67C6D144737B"
 OWNER_MARKER = "LIGHT-IMAGE-INSTALL.txt"
 COMPILER_VERSION = "6.7.3"
@@ -33,12 +53,11 @@ SETUP_ORIGINAL_FILENAME_CAPACITY = 50
 RESOURCE_HELPER = Path(__file__).resolve().parent.parent / "build-support/verify_windows_resources.py"
 INSTALLER_NAME = f"{PRODUCT}-{VERSION}-Win64-Setup-unsigned.exe"
 REQUIRED_FILES = {
-    "gloamere-image.exe", "gloamere-image-worker.exe", "assets/gloamere-image.ico",
+    "gloamere-image.exe", "runtime/gloamere-image-ui.exe", "runtime/gloamere-image-worker.exe", "assets/gloamere-image.ico",
     "README.md", "VALIDATION.md", "LICENSE-MIT", "LICENSE-APACHE",
     "third-party-notices/inventory.json",
 }
 RESERVED_FILES = {"manifest.json", OWNER_MARKER.casefold()}
-PROJECT = Path(__file__).resolve().parent.parent
 
 
 def sha256(path: Path) -> str:
@@ -192,7 +211,7 @@ def validate_payload(payload: Path) -> dict:
     icon = (payload / "assets/gloamere-image.ico").read_bytes()
     if len(icon) < 6 or icon[:4] != b"\x00\x00\x01\x00" or icon[4:6] == b"\x00\x00":
         raise ValueError("Required product icon is not an ICO file")
-    for name in ("gloamere-image.exe", "gloamere-image-worker.exe"):
+    for name in ("gloamere-image.exe", "runtime/gloamere-image-ui.exe", "runtime/gloamere-image-worker.exe"):
         with (payload / name).open("rb") as stream:
             if stream.read(2) != b"MZ":
                 raise ValueError(f"Expected Windows executable: {name}")
@@ -202,10 +221,14 @@ def validate_payload(payload: Path) -> dict:
 def generate_includes(paths: list[str], directory: Path) -> tuple[Path, Path]:
     check_path_collisions(paths + [OWNER_MARKER])
     entries = []
-    for relative in sorted(paths):
+    for relative in sorted(paths, key=lambda value: (value != "gloamere-image.exe", value)):
         source = relative.replace("/", "\\")
         folder = source.rpartition("\\")[0]
         destination = "{app}" + ("\\" + folder if folder else "")
+        if relative == "gloamere-image.exe":
+            # Native begin atomically publishes the first launcher. Inno must
+            # never truncate/copy the only recovery entry, including bootstrap.
+            continue
         entries.append(f'Source: "{{#PayloadDir}}\\{source}"; DestDir: "{destination}"; Flags: ignoreversion')
     entries.append('Source: "{#OwnerMarker}"; DestDir: "{app}"; Flags: ignoreversion')
     file_list = directory / "payload-files.iss"
@@ -218,6 +241,22 @@ def generate_includes(paths: list[str], directory: Path) -> tuple[Path, Path]:
     recovery_list = directory / "payload-recovery.iss"
     recovery_list.write_text("\n".join(recovery) + "\n", "utf-8")
     return file_list, recovery_list
+
+
+def generate_transaction_plan(payload: Path, manifest: dict, directory: Path) -> Path:
+    records = [{"path": entry["path"], "length": entry["size_bytes"], "sha256": entry["sha256"]}
+               for entry in manifest["files"]]
+    records.append({"path": "MANIFEST.json", "length": (payload / "MANIFEST.json").stat().st_size,
+                    "sha256": sha256(payload / "MANIFEST.json")})
+    marker = PRODUCT_ID.encode("ascii")
+    records.append({"path": OWNER_MARKER, "length": len(marker), "sha256": hashlib.sha256(marker).hexdigest()})
+    if len(records) > 4096 or sum(entry["length"] for entry in records) > 2 * 1024**3:
+        raise ValueError("Installer plan exceeds native transaction bounds")
+    plan = {"schema": 1, "product_id": PRODUCT_ID, "version": VERSION,
+            "launcher_protocol": 1, "files": sorted(records, key=lambda entry: entry["path"])}
+    path = directory / "installer-plan.json"
+    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", "utf-8")
+    return path
 
 
 def running_on_windows() -> bool:
@@ -387,6 +426,7 @@ def compile_installer(compiler: Path, payload: Path, output: Path) -> dict:
         marker.write_text(PRODUCT_ID, "ascii")
         file_list, recovery_list = generate_includes(
             [entry["path"] for entry in manifest["files"]] + ["MANIFEST.json"], internal)
+        plan_file = generate_transaction_plan(payload, manifest, internal)
         # Recheck immediately before the compiler reads the exact generated list.
         validate_payload(payload)
         require_compiler_snapshot(compiler, component_hashes)
@@ -394,7 +434,7 @@ def compile_installer(compiler: Path, payload: Path, output: Path) -> dict:
             str(compiler), "/Qp", "/DPayloadDir=" + str(payload),
             "/DOutputDir=" + str(internal), "/DProductVersion=" + VERSION,
             "/DPayloadFileList=" + str(file_list), "/DPayloadRecoveryList=" + str(recovery_list),
-            "/DOwnerMarker=" + str(marker), str(PROJECT / "installer/light-image-tool.iss"),
+            "/DOwnerMarker=" + str(marker), "/DTransactionPlan=" + str(plan_file), str(PROJECT / "installer/light-image-tool.iss"),
         ], check=True)
         require_compiler_snapshot(compiler, component_hashes)
         built = internal / INSTALLER_NAME
@@ -429,10 +469,16 @@ def compile_installer(compiler: Path, payload: Path, output: Path) -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", type=Path, help="Preinstalled official Inno Setup 6.7.3 ISCC.exe")
-    parser.add_argument("--payload", type=Path, required=True)
+    parser.add_argument("--payload", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--print-version", action="store_true", help="Print the paired Cargo candidate version, without building")
     args = parser.parse_args(argv)
+    if args.print_version:
+        print(VERSION)
+        return 0
+    if args.payload is None:
+        parser.error("--payload is required unless --print-version")
     if args.validate_only:
         manifest = validate_payload(args.payload)
         print(json.dumps({"payload_validation": "passed", "files": len(manifest["files"]),

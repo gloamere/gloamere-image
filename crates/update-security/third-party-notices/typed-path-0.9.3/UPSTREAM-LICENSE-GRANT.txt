@@ -1,0 +1,16 @@
+typed-path 0.9.3
+Source commit: 08cae85913d37b862b1d0e1aa2fa9e3857e9312e
+Repository: https://github.com/chipsenkbeil/typed-path
+The crates.io source package omits standalone LICENSE files. Its README license grant is reproduced below. This distribution uses the Apache-2.0 option; unmodified Apache-2.0 license text is included.
+
+
+
+This project is licensed under either of
+
+Apache License, Version 2.0, (LICENSE-APACHE or
+[apache-license][apache-license]) MIT license (LICENSE-MIT or
+[mit-license][mit-license]) at your option.
+
+[apache-license]: http://www.apache.org/licenses/LICENSE-2.0
+[mit-license]: http://opensource.org/licenses/MIT
+

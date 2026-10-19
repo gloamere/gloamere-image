@@ -62,6 +62,14 @@ pub enum Icon {
     CropApply,
     ResizeApply,
     Close,
+    Copy,
+    Paste,
+    FitWidth,
+    Play,
+    Pause,
+    Step,
+    Restart,
+    Filter,
 }
 impl Icon {
     pub const ALL: [Self; BUTTON_COUNT] = [
@@ -103,6 +111,14 @@ impl Icon {
             Self::CropApply => "应用裁剪",
             Self::ResizeApply => "应用缩放",
             Self::Close => "关闭 / 取消",
+            Self::Copy => "复制图像 / 当前帧 · Ctrl+C",
+            Self::Paste => "从剪贴板打开 · Ctrl+V",
+            Self::FitWidth => "长图适应宽度",
+            Self::Play => "播放动画 · Space",
+            Self::Pause => "暂停动画 · Space",
+            Self::Step => "下一帧并暂停",
+            Self::Restart => "从头播放",
+            Self::Filter => "AI 状态筛选",
         }
     }
 }
@@ -110,44 +126,63 @@ impl Icon {
 #[derive(Clone, Debug)]
 pub struct ToolbarLayout {
     pub buttons: [Rect; BUTTON_COUNT],
+    /// Indices remain aligned with `Icon::ALL`; hidden commands live in More.
+    pub visible: [bool; BUTTON_COUNT],
     pub separators: Vec<f32>,
     pub metadata: Option<Rect>,
     pub zoom: Option<Rect>,
 }
 impl ToolbarLayout {
     pub fn new(area: Rect) -> Self {
-        let full = area.width() >= 720.0;
-        let compact = area.width() < 520.0;
-        let side = if compact { 28.0 } else { 34.0 };
-        let gap = if compact { 1.0 } else { 4.0 };
-        let separator = if compact { 6.0 } else { 12.0 };
-        let width = BUTTON_COUNT as f32 * side + (BUTTON_COUNT - 1) as f32 * gap + 3.0 * separator;
+        // Breakpoints are logical points, independent of the display scale.
+        // Remove low-frequency controls before reducing the remaining targets.
+        let visible = std::array::from_fn(|index| match index {
+            7..=9 => area.width() >= 640.0,
+            6 => area.width() >= 480.0,
+            _ => true,
+        });
+        let count = visible.iter().filter(|&&shown| shown).count();
+        let side = if area.width() < 480.0 { 32.0 } else { 34.0 };
+        let gap = 4.0;
+        let separator = 12.0;
+        let width = count as f32 * side + (count - 1) as f32 * gap + 3.0 * separator;
         let mut x = area.center().x - width / 2.0;
         let y = area.center().y - side / 2.0;
-        let mut separators = Vec::new();
+        let mut separators = Vec::with_capacity(3);
+        let mut previous_group = 0;
         let buttons = std::array::from_fn(|index| {
-            if [1, 3, 7].contains(&index) {
+            if !visible[index] {
+                return Rect::NOTHING;
+            }
+            let group = match index {
+                0 => 0,
+                1..=2 => 1,
+                3..=6 => 2,
+                _ => 3,
+            };
+            if group != previous_group {
                 separators.push(x + separator / 2.0 - gap / 2.0);
                 x += separator;
             }
+            previous_group = group;
             let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::splat(side));
             x += side + gap;
             rect
         });
+        let metadata_rect = Rect::from_min_max(
+            area.min + Vec2::new(12.0, 0.0),
+            Pos2::new(buttons[0].left() - 10.0, area.bottom()),
+        );
+        let zoom_rect = Rect::from_min_max(
+            Pos2::new(buttons[BUTTON_COUNT - 1].right() + 10.0, area.top()),
+            area.max - Vec2::new(12.0, 0.0),
+        );
         Self {
-            metadata: full.then(|| {
-                Rect::from_min_max(
-                    area.min + Vec2::new(12.0, 0.0),
-                    Pos2::new(buttons[0].left() - 10.0, area.bottom()),
-                )
-            }),
-            zoom: full.then(|| {
-                Rect::from_min_max(
-                    Pos2::new(buttons[BUTTON_COUNT - 1].right() + 10.0, area.top()),
-                    area.max - Vec2::new(12.0, 0.0),
-                )
-            }),
+            metadata: (area.width() >= 960.0 && metadata_rect.width() >= 96.0)
+                .then_some(metadata_rect),
+            zoom: (area.width() >= 640.0 && zoom_rect.width() >= 64.0).then_some(zoom_rect),
             buttons,
+            visible,
             separators,
         }
     }
@@ -215,8 +250,9 @@ pub fn icon_button(
             egui::Sense::hover()
         },
     );
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, icon.label()));
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, icon.label())
+    });
     let color = if !enabled {
         Color32::from_gray(183)
     } else {
@@ -233,7 +269,7 @@ pub fn icon_button(
         ui.painter().rect_stroke(
             rect.shrink(1.0),
             5.0,
-            egui::Stroke::new(1.5, Color32::from_rgb(39, 99, 151)),
+            egui::Stroke::new(2.0, Color32::from_rgb(28, 79, 125)),
             egui::StrokeKind::Inside,
         );
     }
@@ -306,7 +342,7 @@ impl egui::Widget for CompactAction<'_> {
             ui.painter().rect_stroke(
                 rect.shrink(1.0),
                 5.0,
-                egui::Stroke::new(1.5, Color32::from_rgb(39, 99, 151)),
+                egui::Stroke::new(2.0, Color32::from_rgb(28, 79, 125)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -369,6 +405,7 @@ impl egui::Widget for ActionButton<'_> {
             ui.spacing()
                 .interact_size
                 .y
+                .max(if self.full_width { 34.0 } else { 0.0 })
                 .max(galley.size().y + if self.full_width { 4.0 } else { 8.0 }),
         );
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -383,7 +420,7 @@ impl egui::Widget for ActionButton<'_> {
             ui.painter().rect_stroke(
                 rect.shrink(1.0),
                 4.0,
-                egui::Stroke::new(1.5, Color32::from_rgb(39, 99, 151)),
+                egui::Stroke::new(2.0, Color32::from_rgb(28, 79, 125)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -411,9 +448,35 @@ impl egui::Widget for ActionButton<'_> {
     }
 }
 
+/// Pure display decoration. This never sees image pixels or export/clipboard buffers.
+/// A larger canvas badge provides a 32 point target; list badges remain decoration.
+pub fn paint_ai_badge(
+    painter: &egui::Painter,
+    position: Pos2,
+    label: &str,
+    suspected: bool,
+    manual: bool,
+    interactive: bool,
+) -> Rect {
+    let height = if interactive { 32.0 } else { 19.0 };
+    let font = egui::FontId::proportional(if interactive { 13.0 } else { 11.0 });
+    let galley = painter.layout_no_wrap(label.to_owned(), font, Color32::WHITE);
+    let rect = Rect::from_min_size(position, Vec2::new(galley.size().x + 12.0, height));
+    let color = if manual {
+        Color32::from_rgb(58, 82, 119)
+    } else if suspected {
+        Color32::from_rgb(130, 79, 22)
+    } else {
+        Color32::from_rgb(36, 103, 79)
+    };
+    painter.rect_filled(rect, 5.0, color);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
+    rect
+}
+
 fn paint_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) {
     let p = |x, y| center + Vec2::new(x, y);
-    let stroke = egui::Stroke::new(1.5, color);
+    let stroke = egui::Stroke::new(1.7, color);
     let line = |points: &[(f32, f32)]| {
         painter.add(egui::Shape::line(
             points.iter().map(|&(x, y)| p(x, y)).collect(),
@@ -421,6 +484,15 @@ fn paint_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32)
         ));
     };
     match icon {
+        Icon::Filter => line(&[
+            (-9., -7.),
+            (9., -7.),
+            (3., 0.),
+            (3., 7.),
+            (-3., 9.),
+            (-3., 0.),
+            (-9., -7.),
+        ]),
         Icon::Open => line(&[
             (-9., 7.),
             (-9., -6.),
@@ -544,6 +616,50 @@ fn paint_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32)
             line(&[(0., 3.), (0., -8.)]);
             line(&[(-4., -4.), (0., -8.), (4., -4.)]);
         }
+        Icon::Copy => {
+            line(&[(-5., 4.), (-9., 4.), (-9., -9.), (4., -9.), (4., -5.)]);
+            line(&[(-4., -4.), (9., -4.), (9., 9.), (-4., 9.), (-4., -4.)]);
+        }
+        Icon::Paste => {
+            line(&[
+                (-4., -7.),
+                (-8., -7.),
+                (-8., 9.),
+                (8., 9.),
+                (8., -7.),
+                (4., -7.),
+            ]);
+            line(&[(-4., -10.), (4., -10.), (4., -5.), (-4., -5.), (-4., -10.)]);
+            line(&[(-4., 0.), (4., 0.)]);
+            line(&[(-4., 4.), (2., 4.)]);
+        }
+        Icon::FitWidth => {
+            line(&[(-9., -8.), (-9., 8.)]);
+            line(&[(9., -8.), (9., 8.)]);
+            line(&[(-6., 0.), (6., 0.)]);
+            line(&[(-2., -4.), (-6., 0.), (-2., 4.)]);
+            line(&[(2., -4.), (6., 0.), (2., 4.)]);
+        }
+        Icon::Play => line(&[(-5., -8.), (8., 0.), (-5., 8.), (-5., -8.)]),
+        Icon::Pause => {
+            line(&[(-6., -8.), (-6., 8.)]);
+            line(&[(6., -8.), (6., 8.)]);
+        }
+        Icon::Step => {
+            line(&[(-8., -8.), (4., 0.), (-8., 8.), (-8., -8.)]);
+            line(&[(8., -8.), (8., 8.)]);
+        }
+        Icon::Restart => {
+            let points = (0..=24)
+                .map(|i| {
+                    let a = -2.3 + i as f32 / 24.0 * 5.2;
+                    p(a.cos() * 9.0, a.sin() * 9.0)
+                })
+                .collect();
+            painter.add(egui::Shape::line(points, stroke));
+            line(&[(-6., -10.), (-6., -6.), (-2., -6.)]);
+            line(&[(-2., -3.), (3., 0.), (-2., 3.), (-2., -3.)]);
+        }
         Icon::List => {
             for y in [-6.0, 0.0, 6.0] {
                 painter.circle_filled(p(-7.0, y), 1.2, color);
@@ -584,7 +700,7 @@ fn paint_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32)
 pub fn paint_checker(painter: &egui::Painter, area: Rect, colors: ([u8; 3], [u8; 3])) {
     let (a, b) = colors;
     painter.rect_filled(area, 0.0, Color32::from_rgb(a[0], a[1], a[2]));
-    let cell = 16.0;
+    let cell = 12.0;
     let mut mesh = egui::Mesh::default();
     for y in 0..(area.height() / cell).ceil() as usize {
         for x in 0..(area.width() / cell).ceil() as usize {
@@ -783,6 +899,13 @@ mod tests {
             Icon::Crop,
             Icon::CropApply,
             Icon::ResizeApply,
+            Icon::Copy,
+            Icon::Paste,
+            Icon::FitWidth,
+            Icon::Play,
+            Icon::Pause,
+            Icon::Step,
+            Icon::Restart,
         ];
         let mut glyphs = Vec::new();
         for icon in icons {
@@ -820,30 +943,190 @@ mod tests {
     }
     #[test]
     fn toolbar_rectangles_fit_single_row_at_supported_sizes_and_high_dpi() {
-        for width in [400.0, 533.3, 720.0, 800.0, 1180.0, 1600.0] {
+        for width in [
+            360.0, 400.0, 480.0, 533.3, 640.0, 720.0, 800.0, 960.0, 1180.0, 1600.0,
+        ] {
             let area = Rect::from_min_size(Pos2::new(0., 498.), Vec2::new(width, TOOLBAR_HEIGHT));
             let layout = ToolbarLayout::new(area);
-            for rect in &layout.buttons {
+            let buttons: Vec<_> = layout
+                .buttons
+                .iter()
+                .zip(layout.visible)
+                .filter_map(|(rect, visible)| visible.then_some(*rect))
+                .collect();
+            for rect in &buttons {
                 assert!(area.contains_rect(*rect), "width={width}, rect={rect:?}");
-                assert!(rect.width() >= 28.0);
+                assert!(rect.width() >= 32.0);
+                assert_eq!(rect.width(), rect.height());
+                assert!(rect.left() >= area.left() + 12.0);
+                assert!(rect.right() <= area.right() - 12.0);
             }
-            for pair in layout.buttons.windows(2) {
-                assert!(pair[0].right() < pair[1].left());
+            for pair in buttons.windows(2) {
+                assert!(pair[0].right() + 4.0 <= pair[1].left());
+                assert_eq!(pair[0].center().y, pair[1].center().y);
             }
+            assert_eq!(layout.separators.len(), 3);
+            for separator in &layout.separators {
+                assert!(
+                    buttons.windows(2).any(|pair| {
+                        pair[0].right() < *separator && *separator < pair[1].left()
+                    }),
+                    "separator must be between visible buttons"
+                );
+            }
+            assert_eq!(layout.metadata.is_some(), width >= 960.0);
             if let Some(metadata) = layout.metadata {
+                assert!(area.contains_rect(metadata));
                 assert!(metadata.right() < layout.buttons[0].left());
             }
             if let Some(zoom) = layout.zoom {
+                assert!(area.contains_rect(zoom));
+                assert!(zoom.width() >= 64.0);
                 assert!(zoom.left() > layout.buttons[10].right());
             }
         }
     }
     #[test]
+    fn toolbar_breakpoints_keep_stable_indices_and_overflow_low_frequency_commands() {
+        for (width, expected) in [
+            (360.0, 7),
+            (400.0, 7),
+            (479.9, 7),
+            (480.0, 8),
+            (639.9, 8),
+            (640.0, 11),
+            (959.9, 11),
+            (960.0, 11),
+        ] {
+            let layout = ToolbarLayout::new(Rect::from_min_size(
+                Pos2::new(17.0, 50.0),
+                Vec2::new(width, TOOLBAR_HEIGHT),
+            ));
+            assert_eq!(layout.visible.iter().filter(|&&v| v).count(), expected);
+            for (index, (rect, visible)) in layout.buttons.iter().zip(layout.visible).enumerate() {
+                assert_eq!(
+                    visible,
+                    match index {
+                        6 => width >= 480.0,
+                        7..=9 => width >= 640.0,
+                        _ => true,
+                    }
+                );
+                assert_eq!(*rect == Rect::NOTHING, !visible);
+            }
+        }
+    }
+    #[test]
+    fn toolbar_targets_and_breakpoints_are_logical_at_200_percent_dpi() {
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            for width in [360.0, 400.0, 480.0, 640.0, 960.0] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(pixels_per_point);
+                let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, TOOLBAR_HEIGHT));
+                let mut layout = None;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(area),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        assert_eq!(ui.ctx().pixels_per_point(), pixels_per_point);
+                        layout = Some(ToolbarLayout::new(area));
+                    },
+                );
+                output.textures_delta.clear();
+                let actual = layout.unwrap();
+                let expected = ToolbarLayout::new(area);
+                assert_eq!(actual.buttons, expected.buttons);
+                assert_eq!(actual.visible, expected.visible);
+                for (rect, visible) in actual.buttons.iter().zip(actual.visible) {
+                    if visible {
+                        assert!(rect.width() * pixels_per_point >= 32.0 * pixels_per_point);
+                        assert!(area.contains_rect(*rect));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn menu_actions_have_34_point_rows_and_accessible_labels() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut response = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_width(236.0);
+            response = Some(ui.add(ActionButton::new(Icon::Paste, "从剪贴板打开 · Ctrl+V").menu()));
+        });
+        output.textures_delta.clear();
+        let response = response.unwrap();
+        assert!(response.rect.height() >= 34.0);
+        assert_eq!(response.rect.width(), 236.0);
+        assert!(texts(&output).iter().any(|s| s == "从剪贴板打开 · Ctrl+V"));
+        let node = &output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|(id, _)| *id == response.id.accesskit_id())
+            .unwrap()
+            .1;
+        assert_eq!(node.label(), Some("从剪贴板打开 · Ctrl+V"));
+        assert_eq!(node.role(), egui::accesskit::Role::Button);
+    }
+    #[test]
+    fn compact_keyboard_focus_has_a_two_point_high_contrast_ring() {
+        let ctx = egui::Context::default();
+        let (_, response) = compact_frame(&ctx, 240.0, true, false, 0.0, vec![]);
+        ctx.memory_mut(|m| m.request_focus(response.id));
+        let (output, response) = compact_frame(&ctx, 240.0, true, false, 0.1, vec![]);
+        assert!(response.has_focus());
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Rect(rect) if rect.stroke.width == 2.0
+                && rect.stroke.color == Color32::from_rgb(28, 79, 125))));
+    }
+    #[test]
+    fn checker_uses_twelve_point_cells() {
+        let ctx = egui::Context::default();
+        let area = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::splat(24.0));
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            paint_checker(ui.painter(), area, ([241, 243, 242], [235, 239, 237]));
+        });
+        output.textures_delta.clear();
+        let mesh = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) => Some(mesh),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(mesh.vertices.len(), 8);
+        for vertices in mesh.vertices.as_chunks::<4>().0 {
+            let rect = Rect::from_points(&vertices.iter().map(|v| v.pos).collect::<Vec<_>>());
+            assert_eq!(rect.size(), Vec2::splat(12.0));
+            assert!(area.contains_rect(rect));
+        }
+    }
+    #[test]
     fn all_icons_have_distinct_accessible_names() {
-        let mut names: Vec<_> = Icon::ALL.into_iter().map(Icon::label).collect();
+        let new_icons = [
+            Icon::Copy,
+            Icon::Paste,
+            Icon::FitWidth,
+            Icon::Play,
+            Icon::Pause,
+            Icon::Step,
+            Icon::Restart,
+        ];
+        let mut names: Vec<_> = Icon::ALL
+            .into_iter()
+            .chain(new_icons)
+            .map(Icon::label)
+            .collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), BUTTON_COUNT);
+        assert_eq!(names.len(), BUTTON_COUNT + new_icons.len());
         assert!(names.iter().all(|name| !name.is_empty()));
     }
 }

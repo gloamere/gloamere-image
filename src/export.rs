@@ -72,9 +72,30 @@ pub fn save_new(
     })
 }
 
+/// Export a session with no source file, preserving the same no-clobber protocol.
+pub fn save_temporary(
+    image: &RgbaImage,
+    options: &ExportOptions,
+    cancel: &Cancellation,
+) -> Result<PathBuf> {
+    save_using(image, None, options, cancel, |file, icc| {
+        encode(file, image, options, icc, cancel)
+    })
+}
+
 fn save_new_using(
     image: &RgbaImage,
     original: &Path,
+    options: &ExportOptions,
+    cancel: &Cancellation,
+    encoder: impl FnOnce(&mut std::fs::File, &[u8]) -> Result<()>,
+) -> Result<PathBuf> {
+    save_using(image, Some(original), options, cancel, encoder)
+}
+
+fn save_using(
+    image: &RgbaImage,
+    original: Option<&Path>,
     options: &ExportOptions,
     cancel: &Cancellation,
     encoder: impl FnOnce(&mut std::fs::File, &[u8]) -> Result<()>,
@@ -89,7 +110,7 @@ fn save_new_using(
             "目标名称已存在，请选择新名称；不会覆盖任何文件".into(),
         ));
     }
-    if destination == original {
+    if original.is_some_and(|original| destination == original) {
         return Err(ToolError::Invalid("不能覆盖原图，请导出新副本".into()));
     }
     let parent = destination
