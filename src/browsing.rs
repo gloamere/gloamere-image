@@ -2,10 +2,11 @@
 use crate::{Cancellation, Result, ToolError, pipeline};
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub const MAX_DIRECTORY_ENTRIES: usize = 10_000;
@@ -16,7 +17,138 @@ pub const THUMBNAIL_CACHE_ENTRIES: usize = 48;
 #[derive(Debug)]
 pub struct DirectoryListing {
     pub paths: Vec<PathBuf>,
+    pub metadata: HashMap<PathBuf, FileMetadata>,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FileMetadata {
+    pub modified: Option<SystemTime>,
+    pub bytes: Option<u64>,
+    pub regular_file: bool,
+    pub symlink: bool,
+}
+impl FileMetadata {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            modified: metadata.modified().ok(),
+            bytes: metadata.is_file().then_some(metadata.len()),
+            regular_file: metadata.is_file(),
+            symlink: metadata.file_type().is_symlink(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortOrder {
+    #[default]
+    Natural,
+    ModifiedNewest,
+    ModifiedOldest,
+    SizeLargest,
+    SizeSmallest,
+}
+impl SortOrder {
+    pub const ALL: [Self; 5] = [
+        Self::Natural,
+        Self::ModifiedNewest,
+        Self::ModifiedOldest,
+        Self::SizeLargest,
+        Self::SizeSmallest,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Natural => "文件名自然排序",
+            Self::ModifiedNewest => "修改时间 · 新到旧",
+            Self::ModifiedOldest => "修改时间 · 旧到新",
+            Self::SizeLargest => "文件大小 · 大到小",
+            Self::SizeSmallest => "文件大小 · 小到大",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FormatFilter {
+    #[default]
+    All,
+    Jpeg,
+    Png,
+    Gif,
+    WebP,
+}
+impl FormatFilter {
+    pub const ALL: [Self; 5] = [Self::All, Self::Jpeg, Self::Png, Self::Gif, Self::WebP];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "全部格式",
+            Self::Jpeg => "JPEG",
+            Self::Png => "PNG",
+            Self::Gif => "GIF",
+            Self::WebP => "WebP",
+        }
+    }
+    pub fn matches(self, path: &Path) -> bool {
+        if self == Self::All {
+            return true;
+        }
+        let extension = path.extension().unwrap_or_default().to_string_lossy();
+        match self {
+            Self::All => true,
+            Self::Jpeg => {
+                extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg")
+            }
+            Self::Png => extension.eq_ignore_ascii_case("png"),
+            Self::Gif => extension.eq_ignore_ascii_case("gif"),
+            Self::WebP => extension.eq_ignore_ascii_case("webp"),
+        }
+    }
+}
+
+fn optional_cmp<T: Ord>(left: Option<T>, right: Option<T>, descending: bool) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) if descending => right.cmp(&left),
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+pub fn sort_indices(
+    paths: &[PathBuf],
+    metadata: &HashMap<PathBuf, FileMetadata>,
+    indices: &mut [usize],
+    order: SortOrder,
+) {
+    let names: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase()
+        })
+        .collect();
+    indices.sort_by(|&left, &right| {
+        let a = metadata.get(&paths[left]);
+        let b = metadata.get(&paths[right]);
+        let by_metadata = match order {
+            SortOrder::Natural => Ordering::Equal,
+            SortOrder::ModifiedNewest | SortOrder::ModifiedOldest => optional_cmp(
+                a.and_then(|m| m.modified),
+                b.and_then(|m| m.modified),
+                order == SortOrder::ModifiedNewest,
+            ),
+            SortOrder::SizeLargest | SortOrder::SizeSmallest => optional_cmp(
+                a.and_then(|m| m.bytes),
+                b.and_then(|m| m.bytes),
+                order == SortOrder::SizeLargest,
+            ),
+        };
+        by_metadata
+            .then_with(|| natural_cmp(&names[left], &names[right]))
+            .then_with(|| paths[left].cmp(&paths[right]))
+    });
 }
 pub fn ensure_current(mut paths: Vec<PathBuf>, current: &Path) -> Result<Vec<PathBuf>> {
     if current.as_os_str().len() > pipeline::MAX_SIBLING_PATH_BYTES {
@@ -141,6 +273,10 @@ pub fn scan(path: &Path, cancel: &Cancellation) -> Result<DirectoryListing> {
         return Err(ToolError::Invalid("当前浏览路径超过列表大小限制".into()));
     }
     let mut paths = vec![path.to_path_buf()];
+    let mut metadata = HashMap::new();
+    if let Ok(value) = std::fs::symlink_metadata(path) {
+        metadata.insert(path.to_path_buf(), FileMetadata::from_metadata(&value));
+    }
     let mut bytes = path.as_os_str().len();
     let mut entries = std::fs::read_dir(directory(path))?;
     let mut truncated = false;
@@ -167,8 +303,13 @@ pub fn scan(path: &Path, cancel: &Cancellation) -> Result<DirectoryListing> {
                             && a.to_string_lossy().to_lowercase()
                                 == b.to_string_lossy().to_lowercase())
                 })
-            || !entry.file_type().is_ok_and(|t| t.is_file())
         {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() || file_type.is_symlink() {
             continue;
         }
         let next_bytes = bytes.saturating_add(candidate.as_os_str().len());
@@ -177,19 +318,27 @@ pub fn scan(path: &Path, cancel: &Cancellation) -> Result<DirectoryListing> {
             break;
         }
         bytes = next_bytes;
+        let value = entry
+            .metadata()
+            .map(|m| FileMetadata::from_metadata(&m))
+            .unwrap_or(FileMetadata {
+                regular_file: true,
+                ..Default::default()
+            });
+        metadata.insert(candidate.clone(), value);
         paths.push(candidate);
     }
     cancel.check()?;
     sort_paths(&mut paths);
     paths.dedup();
-    Ok(DirectoryListing { paths, truncated })
+    Ok(DirectoryListing {
+        paths,
+        metadata,
+        truncated,
+    })
 }
 pub fn thumbnail(path: &Path, cancel: &Cancellation) -> Result<image::RgbaImage> {
-    let loaded = pipeline::load(path, cancel)?;
-    cancel.check()?;
-    let thumbnail = image::imageops::thumbnail(&**loaded.pixels, THUMBNAIL_EDGE, THUMBNAIL_EDGE);
-    cancel.check()?;
-    Ok(thumbnail)
+    pipeline::thumbnail(path, THUMBNAIL_EDGE, cancel)
 }
 pub struct Request {
     pub generation: u64,
@@ -231,7 +380,7 @@ impl<T: Send + 'static> Worker<T> {
     pub fn new(
         name: &str,
         _ctx: eframe::egui::Context,
-        operation: fn(&Path, &Cancellation) -> Result<T>,
+        operation: impl FnMut(&Path, &Cancellation) -> Result<T> + Send + 'static,
     ) -> Self {
         // Retain the constructor API but never move a Context into this worker.
         // The UI polls while busy. A repaint call can acquire egui's Context
@@ -241,7 +390,7 @@ impl<T: Send + 'static> Worker<T> {
 
     fn start(
         name: &str,
-        operation: impl Fn(&Path, &Cancellation) -> Result<T> + Send + 'static,
+        mut operation: impl FnMut(&Path, &Cancellation) -> Result<T> + Send + 'static,
     ) -> Self {
         let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let output = Arc::new(Mutex::new(None));
@@ -508,6 +657,70 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn metadata_sort_keeps_missing_values_last_and_natural_names_break_ties() {
+        let paths: Vec<_> = ["image10.png", "image2.png", "image1.png", "missing.png"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let mut metadata = HashMap::new();
+        for (index, seconds) in [20, 20, 10].into_iter().enumerate() {
+            metadata.insert(
+                paths[index].clone(),
+                FileMetadata {
+                    modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                    bytes: Some(seconds),
+                    regular_file: true,
+                    symlink: false,
+                },
+            );
+        }
+        for order in [SortOrder::ModifiedNewest, SortOrder::SizeLargest] {
+            let mut indices = vec![3, 0, 2, 1];
+            sort_indices(&paths, &metadata, &mut indices, order);
+            assert_eq!(indices, vec![1, 0, 2, 3]);
+        }
+        for order in [SortOrder::ModifiedOldest, SortOrder::SizeSmallest] {
+            let mut indices = vec![3, 0, 2, 1];
+            sort_indices(&paths, &metadata, &mut indices, order);
+            assert_eq!(indices, vec![2, 1, 0, 3]);
+        }
+        let mut indices = vec![3, 0, 2, 1];
+        sort_indices(&paths, &metadata, &mut indices, SortOrder::Natural);
+        assert_eq!(indices, vec![2, 1, 0, 3]);
+    }
+
+    #[test]
+    fn format_filters_use_case_insensitive_extensions_without_decoding() {
+        assert!(FormatFilter::Jpeg.matches(Path::new("IMAGE.JPG")));
+        assert!(FormatFilter::Jpeg.matches(Path::new("image.JpEg")));
+        assert!(!FormatFilter::Jpeg.matches(Path::new("image.png")));
+        assert!(FormatFilter::Png.matches(Path::new("image.PNG")));
+        assert!(FormatFilter::Gif.matches(Path::new("image.GIF")));
+        assert!(FormatFilter::WebP.matches(Path::new("image.WeBp")));
+        assert!(FormatFilter::All.matches(Path::new("new-file")));
+    }
+
+    #[test]
+    fn directory_scan_carries_background_file_metadata_for_ui_sorting() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("first.png");
+        let other = dir.path().join("second.jpg");
+        std::fs::write(&source, [0; 5]).unwrap();
+        std::fs::write(&other, [0; 13]).unwrap();
+        let listing = scan(&source, &Cancellation::default()).unwrap();
+        assert_eq!(listing.metadata.len(), 2);
+        for (path, bytes) in [(&source, 5), (&other, 13)] {
+            let value = &listing.metadata[path];
+            assert_eq!(value.bytes, Some(bytes));
+            assert_eq!(
+                value.modified,
+                std::fs::metadata(path).unwrap().modified().ok()
+            );
+            assert!(value.regular_file && !value.symlink);
         }
     }
 

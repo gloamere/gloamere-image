@@ -1,4 +1,4 @@
-//! Local, bounded folder screening. UI badges never enter image buffers.
+//! Local, bounded checks requested by the user. UI badges never enter image buffers.
 pub mod cache;
 pub mod jpeg;
 pub mod metadata;
@@ -36,7 +36,7 @@ impl Default for AiSettings {
     fn default() -> Self {
         Self {
             schema_version: 1,
-            auto_scan: true,
+            auto_scan: false,
             show_badges: true,
             persist_results: true,
         }
@@ -109,6 +109,12 @@ fn key(_path: &Path, _file: &File, _meta: &std::fs::Metadata) -> String {
 }
 fn snapshot(path: &Path, cancel: &Cancellation) -> Result<(AssetIdentity, Vec<u8>)> {
     cancel.check()?;
+    let location_before = std::fs::symlink_metadata(path)?;
+    if !location_before.is_file() || location_before.file_type().is_symlink() {
+        return Err(ToolError::Invalid(
+            "不支持：检测仅接受普通文件，不跟随符号链接".into(),
+        ));
+    }
     let mut file = File::open(path)?;
     let before = file.metadata()?;
     if !before.is_file() || before.len() > crate::pipeline::MAX_INPUT_BYTES {
@@ -132,9 +138,12 @@ fn snapshot(path: &Path, cancel: &Cancellation) -> Result<(AssetIdentity, Vec<u8
         bytes.extend_from_slice(&buffer[..n]);
     }
     let after = file.metadata()?;
+    let location_after = std::fs::symlink_metadata(path)?;
     let location_file = File::open(path)?;
     let located = location_file.metadata()?;
-    if before.len() != after.len()
+    if !location_after.is_file()
+        || location_after.file_type().is_symlink()
+        || before.len() != after.len()
         || modified(&before) != modified(&after)
         || key(path, &file, &before) != key(path, &location_file, &located)
         || modified(&after) != modified(&located)
@@ -467,6 +476,7 @@ pub struct Controller {
     model_pack: Option<PathBuf>,
     store_directory: Option<PathBuf>,
     installation: Option<Installation>,
+    pending_manual: Option<PathBuf>,
 }
 impl Controller {
     pub fn new(store_path: Option<PathBuf>) -> Self {
@@ -570,23 +580,7 @@ impl Controller {
                 }
             }
         }
-        let installation = model_pack.as_ref().map(|_| {
-            let root = store_directory.as_ref().unwrap().join("ai-model");
-            let (tx, receiver) = mpsc::sync_channel(1);
-            let thread = thread::spawn(move || {
-                let result = model_update::validate_installed_or_recover(&root)
-                    .map_err(|e| ToolError::Invalid(e.to_string()))
-                    .and_then(|value| value.ok_or_else(|| ToolError::Invalid("组件已移除".into())));
-                let _ = tx.try_send(result);
-            });
-            Installation {
-                receiver,
-                thread: Some(thread),
-            }
-        });
-        let component_state = if installation.is_some() {
-            ComponentState::Checking
-        } else if let Some(error) = model_pointer_failure {
+        let component_state = if let Some(error) = model_pointer_failure {
             ComponentState::Failed(error)
         } else {
             ComponentState::Missing
@@ -619,7 +613,8 @@ impl Controller {
             warning,
             model_pack,
             store_directory,
-            installation,
+            installation: None,
+            pending_manual: None,
         }
     }
     fn save_settings(&mut self) {
@@ -648,6 +643,7 @@ impl Controller {
     }
     fn cancel(&mut self) {
         self.worker.cancel();
+        self.pending_manual = None;
         for (_, c) in self.tokens.values() {
             c.cancel();
         }
@@ -657,15 +653,6 @@ impl Controller {
         }
         self.outstanding.clear();
         self.tokens.clear();
-    }
-    fn auto_cause(&self, path: &Path) -> Option<QueueCause> {
-        if self.experimental_auto_scan() && !is_network_path(path) {
-            Some(QueueCause::ExperimentalFolder)
-        } else if self.settings.auto_scan {
-            Some(QueueCause::SourceOnly)
-        } else {
-            None
-        }
     }
     fn queue(&mut self, path: PathBuf, cause: QueueCause, front: bool) {
         if self.outstanding.contains(&path) {
@@ -687,20 +674,8 @@ impl Controller {
             ticket: self.ticket,
             cancel: cancel.clone(),
             model: if self.component_state == ComponentState::Ready
-                && match cause {
-                    QueueCause::UserManual => true,
-                    QueueCause::ExperimentalFolder => {
-                        self.experimental_auto_scan()
-                            && !is_network_path(&path)
-                            && self.scope.contains(&path)
-                    }
-                    QueueCause::StableAutomatic => {
-                        model::stable_approved()
-                            && !is_network_path(&path)
-                            && self.scope.contains(&path)
-                    }
-                    QueueCause::SourceOnly => false,
-                } {
+                && cause == QueueCause::UserManual
+            {
                 self.model_pack.clone()
             } else {
                 None
@@ -718,32 +693,6 @@ impl Controller {
             self.tokens.insert(path, (self.ticket, cancel));
         }
     }
-    fn dispatch(&mut self) {
-        if !(self.settings.auto_scan || self.experimental_auto_scan())
-            || self.paused
-            || self.outstanding.len() >= MAX_QUEUE
-            || self.attempted.len() >= self.paths.len()
-        {
-            return;
-        }
-        let mut seen = HashSet::new();
-        let candidates: Vec<_> = self
-            .current
-            .iter()
-            .chain(self.visible.iter())
-            .chain(self.paths.iter())
-            .filter(|p| {
-                self.paths.contains(*p) && !self.attempted.contains(*p) && seen.insert((*p).clone())
-            })
-            .take(MAX_QUEUE.saturating_sub(self.outstanding.len()))
-            .cloned()
-            .collect();
-        for p in candidates {
-            if let Some(cause) = self.auto_cause(&p) {
-                self.queue(p, cause, false);
-            }
-        }
-    }
     pub fn prioritize_visible(&mut self, paths: &[PathBuf]) {
         let visible: Vec<_> = paths
             .iter()
@@ -755,39 +704,42 @@ impl Controller {
             return;
         }
         self.visible = visible;
-        let missing = self
-            .visible
-            .iter()
-            .filter(|p| !self.attempted.contains(*p))
-            .count();
-        let needed = missing.saturating_sub(MAX_QUEUE.saturating_sub(self.outstanding.len()));
-        let removed = self
-            .worker
-            .prioritize(&self.visible, self.current.as_deref(), needed);
-        for path in removed {
-            self.outstanding.remove(&path);
-            self.tokens.remove(&path);
-            self.attempted.remove(&path);
-        }
-        self.dispatch();
         self.worker
             .prioritize(&self.visible, self.current.as_deref(), 0);
     }
     pub fn set_scope(&mut self, paths: &[PathBuf], current: Option<&Path>) {
-        // Defense in depth: even a caller supplying recursive or mixed-folder
-        // lists cannot expand automatic processing beyond the current folder.
+        self.set_scanned_scope(paths, current, &HashMap::new());
+    }
+    /// Directory metadata is gathered by the bounded scan worker. This method
+    /// only changes view scope; explicit checks revalidate input at snapshot time.
+    pub fn set_scanned_scope(
+        &mut self,
+        paths: &[PathBuf],
+        current: Option<&Path>,
+        metadata: &HashMap<PathBuf, crate::browsing::FileMetadata>,
+    ) {
+        // Scope changes only update records and navigation; they do not request checks.
         let parent = current
             .and_then(Path::parent)
             .or_else(|| paths.first().and_then(|p| p.parent()));
         let filtered: Vec<_> = paths
             .iter()
             .filter(|p| p.parent() == parent)
-            .filter(|p| !std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
+            .filter(|p| {
+                metadata
+                    .get(*p)
+                    .is_none_or(|m| m.regular_file && !m.symlink)
+            })
+            .take(crate::browsing::MAX_DIRECTORY_IMAGES)
             .cloned()
             .collect();
         let paths = filtered.as_slice();
-        if self.paths != paths {
+        if self.current.as_deref() != current
+            || !current.is_some_and(|path| paths.iter().any(|candidate| candidate == path))
+        {
             self.cancel();
+        }
+        if self.paths != paths {
             self.paths = paths
                 .iter()
                 .take(crate::browsing::MAX_DIRECTORY_IMAGES)
@@ -811,15 +763,13 @@ impl Controller {
             self.scope = self.paths.iter().cloned().collect();
             self.warning = Some("网络路径仅检查显式打开的当前文件，不自动分析共享目录".into());
         }
-        if let Some(p) = current
-            && !self.attempted.contains(p)
-            && let Some(cause) = self.auto_cause(p)
-        {
-            self.queue(p.to_path_buf(), cause, true);
-        }
-        self.dispatch();
     }
     pub fn set_current(&mut self, path: &Path) {
+        if self.current.as_deref() != Some(path) {
+            self.cancel();
+        } else {
+            self.pending_manual = None;
+        }
         self.current = Some(path.to_path_buf());
         // A reopen is a content-validation boundary even at the same path.
         // Remove old badges/overrides from effective view until bytes revalidate.
@@ -831,9 +781,6 @@ impl Controller {
         }
         self.outstanding.remove(path);
         self.attempted.remove(path);
-        if let Some(cause) = self.auto_cause(path) {
-            self.queue(path.to_path_buf(), cause, true);
-        }
     }
     pub fn settings(&self) -> &AiSettings {
         &self.settings
@@ -846,8 +793,6 @@ impl Controller {
             for p in pending {
                 self.attempted.remove(&p);
             }
-        } else {
-            self.dispatch();
         }
         self.save_settings();
     }
@@ -867,9 +812,6 @@ impl Controller {
     pub fn pause(&mut self, value: bool) {
         self.paused = value;
         self.worker.pause(value);
-        if !value {
-            self.dispatch();
-        }
     }
     pub fn is_paused(&self) -> bool {
         self.paused
@@ -877,26 +819,44 @@ impl Controller {
     pub fn is_busy(&self) -> bool {
         self.installation.is_some() || (!self.paused && !self.outstanding.is_empty())
     }
-    pub fn scan_current(&mut self, path: &Path) {
-        if let Some((_, c)) = self.tokens.remove(path) {
-            c.cancel();
-        }
-        self.outstanding.remove(path);
-        self.attempted.remove(path);
+    pub fn inspect_source_current(&mut self, path: &Path) {
+        self.cancel();
         self.worker.pause(false);
         self.paused = false;
-        self.queue(path.to_path_buf(), QueueCause::UserManual, true);
+        self.queue(path.to_path_buf(), QueueCause::SourceOnly, true);
+    }
+    pub fn scan_current(&mut self, path: &Path) {
+        self.cancel();
+        self.worker.pause(false);
+        self.paused = false;
+        if self.component_state == ComponentState::Ready && self.model_pack.is_some() {
+            self.queue(path.to_path_buf(), QueueCause::UserManual, true);
+        } else if self.installation.is_some() {
+            self.pending_manual = Some(path.to_path_buf());
+        } else if self.has_installed_model() {
+            self.pending_manual = Some(path.to_path_buf());
+            let root = self.store_directory.as_ref().unwrap().join("ai-model");
+            let (tx, receiver) = mpsc::sync_channel(1);
+            let thread = thread::spawn(move || {
+                let result = model_update::validate_installed_or_recover(&root)
+                    .map_err(|e| ToolError::Invalid(e.to_string()))
+                    .and_then(|value| value.ok_or_else(|| ToolError::Invalid("组件已移除".into())));
+                let _ = tx.try_send(result);
+            });
+            self.component_state = ComponentState::Checking;
+            self.installation = Some(Installation {
+                receiver,
+                thread: Some(thread),
+            });
+        } else {
+            self.warning =
+                Some("尚未安装 AI 检测组件；请先在组件管理中离线导入，当前图片未检测".into());
+        }
     }
     pub fn refresh(&mut self) {
         self.cancel();
         self.attempted.clear();
         self.records.clear();
-        if let Some(p) = self.current.clone()
-            && let Some(cause) = self.auto_cause(&p)
-        {
-            self.queue(p, cause, true);
-        }
-        self.dispatch();
     }
     pub fn retry_errors(&mut self) {
         let paths: Vec<_> = self
@@ -911,7 +871,6 @@ impl Controller {
             // preferences. A retry may use the already verified component.
             self.queue(p, QueueCause::UserManual, false);
         }
-        self.dispatch();
     }
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
@@ -935,12 +894,14 @@ impl Controller {
                     self.component_state = ComponentState::Ready;
                     self.warning =
                         Some("实验组件已校验并通过固定自检；尚未通过正式发布验证标准".into());
-                    if self.experimental_auto_scan() {
-                        self.cancel();
-                        self.attempted.clear();
+                    if let Some(path) = self.pending_manual.take()
+                        && self.current.as_ref() == Some(&path)
+                    {
+                        self.queue(path, QueueCause::UserManual, true);
                     }
                 }
                 Err(error) => {
+                    self.pending_manual = None;
                     self.component_state = ComponentState::Failed(error.to_string());
                     self.warning = Some(format!("组件校验或自检失败：{error}"));
                 }
@@ -1058,7 +1019,6 @@ impl Controller {
             }
             changed = true;
         }
-        self.dispatch();
         changed
     }
     pub fn record(&self, path: &Path) -> Option<&MachineRecord> {
@@ -1070,6 +1030,9 @@ impl Controller {
             .and_then(|r| self.manuals.get(&r.identity.key))
     }
     pub fn run_state(&self, path: &Path) -> RunState {
+        if self.pending_manual.as_deref() == Some(path) {
+            return RunState::Queued;
+        }
         if let Some((ticket, _)) = self.tokens.get(path) {
             let pixel = self.worker.is_pixel_task(path, *ticket);
             return if self.worker.is_running(path, *ticket) {
@@ -1110,14 +1073,13 @@ impl Controller {
             let state = self.run_state(path);
             if self.outstanding.contains(path) || state == RunState::Expired {
                 d.label = state.label().into();
-            } else if self.component_state == ComponentState::Missing {
+            } else if self.component_state == ComponentState::Missing && !self.has_installed_model()
+            {
                 d.label = self.component_state.label().into();
             } else if self.component_state == ComponentState::Checking {
-                d.label = "仅来源检查 · 正在校验组件".into();
-            } else if self.component_state == ComponentState::Ready
-                && !self.experimental_auto_scan()
-            {
-                d.label = RunState::Disabled.label().into();
+                d.label = "正在校验 AI 组件".into();
+            } else if self.component_state == ComponentState::Ready || self.has_installed_model() {
+                d.label = "尚未检测".into();
             }
         }
         d
@@ -1149,8 +1111,8 @@ impl Controller {
     }
     pub fn clear_automatic(&mut self) -> Result<()> {
         self.cancel();
-        // Clearing is a stop boundary; canceled responses and idle dispatch
-        // cannot silently recreate records until explicit refresh/reopen.
+        // Clearing is a stop boundary; canceled responses and ordinary browsing
+        // cannot silently recreate records until another explicit check.
         self.attempted = self.paths.iter().cloned().collect();
         self.expired_paths.clear();
         self.cache
@@ -1189,13 +1151,8 @@ impl Controller {
                 })
                 .count();
             format!(
-                "来源 {done}/{} · 像素完成 {pixels} · {}",
-                self.paths.len(),
-                if self.experimental_auto_scan() {
-                    "实验自动筛查"
-                } else {
-                    "来源检查 / 手动像素"
-                }
+                "来源 {done}/{} · 像素完成 {pixels} · 按需检测",
+                self.paths.len()
             )
         };
         if let Some(w) = &self.warning {
@@ -1206,6 +1163,11 @@ impl Controller {
     }
     pub fn component_state(&self) -> &ComponentState {
         &self.component_state
+    }
+    pub fn has_installed_model(&self) -> bool {
+        self.installed_model.is_some()
+            && self.model_pack.is_some()
+            && self.store_directory.is_some()
     }
     pub fn component_info(&self) -> Option<&model::ComponentInfo> {
         self.component_info.as_ref()
@@ -1218,19 +1180,24 @@ impl Controller {
         }
     }
     pub fn model_status(&self) -> &'static str {
-        self.component_state.label()
+        if self.component_state == ComponentState::Missing && self.has_installed_model() {
+            "组件已安装 · 点击 AI 检测时校验"
+        } else {
+            self.component_state.label()
+        }
     }
     pub fn experimental_auto_scan(&self) -> bool {
-        self.experimental.enabled && self.experimental.risk_ack_version == 1
+        // Legacy preferences remain on disk for rollback, but browsing never enables detection.
+        false
     }
     pub fn set_experimental_auto_scan(
         &mut self,
         enabled: bool,
-        risk_acknowledged: bool,
+        _risk_acknowledged: bool,
     ) -> Result<()> {
-        if enabled && (!risk_acknowledged || self.component_state != ComponentState::Ready) {
+        if enabled {
             return Err(ToolError::Invalid(
-                "请先校验组件并确认实验误报、漏报风险".into(),
+                "自动筛查已停用，请使用 AI 检测按钮检测当前图片".into(),
             ));
         }
         self.cancel();
@@ -1255,7 +1222,6 @@ impl Controller {
             temp.as_file().sync_all()?;
             temp.persist(path).map_err(|e| e.error)?;
         }
-        self.dispatch();
         Ok(())
     }
     /// Available only after actual hash validation and the fixed self-test.
@@ -1300,7 +1266,6 @@ impl Controller {
         }
         self.attempted.clear();
         self.warning = Some("模型组件更新已校验并启用；仍为实验结果，原组件保留供恢复".into());
-        self.dispatch();
         Ok(())
     }
     pub fn import_model_pack(&mut self, source: &Path) -> Result<()> {
@@ -1414,6 +1379,7 @@ mod tests {
         image(&p);
         let mut c = Controller::new(None);
         c.set_scope(std::slice::from_ref(&p), Some(&p));
+        c.inspect_source_current(&p);
         pump(&mut c);
         assert_eq!(c.decision(&p).bucket, Bucket::Pending);
         c.mark(&p, Some(ManualDecision::Ai)).unwrap();
@@ -1424,6 +1390,80 @@ mod tests {
         assert_eq!(c.decision(&p).bucket, Bucket::Ai);
     }
     #[test]
+    fn scanned_scope_uses_supplied_file_types_without_touching_nonexistent_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("not-yet-created.png");
+        let link = dir.path().join("link.png");
+        let folder = dir.path().join("folder.png");
+        let paths = vec![regular.clone(), link.clone(), folder.clone()];
+        let metadata = HashMap::from([
+            (
+                regular.clone(),
+                crate::browsing::FileMetadata {
+                    regular_file: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                link,
+                crate::browsing::FileMetadata {
+                    symlink: true,
+                    ..Default::default()
+                },
+            ),
+            (folder, crate::browsing::FileMetadata::default()),
+        ]);
+        let mut controller = Controller::new(None);
+        controller.set_scanned_scope(&paths, Some(&regular), &metadata);
+        assert_eq!(controller.paths, vec![regular.clone()]);
+        assert!(controller.scope.contains(&regular));
+        assert!(!controller.is_busy());
+        assert!(controller.records.is_empty());
+    }
+
+    #[test]
+    fn explicit_source_check_revalidates_file_kind_at_the_snapshot_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("changed-to-directory.png");
+        let mut controller = Controller::new(None);
+        controller.set_scanned_scope(std::slice::from_ref(&path), Some(&path), &HashMap::new());
+        std::fs::create_dir(&path).unwrap();
+        controller.inspect_source_current(&path);
+        pump(&mut controller);
+        assert_eq!(controller.decision(&path).bucket, Bucket::Unsupported);
+        assert!(
+            controller
+                .record(&path)
+                .unwrap()
+                .identity
+                .content_hash
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_source_check_rejects_a_symlink_added_after_scope_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.png");
+        let link = dir.path().join("link.png");
+        image(&target);
+        let mut controller = Controller::new(None);
+        controller.set_scanned_scope(std::slice::from_ref(&link), Some(&link), &HashMap::new());
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        controller.inspect_source_current(&link);
+        pump(&mut controller);
+        assert_eq!(controller.decision(&link).bucket, Bucket::Unsupported);
+        assert!(
+            controller
+                .record(&link)
+                .unwrap()
+                .identity
+                .content_hash
+                .is_empty()
+        );
+    }
+    #[test]
     fn cancelled_folder_cannot_publish_and_queue_is_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let paths: Vec<_> = (0..1000)
@@ -1432,6 +1472,9 @@ mod tests {
         let mut c = Controller::new(None);
         c.pause(true);
         c.set_scope(&paths, Some(&paths[0]));
+        for p in &paths {
+            c.queue(p.clone(), QueueCause::SourceOnly, false);
+        }
         assert!(c.outstanding.len() <= MAX_QUEUE);
         c.set_scope(&[], None);
         c.pause(false);
@@ -1445,12 +1488,14 @@ mod tests {
         image(&p);
         let mut c = Controller::new(Some(dir.path().join("cache.sqlite")));
         c.set_scope(std::slice::from_ref(&p), Some(&p));
+        c.inspect_source_current(&p);
         pump(&mut c);
         c.mark(&p, Some(ManualDecision::NotAi)).unwrap();
         image::RgbImage::from_pixel(240, 240, image::Rgb([90, 0, 0]))
             .save(&p)
             .unwrap();
         c.refresh();
+        c.inspect_source_current(&p);
         pump(&mut c);
         assert_eq!(c.decision(&p).bucket, Bucket::Pending);
         assert!(!c.decision(&p).manual_active);
@@ -1465,7 +1510,7 @@ mod tests {
         let mut c = Controller::new(None);
         c.set_scope(std::slice::from_ref(&p), Some(&p));
         pump(&mut c);
-        c.scan_current(&p);
+        c.inspect_source_current(&p);
         pump(&mut c);
         assert!(c.record(&p).unwrap().model.is_none());
         assert_eq!(std::fs::read(p).unwrap(), before);
@@ -1491,7 +1536,7 @@ mod concurrency_regressions {
         assert!(!c.is_busy(), "{}", c.status());
     }
     #[test]
-    fn paused_changed_scope_requeues_retained_unstarted_paths() {
+    fn same_current_scope_refresh_preserves_explicit_request_without_starting_others() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.png");
         let b = dir.path().join("b.png");
@@ -1500,6 +1545,7 @@ mod concurrency_regressions {
         let mut c = Controller::new(None);
         c.pause(true);
         c.set_scope(&[a.clone(), b], Some(&a));
+        c.queue(a.clone(), QueueCause::SourceOnly, true);
         c.set_scope(std::slice::from_ref(&a), Some(&a));
         c.pause(false);
         pump(&mut c);
@@ -1512,6 +1558,7 @@ mod concurrency_regressions {
         image(&p);
         let mut c = Controller::new(None);
         c.set_scope(std::slice::from_ref(&p), Some(&p));
+        c.inspect_source_current(&p);
         pump(&mut c);
         c.mark(&p, Some(ManualDecision::Ai)).unwrap();
         c.set_auto_scan(false);
@@ -1521,7 +1568,7 @@ mod concurrency_regressions {
         c.set_current(&p);
         assert_eq!(c.decision(&p).bucket, Bucket::Pending);
         assert!(!c.decision(&p).manual_active);
-        c.scan_current(&p);
+        c.inspect_source_current(&p);
         pump(&mut c);
         assert!(!c.decision(&p).manual_active);
     }
@@ -1562,23 +1609,23 @@ mod concurrency_regressions {
         assert!(!c.is_busy());
     }
     #[test]
-    fn visible_rows_replace_queued_background_but_keep_current_first() {
+    fn visible_rows_only_reorder_existing_requests_without_starting_detections() {
         let mut c = Controller::new(None);
         c.pause(true);
         let paths: Vec<_> = (0..1000)
             .map(|n| PathBuf::from(format!("{n}.png")))
             .collect();
         c.set_scope(&paths, Some(&paths[0]));
-        for p in paths.iter().take(MAX_QUEUE).skip(1) {
+        for p in paths.iter().take(MAX_QUEUE) {
             c.queue(p.clone(), QueueCause::SourceOnly, false);
         }
         assert_eq!(c.outstanding.len(), MAX_QUEUE);
-        // Resume dispatch logic but leave the worker paused to inspect its queue.
-        c.paused = false;
         c.prioritize_visible(&paths[900..910]);
+        assert!(c.outstanding.iter().all(|p| paths[..MAX_QUEUE].contains(p)));
+        c.prioritize_visible(&paths[10..20]);
         let s = c.worker.state.0.lock().unwrap();
         assert_eq!(s.queue[0].path, paths[0]);
-        for (index, p) in paths[900..910].iter().enumerate() {
+        for (index, p) in paths[10..20].iter().enumerate() {
             assert_eq!(s.queue[index + 1].path, *p);
         }
         assert_eq!(s.queue.len(), MAX_QUEUE);
@@ -1624,6 +1671,9 @@ mod concurrency_regressions {
             .collect();
         let mut c = Controller::new(None);
         c.set_scope(&paths, Some(&paths[0]));
+        for p in &paths {
+            c.queue(p.clone(), QueueCause::SourceOnly, false);
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let s = c.worker.state.0.lock().unwrap();
@@ -1635,6 +1685,9 @@ mod concurrency_regressions {
             thread::sleep(Duration::from_millis(2));
         }
         c.refresh();
+        for p in &paths {
+            c.queue(p.clone(), QueueCause::SourceOnly, false);
+        }
         pump(&mut c);
         assert_eq!(c.records.len(), MAX_QUEUE);
     }
@@ -1661,37 +1714,197 @@ mod v07_controller_tests {
             .save(path)
             .unwrap();
     }
+    fn verified_component() -> (PathBuf, model::ComponentInfo, InstalledModel) {
+        (
+            PathBuf::from("test-verified-pack"),
+            model::ComponentInfo {
+                model_id: model_update::MODEL_ID.into(),
+                runtime_version: "fixture".into(),
+                installed_bytes: 0,
+                license: "fixture",
+                source_revision: "fixture".into(),
+            },
+            serde_json::from_value(serde_json::json!({
+                "model_id": model_update::MODEL_ID,
+                "release_id": 0,
+                "package_sha256": null,
+                "profile": model::fingerprint()
+            }))
+            .unwrap(),
+        )
+    }
     #[test]
-    fn default_off_separate_preferences_require_acknowledged_ready_component() {
+    fn missing_component_manual_detection_stays_unscanned() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.png");
+        image(&p);
+        let mut c = Controller::new(None);
+        c.set_scope(std::slice::from_ref(&p), Some(&p));
+        c.scan_current(&p);
+        pump(&mut c);
+        assert!(c.record(&p).is_none() && c.outstanding.is_empty());
+        assert_eq!(c.run_state(&p), RunState::Unscanned);
+        assert!(c.status().contains("尚未安装"));
+    }
+    #[test]
+    fn installed_component_validation_starts_only_after_manual_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("ai-model/code-linear-fp32");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("manifest.json"), b"invalid fixture manifest").unwrap();
+        let p = dir.path().join("a.png");
+        image(&p);
+        let mut c = Controller::new(Some(dir.path().join("cache.sqlite")));
+        assert!(c.has_installed_model());
+        assert!(c.installation.is_none() && !c.is_busy());
+        assert!(c.model_status().contains("点击 AI 检测时校验"));
+        c.set_scope(std::slice::from_ref(&p), Some(&p));
+        c.set_current(&p);
+        c.prioritize_visible(std::slice::from_ref(&p));
+        c.poll();
+        assert!(c.installation.is_none() && c.records.is_empty());
+        assert_eq!(c.decision(&p).label, "尚未检测");
+
+        c.scan_current(&p);
+        assert_eq!(c.component_state, ComponentState::Checking);
+        assert!(c.installation.is_some());
+        assert_eq!(c.pending_manual.as_ref(), Some(&p));
+        pump(&mut c);
+        assert!(matches!(c.component_state, ComponentState::Failed(_)));
+        assert!(c.pending_manual.is_none() && c.record(&p).is_none());
+    }
+    #[test]
+    fn validation_success_continues_the_same_manual_request_exactly_once() {
+        let mut c = Controller::new(None);
+        let p = PathBuf::from("folder/a.png");
+        let other = PathBuf::from("folder/b.png");
+        c.set_scope(&[p.clone(), other], Some(&p));
+        let (tx, receiver) = mpsc::sync_channel(1);
+        c.installation = Some(Installation {
+            receiver,
+            thread: None,
+        });
+        c.component_state = ComponentState::Checking;
+        c.scan_current(&p);
+        c.worker.pause(true);
+        assert_eq!(c.pending_manual.as_ref(), Some(&p));
+        c.set_scope(std::slice::from_ref(&p), Some(&p));
+        assert_eq!(c.pending_manual.as_ref(), Some(&p));
+        assert!(c.outstanding.is_empty());
+        tx.send(Ok(verified_component())).unwrap();
+        c.poll();
+        c.poll();
+        assert!(c.pending_manual.is_none());
+        assert_eq!(c.component_state, ComponentState::Ready);
+        assert_eq!(c.outstanding.len(), 1);
+        let state = c.worker.state.0.lock().unwrap();
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(state.queue[0].path, p);
+        assert_eq!(state.queue[0].cause, QueueCause::UserManual);
+        assert!(state.queue[0].model.is_some());
+    }
+    #[test]
+    fn same_current_scope_refresh_preserves_active_manual_task_until_removed() {
+        let mut c = Controller::new(None);
+        ready(&mut c);
+        c.pause(true);
+        let p = PathBuf::from("folder/a.png");
+        let other = PathBuf::from("folder/b.png");
+        c.set_scope(&[p.clone(), other], Some(&p));
+        c.queue(p.clone(), QueueCause::UserManual, true);
+        let token = c.tokens[&p].1.clone();
+        {
+            let mut state = c.worker.state.0.lock().unwrap();
+            let request = state.queue.pop_front().unwrap();
+            state.active = Some((request.path, request.ticket, request.cancel, true));
+        }
+        let generation = c.generation;
+        c.set_scope(std::slice::from_ref(&p), Some(&p));
+        assert_eq!(c.generation, generation);
+        assert!(token.check().is_ok() && c.outstanding.contains(&p));
+        c.set_scope(&[], Some(&p));
+        assert!(token.check().is_err() && c.outstanding.is_empty());
+    }
+    #[test]
+    fn navigating_away_cancels_manual_detection_waiting_for_validation() {
+        let mut c = Controller::new(None);
+        let p = PathBuf::from("folder/a.png");
+        let other = PathBuf::from("folder/b.png");
+        c.set_scope(&[p.clone(), other.clone()], Some(&p));
+        let (tx, receiver) = mpsc::sync_channel(1);
+        c.installation = Some(Installation {
+            receiver,
+            thread: None,
+        });
+        c.component_state = ComponentState::Checking;
+        c.scan_current(&p);
+        c.set_current(&other);
+        tx.send(Ok(verified_component())).unwrap();
+        c.poll();
+        assert!(c.pending_manual.is_none() && c.outstanding.is_empty());
+        assert!(c.worker.state.0.lock().unwrap().queue.is_empty());
+        assert_eq!(c.run_state(&p), RunState::Unscanned);
+    }
+    #[test]
+    fn changing_current_cancels_an_already_queued_manual_detection() {
+        let mut c = Controller::new(None);
+        ready(&mut c);
+        c.pause(true);
+        let p = PathBuf::from("folder/a.png");
+        let other = PathBuf::from("folder/b.png");
+        c.set_scope(&[p.clone(), other.clone()], Some(&p));
+        c.queue(p.clone(), QueueCause::UserManual, true);
+        let token = c.tokens[&p].1.clone();
+        c.set_current(&other);
+        assert!(token.check().is_err() && c.outstanding.is_empty());
+        assert!(c.worker.state.0.lock().unwrap().queue.is_empty());
+    }
+    #[test]
+    fn browsing_never_resumes_legacy_automatic_settings_or_rewrites_them() {
+        assert!(!AiSettings::default().auto_scan);
         let dir = tempfile::tempdir().unwrap();
         let old = AiSettings {
-            auto_scan: false,
+            auto_scan: true,
             show_badges: false,
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&old).unwrap();
+        let experimental = br#"{"schema_version":1,"enabled":true,"risk_ack_version":1}"#;
         std::fs::write(dir.path().join("ai-settings.json"), &bytes).unwrap();
+        std::fs::write(
+            dir.path().join("ai-experimental-settings.json"),
+            experimental,
+        )
+        .unwrap();
         let mut c = Controller::new(Some(dir.path().join("cache.sqlite")));
         assert!(!c.experimental_auto_scan());
         assert!(c.set_experimental_auto_scan(true, true).is_err());
         ready(&mut c);
         assert!(c.set_experimental_auto_scan(true, false).is_err());
         assert!(!c.experimental_auto_scan());
-        c.set_experimental_auto_scan(true, true).unwrap();
-        assert!(c.experimental_auto_scan());
+        let paths = [dir.path().join("a.png"), dir.path().join("b.png")];
+        c.set_scope(&paths, Some(&paths[0]));
+        c.set_current(&paths[1]);
+        c.prioritize_visible(&paths);
+        c.refresh();
+        c.pause(false);
+        c.poll();
+        assert!(c.records.is_empty() && c.outstanding.is_empty() && !c.is_busy());
+        assert!(c.worker.state.0.lock().unwrap().queue.is_empty());
         assert_eq!(
             std::fs::read(dir.path().join("ai-settings.json")).unwrap(),
             bytes
         );
-        assert!(dir.path().join("ai-experimental-settings.json").is_file());
-        assert!(!c.settings().auto_scan);
+        assert_eq!(
+            std::fs::read(dir.path().join("ai-experimental-settings.json")).unwrap(),
+            experimental
+        );
+        assert!(c.settings().auto_scan);
         assert!(!c.settings().show_badges);
-        c.set_experimental_auto_scan(false, false).unwrap();
-        assert!(!c.experimental_auto_scan());
         assert!(!model::stable_approved());
     }
     #[test]
-    fn explicit_causes_cannot_bypass_consent_or_stable_gate() {
+    fn only_explicit_current_image_request_can_use_pixel_model() {
         let mut c = Controller::new(None);
         ready(&mut c);
         c.pause(true);
@@ -1732,7 +1945,11 @@ mod v07_controller_tests {
                 .is_some()
         );
         c.cancel();
-        c.set_experimental_auto_scan(true, true).unwrap();
+        c.experimental = ExperimentalSettings {
+            schema_version: 1,
+            enabled: true,
+            risk_ack_version: 1,
+        };
         c.queue(p.clone(), QueueCause::ExperimentalFolder, true);
         assert!(
             c.worker
@@ -1744,24 +1961,21 @@ mod v07_controller_tests {
                 .front()
                 .unwrap()
                 .model
-                .is_some()
+                .is_none()
         );
     }
     #[test]
-    fn experimental_network_and_recursive_scope_are_never_queued_as_pixels() {
+    fn network_and_recursive_browsing_never_queue_checks() {
         let mut c = Controller::new(None);
         ready(&mut c);
         c.pause(true);
-        c.set_experimental_auto_scan(true, true).unwrap();
         let p = PathBuf::from("//server/share/a.png");
         c.set_scope(
             &[p.clone(), PathBuf::from("//server/share/b.png")],
             Some(&p),
         );
         let state = c.worker.state.0.lock().unwrap();
-        assert_eq!(state.queue.len(), 1);
-        assert_eq!(state.queue[0].cause, QueueCause::SourceOnly);
-        assert!(state.queue[0].model.is_none());
+        assert!(state.queue.is_empty());
         drop(state);
         let local = PathBuf::from("folder/a.png");
         c.set_scope(
@@ -1782,6 +1996,7 @@ mod v07_controller_tests {
         let mut c = Controller::new(None);
         c.pause(true);
         c.set_scope(std::slice::from_ref(&p), Some(&p));
+        c.queue(p.clone(), QueueCause::SourceOnly, true);
         assert_eq!(c.outstanding.len(), 1);
         c.clear_automatic().unwrap();
         c.pause(false);
@@ -1789,6 +2004,9 @@ mod v07_controller_tests {
         assert!(c.records.is_empty());
         assert!(c.outstanding.is_empty());
         c.refresh();
+        pump(&mut c);
+        assert!(c.record(&p).is_none());
+        c.inspect_source_current(&p);
         pump(&mut c);
         assert!(c.record(&p).is_some());
     }
@@ -1822,6 +2040,7 @@ mod v07_controller_tests {
             )
             .unwrap();
         c.set_scope(std::slice::from_ref(&p), Some(&p));
+        c.inspect_source_current(&p);
         pump(&mut c);
         assert_eq!(c.run_state(&p), RunState::Expired);
         assert!(c.record(&p).unwrap().model.is_none());
@@ -1871,6 +2090,7 @@ mod v07_controller_tests {
             )
             .unwrap();
         c.set_scope(std::slice::from_ref(&p), Some(&p));
+        c.inspect_source_current(&p);
         pump(&mut c);
         assert_eq!(c.run_state(&p), RunState::Expired);
         assert!(c.record(&p).unwrap().model.is_none());

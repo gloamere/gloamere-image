@@ -101,6 +101,24 @@ fn main() {
                 .unwrap_or(0)
                 .min(60);
             smoke.show_more = args.iter().any(|v| v == "--show-more");
+            smoke.inspect_pixels = args.iter().any(|v| v == "--inspect-pixels");
+            smoke.alpha_view = args.iter().any(|v| v == "--alpha-view");
+            smoke.nearest_pixels = args.iter().any(|v| v == "--nearest-pixels");
+            smoke.reference_on_top = args.iter().any(|v| v == "--reference-on-top");
+            smoke.show_sticker = args.iter().any(|v| v == "--show-sticker");
+            smoke.show_context_menu = args.iter().any(|v| v == "--show-context-menu");
+            smoke.show_rename = args.iter().any(|v| v == "--show-rename");
+            smoke.sticker_zoom_smoke = args.iter().any(|v| v == "--sticker-zoom-smoke");
+            smoke.sticker_image = args
+                .iter()
+                .position(|v| v == "--sticker-image")
+                .and_then(|i| args.get(i + 1))
+                .map(std::path::PathBuf::from);
+            smoke.compare_image = args
+                .iter()
+                .position(|v| v == "--compare-image")
+                .and_then(|index| args.get(index + 1))
+                .map(std::path::PathBuf::from);
             smoke.show_edit = args.iter().any(|v| v == "--show-edit");
             smoke.show_export = args.iter().any(|v| v == "--show-export");
             smoke.show_error = args.iter().any(|v| v == "--show-error");
@@ -157,6 +175,11 @@ fn main() {
     #[cfg(windows)]
     {
         setup.instance_descriptor.backends = wgpu::Backends::DX12;
+        setup
+            .instance_descriptor
+            .backend_options
+            .dx12
+            .presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
     }
     #[cfg(target_os = "macos")]
     {
@@ -194,6 +217,9 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_icon(viewer_ui::window_icon())
             .with_inner_size(window_size)
+            .with_decorations(false)
+            .with_resizable(true)
+            .with_transparent(true)
             .with_min_inner_size([360.0, 320.0]),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: WgpuConfiguration {

@@ -63,6 +63,7 @@ pub enum Icon {
     ResizeApply,
     Close,
     Copy,
+    Pin,
     Paste,
     FitWidth,
     Play,
@@ -70,6 +71,7 @@ pub enum Icon {
     Step,
     Restart,
     Filter,
+    AiDetect,
 }
 impl Icon {
     pub const ALL: [Self; BUTTON_COUNT] = [
@@ -112,6 +114,7 @@ impl Icon {
             Self::ResizeApply => "应用缩放",
             Self::Close => "关闭 / 取消",
             Self::Copy => "复制图像 / 当前帧 · Ctrl+C",
+            Self::Pin => "贴图置顶（独立参考窗）",
             Self::Paste => "从剪贴板打开 · Ctrl+V",
             Self::FitWidth => "长图适应宽度",
             Self::Play => "播放动画 · Space",
@@ -119,6 +122,7 @@ impl Icon {
             Self::Step => "下一帧并暂停",
             Self::Restart => "从头播放",
             Self::Filter => "AI 状态筛选",
+            Self::AiDetect => "AI 检测当前图片",
         }
     }
 }
@@ -474,6 +478,33 @@ pub fn paint_ai_badge(
     rect
 }
 
+/// Upright pushpin shared by menu actions and the smaller native-style title bar.
+pub fn paint_pin(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    if !size.is_finite() || size <= 0.0 {
+        return;
+    }
+    let scale = size / 16.0;
+    let point = |x, y| center + Vec2::new(x, y) * scale;
+    let stroke = egui::Stroke::new(1.5 * scale, color);
+    let outline = [
+        (-3.5, -7.0),
+        (3.5, -7.0),
+        (3.5, -5.0),
+        (2.0, -5.0),
+        (2.0, -1.0),
+        (5.0, 2.0),
+        (-5.0, 2.0),
+        (-2.0, -1.0),
+        (-2.0, -5.0),
+        (-3.5, -5.0),
+    ];
+    painter.add(egui::Shape::closed_line(
+        outline.into_iter().map(|(x, y)| point(x, y)).collect(),
+        stroke,
+    ));
+    painter.line_segment([point(0.0, 2.0), point(0.0, 7.0)], stroke);
+}
+
 fn paint_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) {
     let p = |x, y| center + Vec2::new(x, y);
     let stroke = egui::Stroke::new(1.7, color);
@@ -484,6 +515,15 @@ fn paint_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32)
         ));
     };
     match icon {
+        Icon::AiDetect => {
+            painter.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                "AI",
+                egui::FontId::proportional(13.0),
+                color,
+            );
+        }
         Icon::Filter => line(&[
             (-9., -7.),
             (9., -7.),
@@ -620,6 +660,7 @@ fn paint_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32)
             line(&[(-5., 4.), (-9., 4.), (-9., -9.), (4., -9.), (4., -5.)]);
             line(&[(-4., -4.), (9., -4.), (9., 9.), (-4., 9.), (-4., -4.)]);
         }
+        Icon::Pin => paint_pin(painter, center, 20.0, color),
         Icon::Paste => {
             line(&[
                 (-4., -7.),
@@ -982,7 +1023,7 @@ mod tests {
             if let Some(zoom) = layout.zoom {
                 assert!(area.contains_rect(zoom));
                 assert!(zoom.width() >= 64.0);
-                assert!(zoom.left() > layout.buttons[10].right());
+                assert!(zoom.left() > layout.buttons[BUTTON_COUNT - 1].right());
             }
         }
     }
@@ -1075,6 +1116,30 @@ mod tests {
         assert_eq!(node.role(), egui::accesskit::Role::Button);
     }
     #[test]
+    fn ai_detection_menu_action_has_visible_caption_and_accessible_name() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut response = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            response =
+                Some(ui.add(ActionButton::new(Icon::AiDetect, Icon::AiDetect.label()).menu()));
+        });
+        output.textures_delta.clear();
+        assert!(texts(&output).iter().any(|text| text == "AI 检测当前图片"));
+        let response = response.unwrap();
+        let node = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|(id, _)| *id == response.id.accesskit_id())
+            .unwrap()
+            .1;
+        assert_eq!(node.label(), Some("AI 检测当前图片"));
+        assert_eq!(node.role(), egui::accesskit::Role::Button);
+    }
+    #[test]
     fn compact_keyboard_focus_has_a_two_point_high_contrast_ring() {
         let ctx = egui::Context::default();
         let (_, response) = compact_frame(&ctx, 240.0, true, false, 0.0, vec![]);
@@ -1111,6 +1176,7 @@ mod tests {
     #[test]
     fn all_icons_have_distinct_accessible_names() {
         let new_icons = [
+            Icon::AiDetect,
             Icon::Copy,
             Icon::Paste,
             Icon::FitWidth,
@@ -1128,5 +1194,64 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), BUTTON_COUNT + new_icons.len());
         assert!(names.iter().all(|name| !name.is_empty()));
+    }
+
+    #[test]
+    fn pin_is_upright_symmetric_and_scales_from_the_same_geometry() {
+        let ctx = egui::Context::default();
+        for size in [16.0, 20.0] {
+            let center = Pos2::new(50.0, 50.0);
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                if size == 20.0 {
+                    paint_icon(ui.painter(), center, Icon::Pin, Color32::BLACK);
+                } else {
+                    paint_pin(ui.painter(), center, size, Color32::BLACK);
+                }
+            });
+            let outline = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Path(path) if path.closed => Some(path),
+                    _ => None,
+                })
+                .unwrap();
+            for point in &outline.points {
+                let mirrored = Pos2::new(center.x * 2.0 - point.x, point.y);
+                assert!(outline.points.iter().any(|p| p.distance(mirrored) < 0.001));
+            }
+            let needle = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::LineSegment { points, .. } => Some(points),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(needle[0].x, center.x);
+            assert_eq!(needle[1].x, center.x);
+            assert!(
+                needle[1].y
+                    > outline
+                        .points
+                        .iter()
+                        .map(|p| p.y)
+                        .fold(f32::NEG_INFINITY, f32::max)
+            );
+            let bounds = output
+                .shapes
+                .iter()
+                .filter(|shape| {
+                    matches!(
+                        shape.shape,
+                        egui::Shape::Path(_) | egui::Shape::LineSegment { .. }
+                    )
+                })
+                .fold(Rect::NOTHING, |bounds, shape| {
+                    bounds.union(shape.shape.visual_bounding_rect())
+                });
+            assert!(bounds.center().distance(center) < 0.001);
+            assert!((bounds.height() / size - 15.5 / 16.0).abs() < 0.001);
+        }
     }
 }

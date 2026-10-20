@@ -2,7 +2,7 @@ use crate::{Result, ToolError};
 use std::{
     ops::Deref,
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -143,6 +143,23 @@ impl AsRef<[u8]> for Snapshot {
 pub struct Pixels {
     image: image::RgbaImage,
     _reservation: Reservation,
+    display: OnceLock<Arc<PreparedDisplay>>,
+}
+pub const DISPLAY_TILE_EDGE: u32 = 2048;
+
+#[derive(Debug)]
+pub struct DisplayTile {
+    pub x: u32,
+    pub y: u32,
+    pub image: Arc<eframe::egui::ColorImage>,
+}
+
+/// CPU display data prepared by decode/edit workers and shared with egui without copying.
+#[derive(Debug)]
+pub struct PreparedDisplay {
+    pub tiles: Vec<DisplayTile>,
+    pub has_alpha: bool,
+    _reservation: Reservation,
 }
 impl Pixels {
     pub fn from_reserved(image: image::RgbaImage, reservation: &mut Reservation) -> Result<Self> {
@@ -150,11 +167,72 @@ impl Pixels {
         Ok(Self {
             image,
             _reservation: owned,
+            display: OnceLock::new(),
         })
     }
     pub fn from_image(image: image::RgbaImage) -> Result<Self> {
         let mut r = reserve(image.as_raw().capacity() as u64)?;
         Self::from_reserved(image, &mut r)
+    }
+
+    pub fn prepare_display(&self, cancel: &crate::Cancellation) -> Result<&Arc<PreparedDisplay>> {
+        self.prepare_display_with_alpha(cancel, None)
+    }
+
+    pub fn prepare_display_with_alpha(
+        &self,
+        cancel: &crate::Cancellation,
+        known_alpha: Option<bool>,
+    ) -> Result<&Arc<PreparedDisplay>> {
+        cancel.check()?;
+        if let Some(display) = self.display.get() {
+            return Ok(display);
+        }
+        let reservation = self
+            ._reservation
+            .budget
+            .reserve(self.image.as_raw().len() as u64)?;
+        let mut tiles = Vec::new();
+        let mut has_alpha = known_alpha.unwrap_or(false);
+        for y in (0..self.height()).step_by(DISPLAY_TILE_EDGE as usize) {
+            for x in (0..self.width()).step_by(DISPLAY_TILE_EDGE as usize) {
+                let w = DISPLAY_TILE_EDGE.min(self.width() - x);
+                let h = DISPLAY_TILE_EDGE.min(self.height() - y);
+                let mut colors = Vec::with_capacity((w * h) as usize);
+                for row in y..y + h {
+                    cancel.check()?;
+                    let start =
+                        ((u64::from(row) * u64::from(self.width()) + u64::from(x)) * 4) as usize;
+                    for p in self.as_raw()[start..start + w as usize * 4]
+                        .as_chunks::<4>()
+                        .0
+                    {
+                        if known_alpha.is_none() {
+                            has_alpha |= p[3] < 255;
+                        }
+                        colors.push(eframe::egui::Color32::from_rgba_unmultiplied(
+                            p[0], p[1], p[2], p[3],
+                        ));
+                    }
+                }
+                tiles.push(DisplayTile {
+                    x,
+                    y,
+                    image: Arc::new(eframe::egui::ColorImage::new(
+                        [w as usize, h as usize],
+                        colors,
+                    )),
+                });
+            }
+        }
+        cancel.check()?;
+        // Concurrent preparations may race; the losing value drops its own reservation.
+        let _ = self.display.set(Arc::new(PreparedDisplay {
+            tiles,
+            has_alpha,
+            _reservation: reservation,
+        }));
+        Ok(self.display.get().expect("prepared display published"))
     }
 }
 impl Deref for Pixels {
@@ -176,6 +254,50 @@ impl PartialEq<image::RgbaImage> for Pixels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prepared_display_tiles_preserve_rgba_and_share_owned_color_buffers() {
+        let image = image::RgbaImage::from_fn(2050, 2, |x, y| {
+            image::Rgba([x as u8, y as u8, 80, if x % 3 == 0 { 127 } else { 255 }])
+        });
+        let budget = Budget::new(100_000);
+        let mut reservation = budget.reserve(image.as_raw().len() as u64).unwrap();
+        let pixels = Pixels::from_reserved(image, &mut reservation).unwrap();
+        let cancel = crate::Cancellation::default();
+        let display = pixels.prepare_display(&cancel).unwrap().clone();
+        assert!(display.has_alpha);
+        assert_eq!(display.tiles.len(), 2);
+        assert_eq!(display.tiles[1].image.size, [2, 2]);
+        for tile in &display.tiles {
+            for y in 0..tile.image.size[1] {
+                for x in 0..tile.image.size[0] {
+                    let p = pixels.get_pixel(tile.x + x as u32, tile.y + y as u32);
+                    assert_eq!(
+                        tile.image[(x, y)],
+                        eframe::egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])
+                    );
+                }
+            }
+        }
+        assert!(Arc::ptr_eq(
+            &display,
+            pixels.prepare_display(&cancel).unwrap()
+        ));
+        drop(pixels);
+        assert_eq!(budget.in_use(), 2050 * 2 * 4);
+        drop(display);
+        assert_eq!(budget.in_use(), 0);
+    }
+    #[test]
+    fn cancelled_display_preparation_does_not_publish_or_reserve() {
+        let pixels = Pixels::from_image(image::RgbaImage::new(3, 2)).unwrap();
+        let cancel = crate::Cancellation::default();
+        cancel.cancel();
+        assert!(matches!(
+            pixels.prepare_display(&cancel),
+            Err(ToolError::Cancelled)
+        ));
+        assert!(pixels.display.get().is_none());
+    }
     #[test]
     fn actual_snapshot_and_pixel_buffers_keep_capacity_owned_across_queued_moves() {
         let budget = Budget::new(4096);

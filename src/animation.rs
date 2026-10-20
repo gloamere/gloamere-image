@@ -887,6 +887,7 @@ impl FrameStream {
         let (delay, normalized) = normalize_delay(original_delay);
         self.cancel.check()?;
         let pixels = Arc::new(memory::Pixels::from_reserved(rgba, &mut self.global)?);
+        pixels.prepare_display(&self.cancel)?;
         self.source
             .frames
             .lock()

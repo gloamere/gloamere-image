@@ -4,13 +4,14 @@ use light_image_tool::ai::{
     policy::{Filter, FilterCounts},
     types::{ComponentState, Decision, ManualDecision, ReleaseTier, RunState},
 };
+use light_image_tool::browsing::{FileMetadata, FormatFilter, SortOrder};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ClearRecords {
     Automatic,
     Manual,
     Model,
-    ExperimentalOptIn,
 }
 
 pub(super) struct AiView {
@@ -20,18 +21,27 @@ pub(super) struct AiView {
     pub rows: Vec<usize>,
     pub counts: FilterCounts,
     pub scope_len: usize,
+    pub sort: SortOrder,
+    pub format: FormatFilter,
+    pub metadata: HashMap<PathBuf, FileMetadata>,
+    row_counts: Vec<FilterCounts>,
+    order_ranks: Vec<usize>,
+    #[cfg(test)]
+    full_rebuilds: usize,
     pub confirm: Option<ClearRecords>,
     pub settings_open: bool,
     #[cfg(test)]
     pub manual_buttons: [Option<Rect>; 3],
+    #[cfg(test)]
+    pub source_button: Option<Rect>,
+    #[cfg(test)]
+    pub detection_menu_button: Option<Rect>,
     #[cfg(test)]
     pub badge_rect: Option<Rect>,
     #[cfg(test)]
     pub filter_button: Option<Rect>,
     #[cfg(test)]
     pub badge_toggle: Option<Rect>,
-    #[cfg(test)]
-    pub auto_toggle: Option<Rect>,
     #[cfg(test)]
     pub clear_buttons: [Option<Rect>; 3],
 }
@@ -44,18 +54,27 @@ impl Default for AiView {
             rows: Vec::new(),
             counts: FilterCounts::default(),
             scope_len: 0,
+            sort: SortOrder::default(),
+            format: FormatFilter::default(),
+            metadata: HashMap::new(),
+            row_counts: Vec::new(),
+            order_ranks: Vec::new(),
+            #[cfg(test)]
+            full_rebuilds: 0,
             confirm: None,
             settings_open: false,
             #[cfg(test)]
             manual_buttons: [None; 3],
+            #[cfg(test)]
+            source_button: None,
+            #[cfg(test)]
+            detection_menu_button: None,
             #[cfg(test)]
             badge_rect: None,
             #[cfg(test)]
             filter_button: None,
             #[cfg(test)]
             badge_toggle: None,
-            #[cfg(test)]
-            auto_toggle: None,
             #[cfg(test)]
             clear_buttons: [None; 3],
         }
@@ -82,11 +101,12 @@ fn ai_detection_summary(
     ui: &mut egui::Ui,
     decision: &Decision,
     component: &ComponentState,
+    component_label: &str,
     run: &RunState,
     tier: ReleaseTier,
 ) {
     ui.strong(&decision.label);
-    ui.small(format!("组件：{}", component.label()));
+    ui.small(format!("组件：{component_label}"));
     ui.small(format!("执行：{}", run.label()));
     ui.small(format!("资格：{}", tier.label()));
     if let ComponentState::Failed(reason) = component {
@@ -104,22 +124,115 @@ fn ai_detection_summary(
 }
 
 impl ImageApp {
+    pub(super) fn browser_set_metadata(&mut self, metadata: HashMap<PathBuf, FileMetadata>) {
+        self.ai_view.metadata = metadata;
+        self.ai_rebuild_view();
+    }
+    pub(super) fn browser_clear_metadata(&mut self) {
+        self.ai_view.metadata.clear();
+    }
+    pub(super) fn browser_sort_filter_ui(&mut self, ui: &mut egui::Ui) {
+        let previous = (self.ai_view.sort, self.ai_view.format);
+        egui::ComboBox::from_id_salt("browser-sort-order")
+            .width(ui.available_width().min(220.0))
+            .selected_text(self.ai_view.sort.label())
+            .show_ui(ui, |ui| {
+                for order in SortOrder::ALL {
+                    if ui
+                        .selectable_value(&mut self.ai_view.sort, order, order.label())
+                        .clicked()
+                    {
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("相同属性按自然文件名排序；无法读取属性的文件排在最后");
+        egui::ComboBox::from_id_salt("browser-format-filter")
+            .width(ui.available_width().min(220.0))
+            .selected_text(self.ai_view.format.label())
+            .show_ui(ui, |ui| {
+                for format in FormatFilter::ALL {
+                    if ui
+                        .selectable_value(&mut self.ai_view.format, format, format.label())
+                        .clicked()
+                    {
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("按文件扩展名筛选，与文件名搜索和 AI 状态筛选取交集");
+        if previous != (self.ai_view.sort, self.ai_view.format) {
+            self.ai_rebuild_view();
+        }
+    }
+    pub(super) fn ai_detection_menu_entry(&mut self, ui: &mut egui::Ui) -> bool {
+        let ready = self.pixels.is_some() && !self.loading && self.work.is_none();
+        let response = ui.add_enabled(
+            ready,
+            ActionButton::new(Icon::AiDetect, "AI 检测当前图片").menu(),
+        );
+        #[cfg(test)]
+        {
+            self.ai_view.detection_menu_button = Some(response.rect);
+        }
+        if response.clicked() {
+            self.ai_detect_current();
+            true
+        } else {
+            false
+        }
+    }
+    pub(super) fn ai_detect_current(&mut self) {
+        if self.loading || self.work.is_some() {
+            return;
+        }
+        self.info_open = true;
+        self.editing = false;
+        self.more_open = false;
+        let Some(path) = self.loaded.as_ref().map(|image| image.path.clone()) else {
+            return;
+        };
+        if self
+            .requested_path
+            .as_ref()
+            .is_some_and(|requested| requested != &path)
+        {
+            return;
+        }
+        self.ai.scan_current(&path);
+        self.ai_view.settings_open = self.ai.component_state() != &ComponentState::Ready;
+        self.ai_rebuild_view();
+    }
     pub(super) fn ai_sync_scope(&mut self) {
-        self.ai
-            .set_scope(&self.siblings, self.requested_path.as_deref());
+        self.ai.set_scanned_scope(
+            &self.siblings,
+            self.requested_path.as_deref(),
+            &self.ai_view.metadata,
+        );
         self.ai_rebuild_view();
     }
     pub(super) fn ai_rebuild_view(&mut self) {
+        #[cfg(test)]
+        {
+            self.ai_view.full_rebuilds += 1;
+        }
         let query = self.ai_view.search.trim().to_lowercase();
         let mut counts = FilterCounts::default();
         let mut rows = Vec::new();
+        let mut row_counts = Vec::with_capacity(self.siblings.len());
         for (index, path) in self.siblings.iter().enumerate() {
             let decision = self.ai.decision(path);
             counts.add(&decision);
+            let mut contribution = FilterCounts::default();
+            contribution.add(&decision);
+            row_counts.push(contribution);
             if self
                 .ai_view
                 .filter
                 .matches(&decision, self.ai_view.include_suspected)
+                && self.ai_view.format.matches(path)
                 && (query.is_empty()
                     || path
                         .file_name()
@@ -131,14 +244,88 @@ impl ImageApp {
                 rows.push(index);
             }
         }
+        let mut order: Vec<_> = (0..self.siblings.len()).collect();
+        browsing::sort_indices(
+            &self.siblings,
+            &self.ai_view.metadata,
+            &mut order,
+            self.ai_view.sort,
+        );
+        let mut ranks = vec![0; self.siblings.len()];
+        for (rank, index) in order.into_iter().enumerate() {
+            ranks[index] = rank;
+        }
+        rows.sort_unstable_by_key(|index| ranks[*index]);
         self.ai_view.rows = rows;
+        self.ai_view.row_counts = row_counts;
+        self.ai_view.order_ranks = ranks;
         self.ai_view.counts = counts;
         self.ai_view.scope_len = self.siblings.len();
         // No open, position assignment, focus request or scroll request here.
     }
+    pub(super) fn ai_refresh_current(&mut self, path: &std::path::Path) {
+        let Some(index) = self.siblings.iter().position(|candidate| candidate == path) else {
+            return;
+        };
+        if self.ai_view.scope_len != self.siblings.len()
+            || self.ai_view.row_counts.len() != self.siblings.len()
+            || self.ai_view.order_ranks.len() != self.siblings.len()
+        {
+            self.ai_rebuild_view();
+            return;
+        }
+        let decision = self.ai.decision(path);
+        let old = self.ai_view.row_counts[index];
+        let mut contribution = FilterCounts::default();
+        contribution.add(&decision);
+        let total = &mut self.ai_view.counts;
+        macro_rules! replace_count {
+            ($($field:ident),+ $(,)?) => { $(total.$field = total.$field.saturating_sub(old.$field) + contribution.$field;)+ };
+        }
+        replace_count!(
+            all,
+            ai,
+            unmarked,
+            pending,
+            error,
+            manual,
+            suspected,
+            source,
+            no_signal,
+            unsupported
+        );
+        self.ai_view.row_counts[index] = contribution;
+        let query = self.ai_view.search.trim().to_lowercase();
+        let visible = self
+            .ai_view
+            .filter
+            .matches(&decision, self.ai_view.include_suspected)
+            && self.ai_view.format.matches(path)
+            && (query.is_empty()
+                || path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&query));
+        self.ai_view.rows.retain(|candidate| *candidate != index);
+        if visible {
+            let rank = self.ai_view.order_ranks[index];
+            let insert = self
+                .ai_view
+                .rows
+                .binary_search_by_key(&rank, |candidate| self.ai_view.order_ranks[*candidate])
+                .unwrap_or_else(|index| index);
+            self.ai_view.rows.insert(insert, index);
+        }
+    }
     pub(super) fn ai_visible_indices(&self) -> Vec<usize> {
         // The unfiltered default also keeps headless v0.5 fixtures independent of scanner startup.
-        if self.ai_view.filter == Filter::All && self.ai_view.search.trim().is_empty() {
+        if self.ai_view.filter == Filter::All
+            && self.ai_view.search.trim().is_empty()
+            && self.ai_view.sort == SortOrder::Natural
+            && self.ai_view.format == FormatFilter::All
+        {
             (0..self.siblings.len()).collect()
         } else {
             self.ai_view.rows.clone()
@@ -152,14 +339,40 @@ impl ImageApp {
         if let Some(current) = rows.iter().position(|index| *index == self.position) {
             Some(rows[(current as isize + step).rem_euclid(rows.len() as isize) as usize])
         } else if step < 0 {
+            let current_rank = self
+                .ai_view
+                .order_ranks
+                .get(self.position)
+                .copied()
+                .unwrap_or(self.position);
             rows.iter()
                 .rev()
-                .find(|index| **index < self.position)
+                .find(|index| {
+                    self.ai_view
+                        .order_ranks
+                        .get(**index)
+                        .copied()
+                        .unwrap_or(**index)
+                        < current_rank
+                })
                 .or(rows.last())
                 .copied()
         } else {
+            let current_rank = self
+                .ai_view
+                .order_ranks
+                .get(self.position)
+                .copied()
+                .unwrap_or(self.position);
             rows.iter()
-                .find(|index| **index > self.position)
+                .find(|index| {
+                    self.ai_view
+                        .order_ranks
+                        .get(**index)
+                        .copied()
+                        .unwrap_or(**index)
+                        > current_rank
+                })
                 .or(rows.first())
                 .copied()
         }
@@ -185,6 +398,7 @@ impl ImageApp {
                         .to_string_lossy()
                         .to_lowercase()
                         .contains(&query))
+                || !self.ai_view.format.matches(path)
         })
     }
     pub(super) fn ai_poll(&mut self, ctx: &egui::Context) {
@@ -234,28 +448,13 @@ impl ImageApp {
         if self.ai_view.scope_len != self.siblings.len() {
             self.ai_rebuild_view();
         }
-        ui.horizontal(|ui| {
-            let filter = ui.add(
-                CompactAction::new(Icon::Filter, "AI 状态筛选")
-                    .help("筛选当前文件夹；搜索与分类取交集"),
-            );
-            #[cfg(test)]
-            {
-                self.ai_view.filter_button = Some(filter.rect);
-            }
-            egui::Popup::menu(&filter)
-                .width(260.0)
-                .show(|ui| self.ai_filter_choices(ui));
-            ui.label(self.ai_view.filter.label());
-            if self.ai_view.filter == Filter::Ai && !self.ai_view.include_suspected {
-                ui.small("不含疑似");
-            }
-        });
         if ui
-            .add(
+            .add_sized(
+                [ui.available_width(), 30.0],
                 egui::TextEdit::singleline(&mut self.ai_view.search)
                     .id(egui::Id::new("ai-folder-search"))
                     .hint_text("搜索文件名")
+                    .margin(egui::Margin::symmetric(8, 6))
                     .desired_width(ui.available_width()),
             )
             .changed()
@@ -263,35 +462,63 @@ impl ImageApp {
             self.ai_rebuild_view();
         }
         ui.horizontal(|ui| {
-            let paused = self.ai.is_paused();
-            let icon = if paused { Icon::Play } else { Icon::Pause };
-            let help = if paused {
-                "恢复当前文件夹检查"
-            } else {
-                "暂停当前文件夹检查"
-            };
+            ui.spacing_mut().item_spacing.x = 4.0;
             if ui
-                .add_enabled(
-                    self.ai.settings().auto_scan || self.ai.experimental_auto_scan(),
-                    CompactAction::new(icon, help),
+                .add(
+                    CompactAction::new(Icon::Locate, "定位当前图片")
+                        .help("定位当前图片：滚动到当前图片"),
                 )
                 .clicked()
             {
-                self.ai.pause(!paused);
-                self.ai_rebuild_view();
+                self.locate_current = true;
             }
+            if ui
+                .add(
+                    CompactAction::new(Icon::Refresh, "刷新图片列表")
+                        .help("刷新图片列表：重新读取目录和缩略图"),
+                )
+                .clicked()
+            {
+                self.refresh_browser();
+            }
+            let filtered = self.ai_view.filter != Filter::All
+                || self.ai_view.sort != SortOrder::default()
+                || self.ai_view.format != FormatFilter::default();
+            let filter = ui.add(
+                CompactAction::new(Icon::Filter, "AI 状态筛选")
+                    .selected(filtered)
+                    .help("筛选与排序：文件排序、图片格式和 AI 状态"),
+            );
+            #[cfg(test)]
+            {
+                self.ai_view.filter_button = Some(filter.rect);
+            }
+            egui::Popup::menu(&filter).width(260.0).show(|ui| {
+                self.browser_sort_filter_ui(ui);
+                ui.separator();
+                ui.weak("AI 状态");
+                self.ai_filter_choices(ui);
+                ui.separator();
+                ui.small(self.ai.status());
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if self.ai_view.filter == Filter::All {
+                    "筛选与排序"
+                } else {
+                    self.ai_view.filter.label()
+                };
+                ui.add(egui::Label::new(egui::RichText::new(label).small().weak()).truncate());
+            });
+        });
+        if self.ai.is_busy() {
             ui.add(egui::Label::new(egui::RichText::new(self.ai.status()).small()).truncate())
                 .on_hover_text(self.ai.status());
-        });
+        }
         if self.ai_current_excluded() {
-            ui.small("当前图片已不符合筛选；主动翻图时进入结果集。");
+            ui.small("当前图片不在筛选结果中。");
         }
         if self.ai_visible_indices().is_empty() {
-            ui.small(if self.ai_view.counts.pending > 0 {
-                "暂未匹配，仍有未完成的检查。"
-            } else {
-                "没有匹配项目。可清除搜索或切换全部。"
-            });
+            ui.small("没有匹配图片，可清除搜索或筛选。");
         }
     }
     pub(super) fn ai_settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -336,37 +563,10 @@ impl ImageApp {
             self.more_open = false;
         }
 
-        let mut experimental = self.ai.experimental_auto_scan();
-        let ready = self.ai.component_state() == &ComponentState::Ready;
-        if ui
-            .add_enabled(
-                ready || experimental,
-                egui::Checkbox::new(&mut experimental, "自动筛查当前文件夹 · 实验功能"),
-            )
-            .changed()
-        {
-            if experimental {
-                self.ai_view.confirm = Some(ClearRecords::ExperimentalOptIn);
-                self.more_open = false;
-            } else if let Err(error) = self.ai.set_experimental_auto_scan(false, false) {
-                self.error = Some(error.to_string());
-            }
-            self.ai_rebuild_view();
-        }
-        ui.small("默认关闭；需单独确认误报与漏报风险。仅当前本地文件夹，不递归、不扫描网络盘；优先当前图与可见项。关闭即取消未完成像素任务，保留人工记录。");
-        ui.small("来源检查开关与实验像素筛查独立。稳定模型质量门槛不受实验开关影响。");
-        let mut automatic = self.ai.settings().auto_scan;
+        ui.small("默认不进行 AI 检测。需要时选择“更多 → AI 检测当前图片”；打开、翻图和刷新列表不会触发文件夹扫描。");
+        ui.small("组件已安装时首次点击会先异步核验，再继续本次检测。实验结果可能误报或漏报，未检测与未见强信号均不等于非 AI。");
         let mut badges = self.ai.settings().show_badges;
         let mut persist = self.ai.settings().persist_results;
-        let response = ui.checkbox(&mut automatic, "自动检查当前文件夹来源");
-        #[cfg(test)]
-        {
-            self.ai_view.auto_toggle = Some(response.rect);
-        }
-        if response.changed() {
-            self.ai.set_auto_scan(automatic);
-            self.ai_rebuild_view();
-        }
         let response = ui.checkbox(&mut badges, "显示 AI 角标");
         #[cfg(test)]
         {
@@ -376,27 +576,12 @@ impl ImageApp {
             self.ai.set_show_badges(badges);
         }
         ui.small("角标仅叠加显示；筛选、详情、复制和导出独立。");
-        if ui.checkbox(&mut persist, "保存本地自动检查结果").changed() {
+        if ui.checkbox(&mut persist, "保存本地检测结果").changed() {
             self.ai.set_persist_results(persist);
         }
         ui.small("关闭保存不清除既有记录；人工决定单独保存（缓存不可用时仅限本次会话）。清除范围包括本机其他文件夹的记录。");
         ui.small(self.ai.status());
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add(CompactAction::new(Icon::Refresh, "重试本文件夹异常"))
-                .clicked()
-            {
-                self.ai.retry_errors();
-            }
-            if ui
-                .add(CompactAction::new(Icon::Recheck, "重新检查本文件夹"))
-                .clicked()
-            {
-                self.ai.refresh();
-                self.ai_rebuild_view();
-            }
-        });
-        if ui.button("清除本机自动检查记录…").clicked() {
+        if ui.button("清除本机检测结果…").clicked() {
             self.ai_view.confirm = Some(ClearRecords::Automatic);
             self.more_open = false;
         }
@@ -406,7 +591,7 @@ impl ImageApp {
         }
     }
     pub(super) fn ai_details(&mut self, ui: &mut egui::Ui) {
-        ui.heading("AI 筛查");
+        ui.heading("AI 检测");
         let path = self.loaded.as_ref().map(|image| image.path.clone());
         if let Some(path) = path {
             let decision = self.ai.decision(&path);
@@ -414,6 +599,7 @@ impl ImageApp {
                 ui,
                 &decision,
                 self.ai.component_state(),
+                self.ai.model_status(),
                 &self.ai.run_state(&path),
                 self.ai.release_tier(),
             );
@@ -489,26 +675,43 @@ impl ImageApp {
                     }
                 ));
             }
+            let source = ui.add_enabled(
+                !self.loading
+                    && self.work.is_none()
+                    && self
+                        .requested_path
+                        .as_ref()
+                        .is_none_or(|requested| requested == &path),
+                ActionButton::new(Icon::Info, "读取来源信息").menu(),
+            );
+            #[cfg(test)]
+            {
+                self.ai_view.source_button = Some(source.rect);
+            }
+            if source.clicked() {
+                self.ai.inspect_source_current(&path);
+                self.ai_rebuild_view();
+            }
+            ui.small("仅读取当前文件的来源信息并确认文件身份，之后可添加人工标记；此操作不运行像素模型。");
             self.ai_manual_controls(ui, &path);
             if ui
                 .add_enabled(
                     !self.loading,
-                    CompactAction::new(Icon::Recheck, "手动检查当前图片")
-                        .help("检查来源；已校验实验组件可执行像素推断，结果可能误报和漏报"),
+                    ActionButton::new(Icon::AiDetect, "检测当前图片").menu(),
                 )
                 .clicked()
             {
-                self.ai.scan_current(&path);
+                self.ai_detect_current();
             }
         } else {
             ui.small("临时剪贴板图像或提取帧没有原文件来源记录；当前未提供临时像素检测。");
         }
         ui.small("无信号不等于非 AI；元数据可伪造，来源信息不证明画面内容真实。");
-        if ui.button("设置像素检测").clicked() {
+        if ui.button("模型组件与设置").clicked() {
             self.ai_view.settings_open = true;
         }
         let open_settings = self.ai_view.settings_open;
-        egui::CollapsingHeader::new("像素检测与本地设置")
+        egui::CollapsingHeader::new("模型组件与本地设置")
             .open(open_settings.then_some(true))
             .show(ui, |ui| {
                 if open_settings {
@@ -563,21 +766,20 @@ impl ImageApp {
             .show(ctx, |ui| {
                 ui.set_width((ctx.viewport_rect().width() - 48.0).clamp(240.0, 390.0));
                 ui.horizontal(|ui| {
-                    ui.strong(if kind == ClearRecords::ExperimentalOptIn { "启用实验自动筛查" } else { "清除本地 AI 记录" });
+                    ui.strong("清除本地 AI 记录");
                     let response = ui.add(CompactAction::new(Icon::Close, "取消清除 AI 记录"));
                     #[cfg(test)] { self.ai_view.clear_buttons[0] = Some(response.rect); }
                     cancelled |= response.clicked();
                 });
                 ui.label(match kind {
-                    ClearRecords::Automatic => "清除本机所有文件夹的自动检查缓存。保留人工标记和原图；可手动重新检查。",
+                    ClearRecords::Automatic => "清除本机所有文件夹保存的检测结果。保留人工标记和原图；可按需重新检测。",
                     ClearRecords::Manual => "清除本机所有文件夹的人工 AI / 非 AI 标记，包括过期待确认记录。此操作不可撤销。保留自动证据和原图。",
                     ClearRecords::Model => "删除本机安装的像素模型组件并清除本次会话模型分值。保留人工标记、独立来源证据及原图；之后可重新离线导入。",
-                    ClearRecords::ExperimentalOptIn => "此模型尚未通过正式发布的验证标准，可能把非 AI 图片误判，也可能漏掉 AI 图片。只检测中央 224×224，阴性结果不能排除 AI。开启后自动检查当前本地文件夹，不递归、不扫描网络盘、不上传原图。",
                 });
                 if kind == ClearRecords::Model && let Some(info) = self.ai.component_info() { ui.small(format!("将释放已核验组件文件 {} 字节", info.installed_bytes)); }
                 ui.horizontal_wrapped(|ui| {
                     let cancel = ui.button("取消");
-                    let confirm = ui.button(if kind == ClearRecords::ExperimentalOptIn { "我理解风险，启用实验筛查" } else { "确认清除" });
+                    let confirm = ui.button("确认清除");
                     #[cfg(test)] { self.ai_view.clear_buttons[1] = Some(cancel.rect); self.ai_view.clear_buttons[2] = Some(confirm.rect); }
                     cancelled |= cancel.clicked();
                     confirmed = confirm.clicked();
@@ -588,7 +790,6 @@ impl ImageApp {
                 ClearRecords::Automatic => self.ai.clear_automatic(),
                 ClearRecords::Manual => self.ai.clear_manual(),
                 ClearRecords::Model => self.ai.remove_model(),
-                ClearRecords::ExperimentalOptIn => self.ai.set_experimental_auto_scan(true, true),
             };
             if let Err(error) = result {
                 self.error = Some(error.to_string());
@@ -686,12 +887,22 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn app_in(directory: &Path, names: &[&str]) -> (ImageApp, egui::Context, Vec<PathBuf>) {
+    fn app_in_unscanned(
+        directory: &Path,
+        names: &[&str],
+    ) -> (ImageApp, egui::Context, Vec<PathBuf>) {
         let paths: Vec<_> = names.iter().map(|name| directory.join(name)).collect();
         for (index, path) in paths.iter().enumerate() {
-            image::RgbaImage::from_pixel(8, 6, image::Rgba([index as u8, 30, 50, 255]))
-                .save(path)
-                .unwrap();
+            let pixels =
+                image::RgbaImage::from_pixel(8, 6, image::Rgba([index as u8, 30, 50, 255]));
+            if FormatFilter::Jpeg.matches(path) {
+                image::DynamicImage::ImageRgba8(pixels)
+                    .into_rgb8()
+                    .save(path)
+                    .unwrap();
+            } else {
+                pixels.save(path).unwrap();
+            }
         }
         let ctx = egui::Context::default();
         let mut app = ImageApp::from_context(ctx.clone(), "AI headless test".into(), None, None);
@@ -703,7 +914,15 @@ mod tests {
         app.directory_path = Some(directory.to_path_buf());
         app.siblings = paths.clone();
         app.ai_sync_scope();
-        wait_ai(&mut app, &ctx);
+        (app, ctx, paths)
+    }
+    fn app_in(directory: &Path, names: &[&str]) -> (ImageApp, egui::Context, Vec<PathBuf>) {
+        let (mut app, ctx, paths) = app_in_unscanned(directory, names);
+        for path in &paths {
+            app.ai.inspect_source_current(path);
+            wait_ai(&mut app, &ctx);
+        }
+        app.ai_rebuild_view();
         (app, ctx, paths)
     }
     fn wait_ai(app: &mut ImageApp, ctx: &egui::Context) {
@@ -792,6 +1011,102 @@ mod tests {
         // Pending async completion may change classification, but never open another file.
         wait_ai(&mut app, &ctx);
         assert_eq!(app.requested_path.as_ref(), Some(&paths[2]));
+    }
+
+    #[test]
+    fn material_sort_format_search_and_ai_filters_intersect_without_changing_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _ctx, paths) = app_in(
+            directory.path(),
+            &["image10.png", "image2.jpg", "image1.png", "image20.PNG"],
+        );
+        for path in &paths {
+            mark(&mut app, path, Some(ManualDecision::Ai));
+        }
+        let selected = app.requested_path.clone();
+        let original = app.pixels.clone().unwrap();
+        app.ai_view.sort = SortOrder::SizeLargest;
+        app.ai_view.format = FormatFilter::Png;
+        app.ai_view.filter = Filter::Ai;
+        let metadata = paths
+            .iter()
+            .zip([200, 400, 200, 300])
+            .map(|(path, bytes)| {
+                (
+                    path.clone(),
+                    FileMetadata {
+                        bytes: Some(bytes),
+                        regular_file: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        app.browser_set_metadata(metadata);
+        assert_eq!(app.ai_visible_indices(), vec![3, 2, 0]);
+        app.ai_view.search = "IMAGE1".into();
+        app.ai_rebuild_view();
+        assert_eq!(app.ai_visible_indices(), vec![2, 0]);
+        mark(&mut app, &paths[0], Some(ManualDecision::NotAi));
+        assert_eq!(app.ai_visible_indices(), vec![2]);
+        assert_eq!(app.requested_path, selected);
+        assert_eq!(app.position, 0);
+        assert!(Arc::ptr_eq(&original, app.pixels.as_ref().unwrap()));
+        assert!(app.ai_current_excluded());
+    }
+
+    #[test]
+    fn same_directory_current_refresh_updates_one_row_without_full_decision_rebuild() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _ctx, paths) = app_in(directory.path(), &["a.png", "b.png", "c.png"]);
+        mark(&mut app, &paths[1], Some(ManualDecision::Ai));
+        app.ai_view.filter = Filter::Ai;
+        app.ai_rebuild_view();
+        assert_eq!(app.ai_visible_indices(), vec![1]);
+        let rebuilds = app.ai_view.full_rebuilds;
+        app.ai.set_current(&paths[1]);
+        app.ai_refresh_current(&paths[1]);
+        assert_eq!(app.ai_view.full_rebuilds, rebuilds);
+        let counts = app.ai_view.counts;
+        let rows = app.ai_visible_indices();
+        assert!(rows.is_empty());
+        app.ai_rebuild_view();
+        assert_eq!(app.ai_view.counts, counts);
+        assert_eq!(app.ai_visible_indices(), rows);
+    }
+
+    #[test]
+    fn excluded_current_navigation_and_metadata_refresh_follow_material_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _ctx, paths) =
+            app_in_unscanned(directory.path(), &["a.png", "b.jpg", "c.png"]);
+        app.position = 1;
+        app.requested_path = Some(paths[1].clone());
+        app.ai_view.sort = SortOrder::SizeLargest;
+        app.ai_view.format = FormatFilter::Png;
+        let metadata = paths
+            .iter()
+            .zip([10, 20, 30])
+            .map(|(path, bytes)| {
+                (
+                    path.clone(),
+                    FileMetadata {
+                        bytes: Some(bytes),
+                        regular_file: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        app.browser_set_metadata(metadata);
+        assert_eq!(app.ai_visible_indices(), vec![2, 0]);
+        assert_eq!(app.ai_navigation_target(1), Some(0));
+        assert_eq!(app.ai_navigation_target(-1), Some(2));
+        app.ai_view.metadata.get_mut(&paths[0]).unwrap().bytes = Some(40);
+        app.browser_set_metadata(app.ai_view.metadata.clone());
+        assert_eq!(app.ai_visible_indices(), vec![0, 2]);
+        assert_eq!(app.position, 1);
+        assert_eq!(app.requested_path.as_ref(), Some(&paths[1]));
     }
 
     #[test]
@@ -989,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_pointer_toggles_keep_auto_scan_and_badges_independent() {
+    fn settings_badge_toggle_keeps_detection_on_demand() {
         let directory = tempfile::tempdir().unwrap();
         let (mut app, ctx, _) = app_in(directory.path(), &["a.png"]);
         let draw = |app: &mut ImageApp, events| {
@@ -1006,12 +1321,6 @@ mod tests {
         };
         draw(&mut app, vec![]);
         let position = app.ai_view.badge_toggle.unwrap().center();
-        for pressed in [true, false] {
-            draw(&mut app, pointer(position, pressed));
-        }
-        assert!(!app.ai.settings().show_badges);
-        assert!(app.ai.settings().auto_scan);
-        let position = app.ai_view.auto_toggle.unwrap().center();
         for pressed in [true, false] {
             draw(&mut app, pointer(position, pressed));
         }
@@ -1259,7 +1568,10 @@ mod tests {
         app.loaded = Some(loaded);
         app.refresh_texture(&ctx);
         app.ai.refresh();
-        wait_ai(&mut app, &ctx);
+        for path in &paths {
+            app.ai.inspect_source_current(path);
+            wait_ai(&mut app, &ctx);
+        }
         app.preferences.list_visible = true;
         app.info_open = true;
         let mut renderer = CpuRenderer {
@@ -1329,15 +1641,6 @@ mod tests {
             .save(destination.join("manual-clear-360x640.png"))
             .unwrap();
         renderer.capture = false;
-        app.ai_view.confirm = Some(ClearRecords::ExperimentalOptIn);
-        for _ in 0..3 {
-            render_actual_frame(&mut app, &ctx, &mut renderer, narrow, vec![]);
-        }
-        renderer.capture = true;
-        render_actual_frame(&mut app, &ctx, &mut renderer, narrow, vec![])
-            .save(destination.join("experimental-risk-360x640.png"))
-            .unwrap();
-        renderer.capture = false;
         app.ai_view.confirm = None;
         app.ai_view.settings_open = true;
         for _ in 0..4 {
@@ -1351,21 +1654,131 @@ mod tests {
         std::fs::write(destination.join("README.txt"), "Actual ImageApp::ui egui mesh/texture CPU renders. Synthetic test image and unsigned PNG test metadata. No native window, GPU, OS input, or classifier quality evidence. Renderer uses bilinear texture sampling and premultiplied alpha; native GPU glyph/edge rendering may differ.\n").unwrap();
     }
     #[test]
-    fn experimental_risk_dialog_cancel_keeps_opt_in_off() {
+    fn ai_detection_more_menu_opens_current_image_details_at_all_widths() {
         let directory = tempfile::tempdir().unwrap();
-        let (mut app, ctx, _) = app_in(directory.path(), &["a.png"]);
-        app.ai_view.confirm = Some(ClearRecords::ExperimentalOptIn);
-        for _ in 0..3 {
-            frame(&mut app, &ctx, Vec2::new(360.0, 640.0), vec![]);
+        let (mut app, ctx, paths) = app_in_unscanned(directory.path(), &["a.png", "b.png"]);
+        let original = std::fs::read(&paths[0]).unwrap();
+        assert!(!Icon::ALL.contains(&Icon::AiDetect));
+        for size in [Vec2::new(1180.0, 780.0), Vec2::new(360.0, 640.0)] {
+            app.info_open = false;
+            frame(&mut app, &ctx, size, vec![]);
+            assert!(!app.info_open);
+            let index = Icon::ALL
+                .iter()
+                .position(|icon| *icon == Icon::More)
+                .unwrap();
+            let layout = app.toolbar_layout.as_ref().unwrap();
+            assert!(layout.visible[index]);
+            let position = layout.buttons[index].center();
+            for pressed in [true, false] {
+                frame(&mut app, &ctx, size, pointer(position, pressed));
+            }
+            frame(&mut app, &ctx, size, vec![]);
+            assert!(app.more_open && !app.ai.is_busy());
+            assert!(app.ai.record(&paths[0]).is_none());
+            let position = app.ai_view.detection_menu_button.unwrap().center();
+            assert!(Rect::from_min_size(Pos2::ZERO, size).contains(position));
+            for pressed in [true, false] {
+                frame(&mut app, &ctx, size, pointer(position, pressed));
+            }
+            assert!(app.info_open && !app.editing && !app.more_open);
+            assert_eq!(app.requested_path.as_ref(), Some(&paths[0]));
+            assert_eq!(app.loaded.as_ref().unwrap().path, paths[0]);
+            assert!(!app.ai.settings().auto_scan && !app.ai.experimental_auto_scan());
+            wait_ai(&mut app, &ctx);
+            assert!(app.ai.record(&paths[1]).is_none());
+            assert_eq!(app.ai.component_state(), &ComponentState::Missing);
+            assert!(app.ai.record(&paths[0]).is_none());
+            assert_eq!(app.ai.run_state(&paths[0]), RunState::Unscanned);
         }
-        frame(
-            &mut app,
-            &ctx,
-            Vec2::new(360.0, 640.0),
-            key(egui::Key::Escape),
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), original);
+    }
+    #[test]
+    fn source_information_button_allows_manual_mark_without_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, ctx, paths) = app_in_unscanned(directory.path(), &["a.png", "b.png"]);
+        let original = std::fs::read(&paths[0]).unwrap();
+        assert_eq!(app.ai.component_state(), &ComponentState::Missing);
+        assert!(!app.ai.is_busy() && app.ai.record(&paths[0]).is_none());
+        app.ai_detect_current();
+        assert_eq!(app.ai.run_state(&paths[0]), RunState::Unscanned);
+        assert!(app.ai.record(&paths[0]).is_none());
+        let draw = |app: &mut ImageApp, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 1400.0))),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.ai_details(ui),
+            );
+            output.textures_delta.clear();
+        };
+        draw(&mut app, vec![]);
+        let position = app.ai_view.source_button.unwrap().center();
+        for pressed in [true, false] {
+            draw(&mut app, pointer(position, pressed));
+        }
+        wait_ai(&mut app, &ctx);
+        let record = app.ai.record(&paths[0]).unwrap();
+        assert!(record.identity.has_content_hash() && record.model.is_none());
+        assert_eq!(app.ai.run_state(&paths[0]), RunState::SourceOnly);
+        assert!(app.ai.record(&paths[1]).is_none());
+        draw(&mut app, vec![]);
+        let position = app.ai_view.manual_buttons[0].unwrap().center();
+        for pressed in [true, false] {
+            draw(&mut app, pointer(position, pressed));
+        }
+        assert_eq!(
+            app.ai.manual(&paths[0]).unwrap().decision,
+            ManualDecision::Ai
         );
-        assert!(app.ai_view.confirm.is_none());
-        assert!(!app.ai.experimental_auto_scan());
+        assert_eq!(app.ai.component_state(), &ComponentState::Missing);
+        assert!(!app.ai.is_busy() && app.ai.record(&paths[0]).unwrap().model.is_none());
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), original);
+    }
+    #[test]
+    fn detection_summary_preserves_installed_pending_validation_label() {
+        fn collect(shape: &egui::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => texts.push(text.galley.job.text.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let decision = light_image_tool::ai::policy::decide(None, None);
+        let component_label = "组件已安装 · 点击 AI 检测时校验";
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ai_detection_summary(
+                ui,
+                &decision,
+                &ComponentState::Missing,
+                component_label,
+                &RunState::Unscanned,
+                ReleaseTier::Unavailable,
+            );
+        });
+        output.textures_delta.clear();
+        let mut texts = Vec::new();
+        for shape in &output.shapes {
+            collect(&shape.shape, &mut texts);
+        }
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == &format!("组件：{component_label}"))
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains(ComponentState::Missing.label()))
+        );
     }
 
     #[test]
@@ -1467,6 +1880,7 @@ mod tests {
                                     ui,
                                     &decision,
                                     &component,
+                                    component.label(),
                                     &run,
                                     record.release_tier,
                                 );
@@ -1580,6 +1994,7 @@ mod tests {
                                                 ui,
                                                 &decision,
                                                 &fixture.record.component_state,
+                                                fixture.record.component_state.label(),
                                                 fixture.record.run_state.as_ref().unwrap(),
                                                 fixture.record.release_tier,
                                             );
@@ -1592,6 +2007,7 @@ mod tests {
                                         ui,
                                         &decision,
                                         &fixture.record.component_state,
+                                        fixture.record.component_state.label(),
                                         fixture.record.run_state.as_ref().unwrap(),
                                         fixture.record.release_tier,
                                     );

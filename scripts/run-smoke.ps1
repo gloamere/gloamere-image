@@ -15,6 +15,16 @@ param(
  [switch]$GpuPerformance,
  [switch]$CropPreview,
  [switch]$CjkFallback,
+ [switch]$InspectPixels,
+ [switch]$AlphaView,
+ [switch]$NearestPixels,
+ [switch]$ReferenceOnTop,
+ [switch]$ShowSticker,
+ [switch]$ShowContextMenu,
+ [switch]$ShowRename,
+ [switch]$StickerZoomSmoke,
+ [string]$StickerImage,
+ [string]$CompareImage,
  [string]$WorkflowImage,
  [ValidateRange(4,1000)][int]$WorkflowOpens=4,
  [ValidateRange(0,2000)][int]$WorkflowDelayMs=0,
@@ -37,6 +47,16 @@ if($ShowError){$arguments+='--show-error'}
 if($JpegPreview){$arguments+='--jpeg-preview'}
 if($SmallWindow){$arguments+='--small-window'}
 if($CjkFallback){$arguments+='--cjk-fallback'}
+if($InspectPixels){$arguments+='--inspect-pixels'}
+if($AlphaView){$arguments+='--alpha-view'}
+if($NearestPixels){$arguments+='--nearest-pixels'}
+if($ReferenceOnTop){$arguments+='--reference-on-top'}
+if($ShowSticker){$arguments+='--show-sticker'}
+if($ShowContextMenu){$arguments+='--show-context-menu'}
+if($ShowRename){$arguments+='--show-rename'}
+if($StickerZoomSmoke){$arguments+=@('--sticker-zoom-smoke','--show-sticker')}
+if($StickerImage){$arguments+=@('--sticker-image',('"'+[IO.Path]::GetFullPath($StickerImage)+'"'))}
+if($CompareImage){$arguments+=@('--compare-image',('"'+[IO.Path]::GetFullPath($CompareImage)+'"'))}
 if($GpuMemoryUsage -and $GpuPerformance){throw 'Choose one GPU memory hint'}
 if($GpuMemoryUsage){$arguments+='--gpu-memory-usage'}
 if($GpuPerformance){$arguments+='--gpu-performance'}
@@ -56,7 +76,9 @@ $qaProcess.WaitForExit()
 $runtime=Join-Path $OutputDirectory 'runtime.json'
 if($qaProcess.ExitCode -ne 0 -or -not(Test-Path -LiteralPath $runtime)) {throw "Smoke failed, exit $($qaProcess.ExitCode)"}
 $record=Get-Content -LiteralPath $runtime -Raw -Encoding utf8 | ConvertFrom-Json
-if($record.error -or ($WorkflowImage -and -not $record.workflow.success)){throw "Own-app workflow/rendering failed; inspect runtime.json"}
+if($record.error -or $record.viewer_ui.inspector.error -or $record.viewer_ui.stickers.error -or (($ShowSticker -or $StickerImage) -and -not $record.viewer_ui.stickers.screenshot_ready) -or ($AlphaView -and -not $record.viewer_ui.inspector.alpha_ready) -or ($CompareImage -and -not $record.viewer_ui.comparison.active) -or ($WorkflowImage -and -not $record.workflow.success)){throw "Own-app workflow/rendering failed; inspect runtime.json"}
+if($ShowRename -and (-not $record.window_chrome.rename_open -or $record.window_chrome.rename_busy)){throw 'Rename dialog rendering failed'}
+if($StickerZoomSmoke -and (-not $record.viewer_ui.stickers.zoom_smoke_ready -or $record.viewer_ui.stickers.animation_frames -lt 2)){throw 'Sticker zoom animation failed'}
 $record | ConvertTo-Json -Depth 12
 } catch {
     [pscustomobject]@{failed=$true;elapsed_ms=$watch.ElapsedMilliseconds;error=$_.Exception.Message;pid=$qaProcess.Id} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'failure.json') -Encoding utf8
