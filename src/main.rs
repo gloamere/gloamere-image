@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 mod app;
+mod app_theme;
 mod crop_selection;
 mod viewer_ui;
 use eframe::{
@@ -141,6 +142,21 @@ fn main() {
                     }
                     _ => None,
                 });
+            smoke.appearance = args
+                .iter()
+                .position(|value| value == "--appearance")
+                .and_then(|index| args.get(index + 1))
+                .and_then(|value| match value.to_str()? {
+                    "system" => Some(light_image_tool::settings::Appearance::System),
+                    "light" => Some(light_image_tool::settings::Appearance::Light),
+                    "dark" => Some(light_image_tool::settings::Appearance::Dark),
+                    _ => None,
+                });
+            smoke.icon_entry = args
+                .iter()
+                .position(|value| value == "--icon-entry")
+                .and_then(|index| args.get(index + 1))
+                .and_then(|value| value.to_str()?.parse().ok());
             smoke.cjk_fallback = args.iter().any(|v| v == "--cjk-fallback");
             smoke.destroy_during_export =
                 args.iter().any(|v| v == "--destroy-device-during-export");

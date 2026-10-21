@@ -168,7 +168,7 @@ impl ImageApp {
                 Pos2::new(area.center().x, area.top()),
                 Pos2::new(area.center().x, area.bottom()),
             ],
-            egui::Stroke::new(1.0, Color32::from_rgb(193, 207, 200)),
+            egui::Stroke::new(1.0, crate::app_theme::palette(ui.ctx()).separator),
         );
         self.paint_compare_label(&painter, a_rect, "A · 固定参考", true);
         self.paint_compare_label(&painter, b_rect, "B · 当前图片", false);
@@ -183,14 +183,15 @@ impl ImageApp {
         label: &str,
         reference: bool,
     ) {
+        let colors = crate::app_theme::palette(painter.ctx());
         let rect = Rect::from_min_size(area.min + Vec2::splat(10.0), Vec2::new(110.0, 27.0));
         painter.rect_filled(
             rect,
             5.0,
             if reference {
-                Color32::from_rgb(36, 76, 65)
+                colors.selected
             } else {
-                Color32::from_rgb(244, 248, 246)
+                colors.popover
             },
         );
         painter.text(
@@ -199,9 +200,9 @@ impl ImageApp {
             label,
             egui::FontId::proportional(13.0),
             if reference {
-                Color32::WHITE
+                colors.accent
             } else {
-                Color32::from_rgb(36, 76, 65)
+                colors.text
             },
         );
     }
@@ -269,7 +270,7 @@ impl ImageApp {
             return;
         }
         let painter = ui.painter_at(area);
-        let (background, checker) = self.preferences.background.colors();
+        let (background, checker) = self.canvas_colors(ui.ctx());
         painter.rect_filled(
             area,
             0.0,
@@ -321,7 +322,8 @@ impl ImageApp {
         if ui
             .put(
                 rect,
-                egui::Button::new("当前窗口置顶 · 点击取消").fill(Color32::from_rgb(221, 237, 229)),
+                egui::Button::new("当前窗口置顶 · 点击取消")
+                    .fill(crate::app_theme::palette(ui.ctx()).selected),
             )
             .clicked()
         {
@@ -481,14 +483,16 @@ mod tests {
     #[test]
     fn reference_toggle_only_changes_window_level_and_is_reversible() {
         let (_dir, mut app, ctx, _second) = loaded_app();
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
         for (on_top, level) in [
             (true, egui::WindowLevel::AlwaysOnTop),
             (false, egui::WindowLevel::Normal),
         ] {
-            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 app.set_reference_on_top(on_top, ui.ctx())
             });
+            output.textures_delta.clear();
             let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
             assert!(commands.iter().any(|command| matches!(command, egui::ViewportCommand::WindowLevel(actual) if *actual == level)));
             assert!(!commands.iter().any(|command| matches!(
@@ -518,9 +522,10 @@ mod tests {
             focused: true,
             ..Default::default()
         };
-        let _ = ctx.run_ui(raw(), |ui| {
+        let mut output = ctx.run_ui(raw(), |ui| {
             app.comparison_canvas(ui);
         });
+        output.textures_delta.clear();
         let b = app.canvas_viewport.unwrap().center();
         let mut input = raw();
         input.events.push(egui::Event::PointerMoved(b));
@@ -530,9 +535,10 @@ mod tests {
             phase: egui::TouchPhase::Move,
             modifiers: egui::Modifiers::NONE,
         });
-        let output = ctx.run_ui(input, |ui| {
+        let mut output = ctx.run_ui(input, |ui| {
             app.comparison_canvas(ui);
         });
+        output.textures_delta.clear();
         assert!(app.zoom > 4.0);
         let a_id = app.comparison.pinned.as_ref().unwrap().tiles[0]
             .texture

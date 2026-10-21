@@ -333,6 +333,37 @@ impl Loader {
             cancel: request.cancel,
         });
     }
+    pub fn request_icon_entry(&self, request: LoadRequest, index: usize) {
+        self.request_variant(request, move |path, cancel| {
+            pipeline::load_icon_entry(path, index, cancel)
+        });
+    }
+    pub fn request_icon_reload(&self, request: LoadRequest, dimensions: [u32; 2], bit_depth: u16) {
+        self.request_variant(request, move |path, cancel| {
+            pipeline::reload_icon(path, dimensions, bit_depth, cancel)
+        });
+    }
+    fn request_variant(
+        &self,
+        request: LoadRequest,
+        operation: impl FnOnce(&Path, &Cancellation) -> Result<LoadedImage> + Send + 'static,
+    ) {
+        self.worker.request_with_operation(
+            Request {
+                generation: request.generation,
+                path: request.path,
+                cancel: request.cancel,
+            },
+            move |path, cancel| {
+                let image = operation(path, cancel)?;
+                image
+                    .pixels
+                    .prepare_display_with_alpha(cancel, Some(image.has_alpha))?;
+                cancel.check()?;
+                Ok(image)
+            },
+        );
+    }
     pub fn take_result(&self) -> Option<LoadResponse> {
         self.worker.take_result().map(|response| LoadResponse {
             generation: response.generation,

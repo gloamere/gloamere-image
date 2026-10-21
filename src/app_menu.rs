@@ -1,4 +1,5 @@
 use super::*;
+use light_image_tool::settings::Appearance;
 
 impl ImageApp {
     pub(super) fn more_menu_contents(
@@ -8,6 +9,7 @@ impl ImageApp {
         newly_opened: bool,
         ctx: &egui::Context,
     ) -> bool {
+        let colors = crate::app_theme::palette(ui.ctx());
         let mut close = false;
         ui.horizontal(|ui| {
             ui.add(egui::Image::new(&self.brand_texture).fit_to_exact_size(Vec2::splat(22.0)));
@@ -239,6 +241,34 @@ impl ImageApp {
                 close = true;
             }
         });
+        let appearance_menu = ui.menu_button("外观", |ui| {
+            for (mode, label) in [
+                (Appearance::System, "跟随系统"),
+                (Appearance::Light, "浅色"),
+                (Appearance::Dark, "深色"),
+            ] {
+                let choice = ui.selectable_label(self.preferences.appearance == mode, label);
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new(("appearance-choice", label)), choice.rect)
+                });
+                if choice.clicked() {
+                    self.set_appearance(ui.ctx(), mode);
+                    close = true;
+                    ui.close();
+                }
+            }
+        });
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("appearance-menu-trigger"),
+                appearance_menu.response.rect,
+            )
+        });
+        appearance_menu
+            .response
+            .on_hover_text("跟随系统，或为查看器单独选择浅色、深色");
         ui.collapsing("高级与设置", |ui| {
             if ui
                 .add(
@@ -287,7 +317,7 @@ impl ImageApp {
         ui.separator();
         ui.small(&self.status);
         if let Some(warning) = &self.settings_warning {
-            ui.colored_label(Color32::from_rgb(150, 91, 16), warning);
+            ui.colored_label(colors.warning, warning);
         }
         ui.small("原图只读 · 仅本地处理");
         ui.add_space(8.0);

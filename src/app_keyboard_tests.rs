@@ -79,9 +79,15 @@ fn assert_more_focus(ctx: &egui::Context) {
 }
 
 #[test]
-fn f10_opens_more_after_tab_focuses_toolbar() {
+fn f10_opens_more_after_tab_reaches_toolbar() {
     let (mut app, ctx) = make();
-    key(&mut app, &ctx, egui::Key::Tab, false);
+    // The title bar precedes the canvas toolbar in the new reading order.
+    for _ in 0..viewer_ui::BUTTON_COUNT + 8 {
+        key(&mut app, &ctx, egui::Key::Tab, false);
+        if viewer_ui::toolbar_has_focus(&ctx) {
+            break;
+        }
+    }
     assert!(viewer_ui::toolbar_has_focus(&ctx));
     assert!(!ctx.text_edit_focused());
     key(&mut app, &ctx, egui::Key::F10, false);

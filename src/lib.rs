@@ -5,6 +5,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod edit;
 pub mod export;
+pub mod icon_container;
 pub mod memory;
 pub mod pipeline;
 pub mod provenance;

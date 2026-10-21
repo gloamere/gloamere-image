@@ -437,9 +437,12 @@ pub fn ensure_update_directory(path: &Path) -> Result<StateDirectoryGuard> {
     }
     #[cfg(any(not(windows), test))]
     {
-        // Cross-platform transaction fixtures do not create or alter native ACLs.
-        // The private_paths module has its own explicit native fixture boundary.
+        // Transaction fixtures use isolated roots, including on hosts whose
+        // shared temp ancestors deliberately fail the native namespace audit.
         storage::plain_path(path)?;
+        #[cfg(all(windows, test))]
+        super::test_support::fs::create_dir_all(path)?;
+        #[cfg(not(windows))]
         std::fs::create_dir_all(path)?;
         Ok(StateDirectoryGuard {})
     }
@@ -463,6 +466,9 @@ pub fn ensure_private_data_directory(path: &Path) -> Result<StateDirectoryGuard>
     #[cfg(any(not(windows), test))]
     {
         storage::plain_path(path)?;
+        #[cfg(all(windows, test))]
+        super::test_support::fs::create_dir_all(path)?;
+        #[cfg(not(windows))]
         std::fs::create_dir_all(path)?;
         Ok(StateDirectoryGuard {})
     }
@@ -477,6 +483,9 @@ pub fn create_private_data_directory_new(path: &Path) -> Result<StateDirectoryGu
     #[cfg(any(not(windows), test))]
     {
         storage::plain_path(path)?;
+        #[cfg(all(windows, test))]
+        super::test_support::fs::create_dir(path)?;
+        #[cfg(not(windows))]
         std::fs::create_dir(path)?;
         Ok(StateDirectoryGuard {})
     }
@@ -488,19 +497,26 @@ pub fn private_tempfile(parent: &Path) -> Result<tempfile::NamedTempFile> {
     }
     #[cfg(any(not(windows), test))]
     {
+        #[cfg(all(windows, test))]
+        return Ok(super::test_support::named_tempfile(parent)?);
+        #[cfg(not(windows))]
         Ok(tempfile::NamedTempFile::new_in(parent)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::super::test_support;
     use super::*;
+
     #[cfg(windows)]
     #[test]
     fn inherited_windows_descriptor_roundtrip_is_exact() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = test_support::tempdir().unwrap();
         let file = directory.path().join("owned-acl-fixture.txt");
-        std::fs::write(&file, b"synthetic owned file").unwrap();
+        test_support::fs::write(&file, b"synthetic owned file").unwrap();
+        test_support::normalize_inheritance(&file).unwrap();
         let original = capture_permissions(&file).unwrap();
         assert!(original.windows_sddl.as_ref().unwrap().contains("D:AI"));
         restore_permissions(&file, &original).unwrap();

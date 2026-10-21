@@ -230,7 +230,7 @@ impl Inspector {
                 ui.small("切图、动画及双图比较期间暂用正常画面；返回静态单图后恢复 Alpha 查看。");
             }
             if let Some(error) = &self.error {
-                ui.colored_label(Color32::from_rgb(166, 68, 30), error);
+                ui.colored_label(crate::app_theme::palette(ui.ctx()).error, error);
                 if self.alpha_requested && ui.button("重试 Alpha 查看").clicked() {
                     self.attempted = None;
                     self.error = None;
@@ -541,6 +541,7 @@ impl Inspector {
         {
             lines.push(notice.clone());
         }
+        let colors = crate::app_theme::palette(ui.ctx());
         let painter = ui.painter().with_clip_rect(clip);
         let width = (clip.width() - 16.0).clamp(1.0, 510.0);
         let galleys: Vec<_> = lines
@@ -549,7 +550,7 @@ impl Inspector {
                 painter.layout(
                     line,
                     egui::FontId::proportional(12.0),
-                    Color32::from_rgb(35, 54, 47),
+                    colors.text,
                     (width - 12.0).max(1.0),
                 )
             })
@@ -566,19 +567,17 @@ impl Inspector {
             ),
             Vec2::new(width, height),
         );
-        painter.rect_filled(
+        painter.rect_filled(rect, 5.0, colors.popover);
+        painter.rect_stroke(
             rect,
             5.0,
-            Color32::from_rgba_unmultiplied(245, 248, 247, 242),
+            egui::Stroke::new(1.0, colors.border),
+            egui::StrokeKind::Inside,
         );
         let mut y = 6.0;
         for galley in galleys {
             let height = galley.size().y;
-            painter.galley(
-                rect.min + Vec2::new(6.0, y),
-                galley,
-                Color32::from_rgb(35, 54, 47),
-            );
+            painter.galley(rect.min + Vec2::new(6.0, y), galley, colors.text);
             y += height + 3.0;
         }
         copied
@@ -677,10 +676,11 @@ mod tests {
         inspector.poll(&ctx, Some(&pixels), 1);
         assert!(inspector.error.as_ref().unwrap().contains("正常图片"));
         assert!(inspector.alpha.is_none() && inspector.task.is_none());
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(90.0, 70.0));
             assert!(!inspector.draw_alpha(ui.painter(), rect, rect, &pixels));
         });
+        output.textures_delta.clear();
         assert_eq!(pixels.as_raw(), &original);
     }
     #[test]

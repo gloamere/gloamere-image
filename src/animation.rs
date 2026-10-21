@@ -305,11 +305,13 @@ fn codec_error(error: impl std::fmt::Display) -> ToolError {
 fn gif_decoder(
     bytes: Arc<memory::Snapshot>,
     cancel: &Cancellation,
+    metadata_only: bool,
 ) -> Result<gif::Decoder<SharedReader>> {
     let mut options = gif::DecodeOptions::new();
     options.set_color_output(gif::ColorOutput::RGBA);
     options.check_frame_consistency(true);
     options.check_lzw_end_code(true);
+    options.skip_frame_decoding(metadata_only);
     // This also bounds extension metadata during read_info, before it is copied.
     options.set_memory_limit(gif::MemoryLimit::Bytes(
         (pipeline::MAX_ICC_BYTES as u64).try_into().unwrap(),
@@ -468,7 +470,7 @@ impl AnimationSource {
     fn decoder(&self, cancel: &Cancellation) -> Result<Decoder> {
         match self.format {
             ImageFormat::Gif => Ok(Decoder::Gif {
-                decoder: Box::new(gif_decoder(self.bytes.clone(), cancel)?),
+                decoder: Box::new(gif_decoder(self.bytes.clone(), cancel, false)?),
                 canvas: RgbaImage::new(self.dimensions.0, self.dimensions.1),
             }),
             ImageFormat::WebP => Ok(Decoder::WebP {
@@ -527,7 +529,7 @@ pub(crate) fn try_load(
     let mut warnings = Vec::new();
     let (dimensions, loops, orientation, icc) = match format {
         ImageFormat::Gif => {
-            let mut decoder = gif_decoder(bytes.clone(), cancel)?;
+            let mut decoder = gif_decoder(bytes.clone(), cancel, true)?;
             let dimensions = (u32::from(decoder.width()), u32::from(decoder.height()));
             pipeline::validate_dimensions(dimensions.0, dimensions.1)?;
             let loops = match decoder.repeat() {
@@ -542,19 +544,11 @@ pub(crate) fn try_load(
                     Some(data.to_vec())
                 }
             });
-            let Some(info) = decoder.next_frame_info().map_err(codec_error)? else {
+            let Some(_) = decoder.next_frame_info().map_err(codec_error)? else {
                 return Err(ToolError::Invalid("GIF 没有可显示帧".into()));
             };
-            // Consume the first frame into a reusable row, not a second canvas. The GIF
-            // codec cannot advance to the next header until its current pixels are read.
-            let (width, height) = (usize::from(info.width), usize::from(info.height));
-            let mut row = vec![0; width * 4];
-            for _ in 0..height {
-                cancel.check()?;
-                if !decoder.fill_buffer(&mut row).map_err(codec_error)? {
-                    return Err(ToolError::Invalid("GIF 首帧不完整".into()));
-                }
-            }
+            // Skip compressed sub-blocks while deciding static versus animated. The actual
+            // display path validates LZW once; this probe must not decode the first frame twice.
             // If the second header is malformed, retain the valid first frame and let playback
             // report the error at that boundary. A sole frame is an ordinary editable image.
             if matches!(decoder.next_frame_info(), Ok(None)) {
@@ -646,6 +640,7 @@ pub(crate) fn try_load(
         warnings: source.warnings.clone(),
         load_ms: started.elapsed().as_millis(),
         animation: Some(source),
+        icon: None,
     }))
 }
 
@@ -839,6 +834,17 @@ pub struct FrameStream {
     _local: memory::Reservation,
 }
 impl FrameStream {
+    fn skip_initial_frame(&mut self) -> Result<()> {
+        self.cancel.check()?;
+        // A fresh decoder must restore the first frame's disposal state before continuing.
+        // Its displayed pixels are already owned by the UI, so skip repeated ICC/display work.
+        self.decoder
+            .next(true, &self.cancel)?
+            .ok_or_else(|| ToolError::Invalid("动画没有可显示帧".into()))?;
+        self.frame_index = 1;
+        self.elapsed = self.source.first_delay;
+        Ok(())
+    }
     pub fn next_frame(&mut self) -> Result<Option<AnimationFrame>> {
         self.cancel.check()?;
         if self.ended {
@@ -977,7 +983,7 @@ impl AnimationWorker {
                             active = None;
                             let mut stream = request.source.open(&request.cancel)?;
                             if !request.restart {
-                                let _ = stream.next_frame()?;
+                                stream.skip_initial_frame()?;
                             }
                             active = Some((request.generation, stream));
                         }

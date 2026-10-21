@@ -193,7 +193,15 @@ impl ImageApp {
         };
         self.loader.clear_cache();
         // Reuse the ordinary open intent so edited pixels still receive the save prompt.
-        self.open(path);
+        let icon_entry = self
+            .loaded
+            .as_ref()
+            .and_then(|image| image.icon.as_ref())
+            .map(|icon| {
+                let entry = &icon.entries[icon.selected_index];
+                IconLoad::Reload([entry.width, entry.height], entry.bit_depth)
+            });
+        self.open_or_request(path, icon_entry);
     }
 
     pub(super) fn show_current_in_folder(&mut self, ctx: &egui::Context) {

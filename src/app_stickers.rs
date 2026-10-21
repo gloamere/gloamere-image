@@ -17,7 +17,7 @@ struct Snapshot {
     name: String,
     dimensions: [u32; 2],
     tiles: Vec<Tile>,
-    background: CanvasBackground,
+    background: (settings::Rgb, Option<settings::CheckerColors>),
     canvas: Rect,
     initial_image: Rect,
     window_title: String,
@@ -209,6 +209,12 @@ impl Stickers {
             .checked_add(1)
             .ok_or_else(|| ToolError::Invalid("贴图窗口标识已耗尽".into()))?;
         let id = egui::ViewportId::from_hash_of(("gloamere-sticker", serial));
+        let background = if background == CanvasBackground::Automatic {
+            let color = app_theme::palette(&self.ctx).canvas;
+            ([color.r(), color.g(), color.b()], None)
+        } else {
+            background.colors()
+        };
         self.stickers.push(Sticker {
             serial,
             id,
@@ -789,7 +795,11 @@ fn draw_sticker(
             ui.close();
         }
         if let Some(error) = &resize_error {
-            ui.small(error);
+            ui.label(
+                egui::RichText::new(error)
+                    .small()
+                    .color(crate::app_theme::palette(ui.ctx()).error),
+            );
         }
         if ui.button("关闭这张贴图").clicked() {
             close = true;
@@ -847,7 +857,7 @@ fn draw_sticker(
     view.pan = Vec2::ZERO;
     view.zoom = image_rect.width() * ppp / snapshot.dimensions[0] as f32;
     let painter = ui.painter_at(image_rect.intersect(area));
-    let (background, checker) = snapshot.background.colors();
+    let (background, checker) = snapshot.background;
     painter.rect_filled(
         image_rect,
         0.0,
@@ -1182,6 +1192,24 @@ fn save_smoke_screenshot(
 mod tests {
     use super::*;
 
+    struct HeadlessOutput(egui::FullOutput);
+
+    impl std::ops::Deref for HeadlessOutput {
+        type Target = egui::FullOutput;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for HeadlessOutput {
+        fn drop(&mut self) {
+            // Keep deltas available to assertions, then acknowledge that these
+            // headless passes have no renderer, including during unwinding.
+            self.0.textures_delta.clear();
+        }
+    }
+
     fn tile(ctx: &egui::Context) -> (Tile, Arc<memory::Budget>) {
         let budget = memory::Budget::new(1024);
         let pixels = memory::Pixels::from_image(image::RgbaImage::from_pixel(
@@ -1229,10 +1257,10 @@ mod tests {
             .unwrap()
             .initial_image = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::splat(240.0));
     }
-    fn root_pass(ctx: &egui::Context, stickers: &mut Stickers, frame: u64) -> egui::FullOutput {
-        ctx.run_ui(egui::RawInput::default(), |_ui| {
+    fn root_pass(ctx: &egui::Context, stickers: &mut Stickers, frame: u64) -> HeadlessOutput {
+        HeadlessOutput(ctx.run_ui(egui::RawInput::default(), |_ui| {
             drop(stickers.show(frame));
-        })
+        }))
     }
     fn child_pass(
         ctx: &egui::Context,
@@ -1240,7 +1268,7 @@ mod tests {
         id: egui::ViewportId,
         events: Vec<egui::Event>,
         close: bool,
-    ) -> egui::FullOutput {
+    ) -> HeadlessOutput {
         child_pass_with(
             ctx,
             output,
@@ -1259,7 +1287,7 @@ mod tests {
         close: bool,
         size: Vec2,
         focused: bool,
-    ) -> egui::FullOutput {
+    ) -> HeadlessOutput {
         let callback = output.viewport_output[&id].viewport_ui_cb.clone().unwrap();
         let mut input = egui::RawInput {
             viewport_id: id,
@@ -1273,7 +1301,50 @@ mod tests {
         if close {
             info.events.push(egui::ViewportEvent::Close);
         }
-        ctx.run_ui(input, |ui| callback(ui))
+        HeadlessOutput(ctx.run_ui(input, |ui| callback(ui)))
+    }
+
+    #[test]
+    fn automatic_canvas_background_is_neutral_and_frozen_when_theme_changes() {
+        for (initial, next) in [
+            (egui::Theme::Dark, egui::Theme::Light),
+            (egui::Theme::Light, egui::Theme::Dark),
+        ] {
+            let (ctx, mut stickers, tile, _) = setup();
+            crate::app_theme::configure(&ctx);
+            ctx.set_theme(match initial {
+                egui::Theme::Light => egui::ThemePreference::Light,
+                egui::Theme::Dark => egui::ThemePreference::Dark,
+            });
+            stickers
+                .push(
+                    "automatic.png".into(),
+                    [2, 2],
+                    vec![tile.clone()],
+                    CanvasBackground::Automatic,
+                )
+                .unwrap();
+            Arc::get_mut(&mut stickers.stickers[0].snapshot)
+                .unwrap()
+                .initial_image = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::splat(240.0));
+            let canvas = crate::app_theme::Palette::for_theme(initial).canvas;
+            let frozen = ([canvas.r(), canvas.g(), canvas.b()], None);
+            assert_eq!(canvas.r(), canvas.g());
+            assert_eq!(canvas.g(), canvas.b());
+            assert_eq!(stickers.stickers[0].snapshot.background, frozen);
+
+            ctx.set_theme(match next {
+                egui::Theme::Light => egui::ThemePreference::Light,
+                egui::Theme::Dark => egui::ThemePreference::Dark,
+            });
+            let id = stickers.stickers[0].id;
+            let root = root_pass(&ctx, &mut stickers, 1);
+            let child = child_pass(&ctx, &root, id, vec![], false);
+            assert_eq!(stickers.stickers[0].snapshot.background, frozen);
+            assert!(child.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Rect(rect) if rect.fill == canvas)
+            }));
+        }
     }
 
     #[test]
@@ -1701,9 +1772,9 @@ mod tests {
                     .contains(&egui::ViewportCommand::Close)
             );
             let mut released = Vec::new();
-            let removed = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            let removed = HeadlessOutput(ctx.run_ui(egui::RawInput::default(), |_ui| {
                 released = stickers.show(2);
-            });
+            }));
             assert_eq!(released.len(), 1);
             assert!(!removed.viewport_output.contains_key(&id));
             assert!(weak.upgrade().is_some());
@@ -1733,7 +1804,7 @@ mod tests {
         drop(tile);
         assert_eq!(budget.in_use(), 0);
         drop(output);
-        let _still_live = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+        let _still_live = HeadlessOutput(ctx.run_ui(egui::RawInput::default(), |_ui| {}));
     }
 
     #[test]

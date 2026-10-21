@@ -340,6 +340,34 @@ fn path_requires_one_absolute_local_image_and_never_a_url_device_or_unc() {
 }
 
 #[test]
+fn bitmap_and_icon_paths_accept_text_and_single_file_drop_only() {
+    for expected in ["C:\\图片\\bitmap.BmP", "D:\\icons\\透明.ICO"] {
+        assert_eq!(local_path(expected).unwrap(), PathBuf::from(expected));
+        let text = encode_text(expected).unwrap();
+        assert_eq!(
+            local_path(&decode_unicode_text(&text).unwrap()).unwrap(),
+            PathBuf::from(expected)
+        );
+        let mut drop = vec![0; 20];
+        put(&mut drop, 0, 20);
+        put(&mut drop, 16, 1);
+        drop.extend_from_slice(&text);
+        drop.extend_from_slice(&[0, 0]);
+        assert_eq!(decode_hdrop(&drop).unwrap(), PathBuf::from(expected));
+    }
+    for bad in [
+        "https://site/bitmap.bmp",
+        "\\\\host\\share\\icon.ico",
+        "C:\\NUL.bmp",
+        "C:\\icons\\icon.ico:stream",
+        "C:\\icons\\icon.cur",
+        "C:\\image.raw",
+    ] {
+        assert!(local_path(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn unicode_text_requires_terminator_valid_pairs_and_bounded_size() {
     let expected = "C:\\图片\\🌙.png";
     assert_eq!(

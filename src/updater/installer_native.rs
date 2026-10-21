@@ -329,32 +329,7 @@ fn copy_durable(
     if replace {
         storage::persist_replace(temp, destination)?;
     } else {
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStrExt;
-            use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
-            let source: Vec<u16> = temp
-                .path()
-                .as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-            let target: Vec<u16> = destination
-                .as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-            // No REPLACE_EXISTING: publishing a snapshot must never clobber.
-            if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            drop(temp);
-        }
-        #[cfg(not(windows))]
-        {
-            temp.persist_noclobber(destination).map_err(|e| e.error)?;
-        }
+        storage::persist_new(temp, destination)?;
     }
     storage::sync_directory(parent)?;
     if FileIdentity::read(destination)? != *identity {
@@ -1754,6 +1729,7 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::updater::test_support::{self, fs};
     struct Fixture {
         _temp: tempfile::TempDir,
         installation: PathBuf,
@@ -1765,7 +1741,7 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = test_support::tempdir().unwrap();
             let root = temp.path();
             let installation = root.join("中文 app");
             let state = root.join("state");
@@ -2847,7 +2823,7 @@ mod tests {
         ] {
             assert!(require_delegated_lock(Err(error)).is_err());
         }
-        let temp = tempfile::tempdir().unwrap();
+        let temp = test_support::tempdir().unwrap();
         let unlocked = storage::LockGuard::acquire(&temp.path().join("unheld.lock"), false);
         assert!(require_delegated_lock(unlocked).is_err());
     }

@@ -8,17 +8,39 @@ use std::{
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+impl Appearance {
+    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "跟随系统",
+            Self::Light => "浅色",
+            Self::Dark => "深色",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CanvasBackground {
+    #[default]
+    Automatic,
     Dark,
     Light,
     CheckerDark,
-    #[default]
     CheckerLight,
 }
 pub type Rgb = [u8; 3];
 pub type CheckerColors = (Rgb, Rgb);
 impl CanvasBackground {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
+        Self::Automatic,
         Self::CheckerLight,
         Self::CheckerDark,
         Self::Light,
@@ -26,6 +48,7 @@ impl CanvasBackground {
     ];
     pub fn label(self) -> &'static str {
         match self {
+            Self::Automatic => "随外观",
             Self::Dark => "深色",
             Self::Light => "浅色",
             Self::CheckerDark => "深棋盘",
@@ -34,6 +57,9 @@ impl CanvasBackground {
     }
     pub fn colors(self) -> (Rgb, Option<CheckerColors>) {
         match self {
+            // Theme-aware callers resolve Automatic before drawing; this is a
+            // neutral light fallback for callers without an appearance context.
+            Self::Automatic => ([0xE8; 3], None),
             Self::Dark => ([26, 30, 36], None),
             Self::Light => ([226, 230, 234], None),
             Self::CheckerDark => ([26, 30, 36], Some(([64; 3], [43; 3]))),
@@ -47,6 +73,9 @@ pub struct Preferences {
     pub schema_version: u8,
     pub background: CanvasBackground,
     pub list_visible: bool,
+    // Older v1 files omit appearance but still retain their saved canvas/list.
+    #[serde(default)]
+    pub appearance: Appearance,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -54,6 +83,7 @@ impl Default for Preferences {
             schema_version: 1,
             background: CanvasBackground::default(),
             list_visible: false,
+            appearance: Appearance::default(),
         }
     }
 }
@@ -134,13 +164,14 @@ pub fn save(path: &Path, settings: &Preferences) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn default_view_is_light_checker_with_collapsed_list() {
+    fn default_view_follows_appearance_with_collapsed_list() {
         assert_eq!(
             Preferences::default().background,
-            CanvasBackground::CheckerLight
+            CanvasBackground::Automatic
         );
+        assert_eq!(Preferences::default().appearance, Appearance::System);
         assert!(!Preferences::default().list_visible);
-        assert_eq!(CanvasBackground::ALL.len(), 4);
+        assert_eq!(CanvasBackground::ALL.len(), 5);
     }
     #[test]
     fn approved_light_checker_colors_are_exact() {
@@ -162,6 +193,9 @@ mod tests {
             br#"{"schema_version":2,"background":"dark","list_visible":true}"#.to_vec(),
             br#"{"schema_version":1,"background":"dark","list_visible":true,"future_preference":42}"#.to_vec(),
             br#"{"schema_version":1,"background":"new_background","list_visible":true}"#.to_vec(),
+            br#"{"schema_version":1,"background":"dark","list_visible":true,"appearance":"new_appearance"}"#.to_vec(),
+            br#"{"schema_version":1,"background":"dark","list_visible":true,"appearance":null}"#.to_vec(),
+            br#"{"schema_version":1,"background":"dark","list_visible":true,"appearance":"light","appearance":"dark"}"#.to_vec(),
         ] {
             std::fs::write(&path, &original).unwrap();
             assert!(load(&path).is_err());
@@ -196,11 +230,65 @@ mod tests {
         let mut preferences = load(&path).unwrap();
         assert_eq!(preferences.background, CanvasBackground::CheckerDark);
         assert!(preferences.list_visible);
-        preferences.background = CanvasBackground::Light;
+        assert_eq!(preferences.appearance, Appearance::System);
+        preferences.appearance = Appearance::Dark;
         save(&path, &preferences).unwrap();
         assert_eq!(load(&path).unwrap(), preferences);
         assert_eq!(preferences.schema_version, 1);
+        assert_eq!(preferences.background, CanvasBackground::CheckerDark);
         assert!(preferences.list_visible);
+    }
+    #[test]
+    fn loading_legacy_canvas_choices_never_rewrites_or_replaces_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for background in [
+            CanvasBackground::Dark,
+            CanvasBackground::Light,
+            CanvasBackground::CheckerDark,
+            CanvasBackground::CheckerLight,
+        ] {
+            let original = serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "background": background,
+                "list_visible": true,
+            }))
+            .unwrap();
+            std::fs::write(&path, &original).unwrap();
+            let preferences = load(&path).unwrap();
+            assert_eq!(preferences.background, background);
+            assert_eq!(preferences.appearance, Appearance::System);
+            assert!(preferences.list_visible);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+    #[test]
+    fn extended_v1_preferences_are_rejected_by_the_legacy_shape() {
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyPreferences {
+            schema_version: u8,
+            background: CanvasBackground,
+            list_visible: bool,
+        }
+
+        let old = br#"{"schema_version":1,"background":"checker_dark","list_visible":true}"#;
+        let legacy: LegacyPreferences = serde_json::from_slice(old).unwrap();
+        assert_eq!(legacy.schema_version, 1);
+        assert_eq!(legacy.background, CanvasBackground::CheckerDark);
+        assert!(legacy.list_visible);
+
+        let preferences = Preferences {
+            background: CanvasBackground::CheckerDark,
+            appearance: Appearance::Dark,
+            list_visible: true,
+            ..Preferences::default()
+        };
+        let extended = serde_json::to_vec(&preferences).unwrap();
+        let error = serde_json::from_slice::<LegacyPreferences>(&extended)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field `appearance`"), "{error}");
     }
     #[test]
     fn preferences_round_trip_and_replace_without_history() {
@@ -208,10 +296,15 @@ mod tests {
         let path = dir.path().join("中 文/settings.json");
         let mut preferences = Preferences::default();
         save(&path, &preferences).unwrap();
-        preferences.background = CanvasBackground::Light;
-        preferences.list_visible = false;
-        save(&path, &preferences).unwrap();
-        assert_eq!(load(&path).unwrap(), preferences);
+        for appearance in Appearance::ALL {
+            for background in CanvasBackground::ALL {
+                preferences.appearance = appearance;
+                preferences.background = background;
+                preferences.list_visible = !preferences.list_visible;
+                save(&path, &preferences).unwrap();
+                assert_eq!(load(&path).unwrap(), preferences);
+            }
+        }
         assert!(
             !std::fs::read_to_string(path)
                 .unwrap()

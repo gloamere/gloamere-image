@@ -62,6 +62,7 @@ impl Seek for CancellableReader<'_> {
 #[derive(Clone)]
 pub struct LoadedImage {
     pub animation: Option<Arc<crate::animation::AnimationSource>>,
+    pub icon: Option<Arc<crate::icon_container::IconDirectory>>,
     pub path: PathBuf,
     pub pixels: Arc<crate::memory::Pixels>,
     pub format: ImageFormat,
@@ -100,16 +101,84 @@ pub fn load(path: &Path, cancel: &Cancellation) -> Result<LoadedImage> {
 }
 
 pub fn load_open_file(path: &Path, file: &mut File, cancel: &Cancellation) -> Result<LoadedImage> {
+    load_open_file_selected(path, file, IconSelection::Default, cancel)
+}
+
+#[derive(Clone, Copy)]
+enum IconSelection {
+    Default,
+    Index(usize),
+    Reload {
+        dimensions: [u32; 2],
+        bit_depth: u16,
+    },
+}
+
+/// Re-read the current file, preserving an ICO size rather than its old directory position.
+/// If that size was removed, the current default entry is used. Replacement files retain
+/// normal content-based loading semantics.
+pub fn reload_icon(
+    path: &Path,
+    dimensions: [u32; 2],
+    bit_depth: u16,
+    cancel: &Cancellation,
+) -> Result<LoadedImage> {
+    let result = (|| {
+        cancel.check()?;
+        let mut file = File::open(path)?;
+        load_open_file_selected(
+            path,
+            &mut file,
+            IconSelection::Reload {
+                dimensions,
+                bit_depth,
+            },
+            cancel,
+        )
+    })();
+    cancel.check()?;
+    result
+}
+
+/// Load one size from an ICO. The index refers to the original directory order.
+pub fn load_icon_entry(path: &Path, index: usize, cancel: &Cancellation) -> Result<LoadedImage> {
+    let result = (|| {
+        cancel.check()?;
+        let mut file = File::open(path)?;
+        load_open_file_icon_entry(path, &mut file, index, cancel)
+    })();
+    cancel.check()?;
+    result
+}
+
+pub fn load_open_file_icon_entry(
+    path: &Path,
+    file: &mut File,
+    index: usize,
+    cancel: &Cancellation,
+) -> Result<LoadedImage> {
+    load_open_file_selected(path, file, IconSelection::Index(index), cancel)
+}
+
+fn load_open_file_selected(
+    path: &Path,
+    file: &mut File,
+    selection: IconSelection,
+    cancel: &Cancellation,
+) -> Result<LoadedImage> {
     let result = (|| {
         let started = Instant::now();
         let bytes = Arc::new(read_snapshot_file(file, cancel)?);
         let format = image::guess_format(&bytes)?;
+        if matches!(selection, IconSelection::Index(_)) && format != ImageFormat::Ico {
+            return Err(ToolError::Invalid("当前文件不是 ICO 图片".into()));
+        }
         if let Some(animated) =
             crate::animation::try_load(bytes.clone(), path, format, cancel, started)?
         {
             return Ok(animated);
         }
-        decode(&bytes, path, cancel, started)
+        decode(&bytes, path, selection, cancel, started)
     })();
     cancel.check()?;
     result
@@ -159,32 +228,65 @@ fn read_snapshot_file(file: &mut File, cancel: &Cancellation) -> Result<crate::m
 fn decode(
     bytes: &[u8],
     path: &Path,
+    selection: IconSelection,
     cancel: &Cancellation,
     started: Instant,
 ) -> Result<LoadedImage> {
     let mut reservation = crate::memory::reserve(MAX_DECODE_BYTES)?;
     // Never trust the extension. Restrict the accepted content formats explicitly.
     cancel.check()?;
-    let mut reader =
-        ImageReader::new(CancellableReader::new(bytes, cancel)).with_guessed_format()?;
-    let format = reader.format().ok_or_else(|| {
-        ToolError::Invalid("无法识别图片；当前支持 JPEG、PNG、GIF 和 WebP".into())
-    })?;
+    let format = image::guess_format(bytes)?;
     if !matches!(
         format,
-        ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::Gif | ImageFormat::WebP
+        ImageFormat::Jpeg
+            | ImageFormat::Png
+            | ImageFormat::Gif
+            | ImageFormat::WebP
+            | ImageFormat::Bmp
+            | ImageFormat::Ico
     ) {
         return Err(ToolError::Invalid(
-            "当前版本仅支持 JPEG、PNG、GIF 和 WebP".into(),
+            "当前版本支持 JPEG、PNG、GIF、WebP、BMP 和 ICO".into(),
         ));
     }
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DIMENSION);
     limits.max_image_height = Some(MAX_DIMENSION);
     limits.max_alloc = Some(MAX_DECODE_BYTES);
-    if format == ImageFormat::Png
+    let icon = if format == ImageFormat::Ico {
+        let mut directory = crate::icon_container::IconDirectory::parse(bytes, cancel)?;
+        match selection {
+            IconSelection::Default => {}
+            IconSelection::Index(index) => directory.select(Some(index))?,
+            IconSelection::Reload {
+                dimensions,
+                bit_depth,
+            } => directory.select_matching(dimensions, bit_depth),
+        }
+        Some(directory)
+    } else {
+        None
+    };
+    // PNG entries retain the normal PNG color-management path. DIB entries use the ICO
+    // decoder, which also applies the legacy one-bit transparency mask.
+    let normalized;
+    let (decode_bytes, decode_format) = if let Some(icon) = &icon {
+        let payload = icon.payload(bytes);
+        if icon.entries[icon.selected_index].encoding == crate::icon_container::IconEncoding::Png {
+            (payload, ImageFormat::Png)
+        } else {
+            reservation.resize(MAX_DECODE_BYTES + payload.len() as u64 + 22)?;
+            normalized = icon.single_entry(bytes, cancel)?;
+            (normalized.as_slice(), ImageFormat::Ico)
+        }
+    } else {
+        (bytes, format)
+    };
+    let mut reader =
+        ImageReader::with_format(CancellableReader::new(decode_bytes, cancel), decode_format);
+    if decode_format == ImageFormat::Png
         && image::codecs::png::PngDecoder::with_limits(
-            CancellableReader::new(bytes, cancel),
+            CancellableReader::new(decode_bytes, cancel),
             limits.clone(),
         )?
         .is_apng()?
@@ -200,12 +302,14 @@ fn decode(
     if decoder.total_bytes() > MAX_DECODE_BYTES {
         return Err(ToolError::Invalid("解码内存超过限制".into()));
     }
-    reservation.resize(crate::memory::decode_estimate(
-        0,
-        decoder.total_bytes(),
-        w,
-        h,
-    ))?;
+    reservation.resize(
+        crate::memory::decode_estimate(0, decoder.total_bytes(), w, h)
+            + if decode_format == ImageFormat::Ico {
+                decode_bytes.len() as u64
+            } else {
+                0
+            },
+    )?;
     let mut warnings = Vec::new();
     let orientation = match decoder.orientation() {
         Ok(o) => o,
@@ -223,9 +327,9 @@ fn decode(
     };
     let source_type = decoder.color_type();
     cancel.check()?;
-    let mut decoded = if format == ImageFormat::Png {
+    let mut decoded = if decode_format == ImageFormat::Png {
         drop(decoder);
-        png_pixels(bytes, cancel)?
+        png_pixels(decode_bytes, cancel)?
     } else {
         DynamicImage::from_decoder(decoder)?
     };
@@ -234,7 +338,18 @@ fn decode(
     if source_type.bits_per_pixel() > u16::from(source_type.channel_count()) * 8 {
         warnings.push("显示与导出副本为 8 位；原始高位深文件保持不变".into());
     }
-    let prepared_icc = icc.as_deref().map(parse_icc);
+    let bitmap_profile = if format == ImageFormat::Bmp {
+        bitmap_icc(bytes, true, &mut warnings)
+    } else if let Some(icon) = &icon {
+        if decode_format == ImageFormat::Ico {
+            bitmap_icc(icon.payload(bytes), false, &mut warnings)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let prepared_icc = bitmap_profile.or(icc.as_deref()).map(parse_icc);
     // Gray ICC must use the original decoded luminance before an 8-bit RGBA conversion.
     let gray = prepared_icc
         .as_ref()
@@ -269,6 +384,7 @@ fn decode(
     let color_managed = !color_status.contains("未完整") && !color_status.contains("核验不完整");
     Ok(LoadedImage {
         animation: None,
+        icon: icon.map(Arc::new),
         path: path.to_path_buf(),
         pixels: Arc::new(crate::memory::Pixels::from_reserved(
             rgba,
@@ -293,6 +409,52 @@ fn source_hash(bytes: &[u8], cancel: &Cancellation) -> Result<String> {
         digest.update(chunk);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+// image's BMP decoder does not expose V4/V5 color metadata. Read only the bounded
+// embedded profile; linked profiles never trigger filesystem access.
+fn bitmap_icc<'a>(
+    bytes: &'a [u8],
+    file_header: bool,
+    warnings: &mut Vec<String>,
+) -> Option<&'a [u8]> {
+    let base = if file_header { 14 } else { 0 };
+    let header = bytes.get(base..base + 4)?;
+    let header = u32::from_le_bytes(header.try_into().unwrap());
+    if !matches!(header, 108 | 124) || bytes.len() < base + header as usize {
+        return None;
+    }
+    let color_space = u32::from_le_bytes(bytes[base + 56..base + 60].try_into().unwrap());
+    match color_space {
+        0x7352_4742 | 0x5769_6e20 => None, // LCS_sRGB / LCS_WINDOWS_COLOR_SPACE
+        0x4d42_4544 if header == 124 => {
+            let offset =
+                u32::from_le_bytes(bytes[base + 112..base + 116].try_into().unwrap()) as usize;
+            let length =
+                u32::from_le_bytes(bytes[base + 116..base + 120].try_into().unwrap()) as usize;
+            if offset < 124 || length == 0 || length > MAX_ICC_BYTES {
+                warnings.push("ICC：BMP 内嵌颜色配置范围无效或超过 4 MiB".into());
+                return None;
+            }
+            let profile = base.checked_add(offset).and_then(|start| {
+                start
+                    .checked_add(length)
+                    .and_then(|end| bytes.get(start..end))
+            });
+            if profile.is_none() {
+                warnings.push("ICC：BMP 内嵌颜色配置已截断".into());
+            }
+            profile
+        }
+        0x4c49_4e4b => {
+            warnings.push("ICC：BMP 使用外部颜色配置，未读取外部文件；颜色可能不准确".into());
+            None
+        }
+        _ => {
+            warnings.push("ICC：BMP 校准颜色空间尚不支持；颜色可能不准确".into());
+            None
+        }
+    }
 }
 
 fn png_error(error: png::DecodingError) -> ToolError {
@@ -425,10 +587,12 @@ fn thumbnail_inner(path: &Path, edge: u32, cancel: &Cancellation) -> Result<Rgba
             Err(ToolError::Cancelled) => return Err(ToolError::Cancelled),
             Err(_) => static_preview(&bytes, format, cancel, &mut reservation)?,
         },
-        ImageFormat::Png => static_preview(&bytes, format, cancel, &mut reservation)?,
+        ImageFormat::Png | ImageFormat::Bmp | ImageFormat::Ico => {
+            static_preview(&bytes, format, cancel, &mut reservation)?
+        }
         _ => {
             return Err(ToolError::Invalid(
-                "当前版本仅支持 JPEG、PNG、GIF 和 WebP".into(),
+                "当前版本支持 JPEG、PNG、GIF、WebP、BMP 和 ICO".into(),
             ));
         }
     };
@@ -468,6 +632,34 @@ fn static_preview(
     cancel: &Cancellation,
     reservation: &mut crate::memory::Reservation,
 ) -> Result<PreviewPixels> {
+    if format == ImageFormat::Ico {
+        let directory = crate::icon_container::IconDirectory::parse(bytes, cancel)?;
+        let payload = directory.payload(bytes);
+        if directory.entries[directory.selected_index].encoding
+            == crate::icon_container::IconEncoding::Png
+        {
+            return static_preview_decode(payload, ImageFormat::Png, cancel, reservation, 0);
+        }
+        reservation.resize(MAX_DECODE_BYTES + payload.len() as u64 + 22)?;
+        let normalized = directory.single_entry(bytes, cancel)?;
+        return static_preview_decode(
+            &normalized,
+            ImageFormat::Ico,
+            cancel,
+            reservation,
+            normalized.len() as u64,
+        );
+    }
+    static_preview_decode(bytes, format, cancel, reservation, 0)
+}
+
+fn static_preview_decode(
+    bytes: &[u8],
+    format: ImageFormat,
+    cancel: &Cancellation,
+    reservation: &mut crate::memory::Reservation,
+    encoded_workspace: u64,
+) -> Result<PreviewPixels> {
     let mut reader = ImageReader::with_format(CancellableReader::new(bytes, cancel), format);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DIMENSION);
@@ -476,14 +668,32 @@ fn static_preview(
     reader.limits(limits);
     let mut decoder = reader.into_decoder()?;
     let (width, height) = decoder.dimensions();
-    preview_workspace(reservation, width, height)?;
+    validate_dimensions(width, height)?;
+    // Keep the selected DIB container admitted throughout the resize; releasing its
+    // bytes and immediately reserving them again would undercount concurrent work.
+    reservation.resize(
+        MAX_DECODE_BYTES
+            + crate::memory::rgba_bytes(width, height) * 3
+            + crate::memory::OVERHEAD
+            + encoded_workspace,
+    )?;
     if decoder.total_bytes() > MAX_DECODE_BYTES {
         return Err(ToolError::Invalid("解码内存超过限制".into()));
     }
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let icc = decoder.icc_profile().ok().flatten();
+    let mut icc = decoder.icc_profile().ok().flatten();
+    if format == ImageFormat::Bmp {
+        icc = bitmap_icc(bytes, true, &mut Vec::new())
+            .map(<[u8]>::to_vec)
+            .or(icc);
+    } else if format == ImageFormat::Ico {
+        // The normalized single-entry container always starts its DIB at byte 22.
+        icc = bitmap_icc(&bytes[22..], false, &mut Vec::new())
+            .map(<[u8]>::to_vec)
+            .or(icc);
+    }
     cancel.check()?;
     let image = if format == ImageFormat::Png {
         drop(decoder);

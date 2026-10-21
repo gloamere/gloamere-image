@@ -29,7 +29,7 @@ impl ImageApp {
             if matches!(self.updater.state, light_image_tool::updater::client::State::Downloading { .. } | light_image_tool::updater::client::State::Paused(_) | light_image_tool::updater::client::State::Ready { .. }) && ui.button("取消本次更新").clicked() { self.updater.cancel(); }
             ui.label(self.updater.state.text());
             ui.small("手动检查不会自动下载。暂停保留临时包，取消只清理本产品临时下载。安装提交开始后不会杀掉安装器。");
-            if let Some(error)=&self.updater.settings_error{ui.colored_label(Color32::from_rgb(178,45,45),error);}
+            if let Some(error)=&self.updater.settings_error{ui.colored_label(crate::app_theme::palette(ui.ctx()).error,error);}
         });
     }
 }

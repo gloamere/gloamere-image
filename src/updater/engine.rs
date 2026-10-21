@@ -465,7 +465,7 @@ pub fn spawn_after_normal_exit(
         if !identity.matches(temporary.path())? {
             return Err(UpdateError::Security("外置 helper 复制校验失败".into()));
         }
-        temporary.persist_noclobber(&helper).map_err(|e| e.error)?;
+        storage::persist_new(temporary, &helper)?;
     }
     super::platform::spawn_exit_helper(&helper, installation, nonce)
 }
@@ -725,8 +725,9 @@ fn retire_completed_download(root: &Path, expected: &PendingUpdate) -> Result<()
 #[cfg(test)]
 mod retention_tests {
     use super::*;
+    use crate::updater::test_support::{self, fs};
     fn fixture() -> (tempfile::TempDir, PendingUpdate) {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = test_support::tempdir().unwrap();
         ensure_private_directory(&directory.path().join("downloads")).unwrap();
         let bytes = b"owned completed installer";
         use sha2::Digest;
@@ -740,7 +741,7 @@ mod retention_tests {
             authorization: Authorization::ExplicitApp,
         };
         let path = pending.package_path(directory.path()).unwrap();
-        std::fs::write(&path, bytes).unwrap();
+        fs::write(&path, bytes).unwrap();
         storage::atomic_json(&path.with_extension("exe.task.json"), &pending).unwrap();
         (directory, pending)
     }
@@ -753,7 +754,7 @@ mod retention_tests {
         new.release_id = 3;
         new.sha256 = "a".repeat(64);
         storage::atomic_json(&root.join("pending.json"), &new).unwrap();
-        std::fs::write(root.join("downloads/foreign.txt"), b"foreign").unwrap();
+        fs::write(root.join("downloads/foreign.txt"), b"foreign").unwrap();
         clear_completed_pending(root, &old).unwrap();
         retire_completed_download(root, &old).unwrap();
         retire_completed_download(root, &old).unwrap();
@@ -763,7 +764,7 @@ mod retention_tests {
             new
         );
         assert_eq!(
-            std::fs::read(root.join("downloads/foreign.txt")).unwrap(),
+            fs::read(root.join("downloads/foreign.txt")).unwrap(),
             b"foreign"
         );
     }
@@ -771,10 +772,10 @@ mod retention_tests {
     fn cleanup_resumes_after_package_removal_but_preserves_modified_bytes() {
         let (d, p) = fixture();
         let path = p.package_path(d.path()).unwrap();
-        std::fs::write(&path, b"foreign changed bytes").unwrap();
+        fs::write(&path, b"foreign changed bytes").unwrap();
         assert!(retire_completed_download(d.path(), &p).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"foreign changed bytes");
-        std::fs::remove_file(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"foreign changed bytes");
+        fs::remove_file(&path).unwrap();
         retire_completed_download(d.path(), &p).unwrap();
         assert!(!path.with_extension("exe.task.json").exists());
     }
@@ -786,7 +787,7 @@ mod retention_tests {
             storage::LockGuard::acquire(&path.with_extension("exe.download.lock"), false).unwrap();
         assert!(retire_completed_download(d.path(), &p).is_err());
         drop(lock);
-        std::fs::write(path.with_extension("exe.part"), b"partial").unwrap();
+        fs::write(path.with_extension("exe.part"), b"partial").unwrap();
         assert!(retire_completed_download(d.path(), &p).is_err());
         assert!(path.exists());
     }
@@ -836,18 +837,19 @@ mod retention_tests {
     fn package_symlink_is_never_followed_for_cleanup() {
         let (d, p) = fixture();
         let path = p.package_path(d.path()).unwrap();
-        std::fs::remove_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
         let foreign = d.path().join("foreign");
-        std::fs::write(&foreign, b"safe").unwrap();
+        fs::write(&foreign, b"safe").unwrap();
         std::os::unix::fs::symlink(&foreign, &path).unwrap();
         assert!(retire_completed_download(d.path(), &p).is_err());
-        assert_eq!(std::fs::read(foreign).unwrap(), b"safe");
+        assert_eq!(fs::read(foreign).unwrap(), b"safe");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::updater::test_support::{self, fs};
     #[test]
     fn no_builtin_root_can_authorize_network_or_execution() {
         assert!(ProductionConfig::bundled().is_err());
@@ -863,7 +865,7 @@ mod tests {
             length: 4,
             authorization: Authorization::AutomaticApp,
         };
-        let d = tempfile::tempdir().unwrap();
+        let d = test_support::tempdir().unwrap();
         assert!(
             p.package_path(d.path())
                 .unwrap()
@@ -873,8 +875,8 @@ mod tests {
     }
     #[test]
     fn cancel_preserves_foreign_files_and_changed_package() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::create_dir(d.path().join("downloads")).unwrap();
+        let d = test_support::tempdir().unwrap();
+        fs::create_dir(d.path().join("downloads")).unwrap();
         let p = PendingUpdate {
             schema: 1,
             release_id: 7,
@@ -885,7 +887,7 @@ mod tests {
             authorization: Authorization::ExplicitApp,
         };
         storage::atomic_json(&d.path().join("pending.json"), &p).unwrap();
-        std::fs::write(p.package_path(d.path()).unwrap(), b"else").unwrap();
+        fs::write(p.package_path(d.path()).unwrap(), b"else").unwrap();
         assert!(cancel_pending(d.path(), Some(&p)).is_err());
         assert!(d.path().join("pending.json").exists());
     }

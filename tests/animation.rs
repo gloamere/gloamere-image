@@ -286,6 +286,84 @@ fn single_frame_gif_and_static_lossless_webp_keep_static_edit_path() {
     assert!(loaded.has_alpha);
 }
 #[test]
+fn gif_interlaced_local_palette_and_previous_restore_two_dimensional_canvas() {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = gif::Encoder::new(
+            &mut bytes,
+            4,
+            4,
+            &[0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255],
+        )
+        .unwrap();
+        encoder
+            .write_frame(&gif::Frame {
+                width: 4,
+                height: 4,
+                dispose: gif::DisposalMethod::Keep,
+                buffer: Cow::Owned(vec![1; 16]),
+                ..Default::default()
+            })
+            .unwrap();
+        // Local indices 1/2 are blue/green. Interlaced storage orders rows 0, 2, 1, 3.
+        encoder
+            .write_frame(&gif::Frame {
+                left: 1,
+                width: 2,
+                height: 4,
+                interlaced: true,
+                palette: Some(vec![0, 0, 0, 0, 0, 255, 0, 255, 0]),
+                transparent: Some(0),
+                dispose: gif::DisposalMethod::Previous,
+                buffer: Cow::Borrowed(&[1, 2, 2, 1, 0, 1, 1, 0]),
+                ..Default::default()
+            })
+            .unwrap();
+        encoder
+            .write_frame(&gif::Frame {
+                top: 3,
+                width: 1,
+                height: 1,
+                dispose: gif::DisposalMethod::Keep,
+                buffer: Cow::Borrowed(&[2]),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let source = load_source(&bytes);
+    let mut stream = source.open(&Cancellation::default()).unwrap();
+    assert_eq!(
+        colors(&stream.next_frame().unwrap().unwrap().pixels),
+        vec![R; 16]
+    );
+    assert_eq!(
+        colors(&stream.next_frame().unwrap().unwrap().pixels),
+        vec![R, B, G, R, R, R, B, R, R, G, B, R, R, B, R, R]
+    );
+    let mut restored = vec![R; 16];
+    restored[12] = G;
+    assert_eq!(
+        colors(&stream.next_frame().unwrap().unwrap().pixels),
+        restored
+    );
+    assert!(stream.next_frame().unwrap().is_none());
+}
+
+#[test]
+fn gif_first_lzw_corruption_still_fails_after_metadata_probe() {
+    let frame = gif_spec(0, 2, vec![1, 2], gif::DisposalMethod::Keep);
+    for frame_count in [1, 2] {
+        let mut bytes = gif_bytes(2, 1, None, &vec![frame.clone(); frame_count]);
+        let descriptor = bytes.iter().position(|byte| *byte == 0x2c).unwrap();
+        let block_length = usize::from(bytes[descriptor + 11]);
+        bytes[descriptor + 12..descriptor + 12 + block_length].fill(0xff);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("corrupt-first.gif");
+        fs::write(&path, bytes).unwrap();
+        assert!(pipeline::load(&path, &Cancellation::default()).is_err());
+    }
+}
+#[test]
 fn webp_blend_replace_background_disposal_and_loop_reset_goldens() {
     let specs = [
         webp_spec(0, &[R, R, R], 40, 2),
@@ -496,6 +574,38 @@ fn demand_worker_steps_once_restarts_and_tags_generations() {
     worker.stop();
     assert!(worker.take_result().is_none());
     worker.shutdown();
+}
+
+#[test]
+fn worker_continuation_preserves_first_disposal_and_normalized_timeline() {
+    for disposal in [
+        gif::DisposalMethod::Previous,
+        gif::DisposalMethod::Background,
+    ] {
+        let mut first = gif_spec(0, 2, vec![1, 1], disposal);
+        first.delay = 0;
+        let loaded = load(&gif_bytes(
+            2,
+            1,
+            None,
+            &[first, gif_spec(1, 1, vec![2], gif::DisposalMethod::Keep)],
+        ));
+        let source = loaded.animation.unwrap();
+        let mut worker = AnimationWorker::without_context();
+        worker.request(AnimationRequest {
+            generation: 1,
+            request_id: 1,
+            source,
+            cancel: Cancellation::default(),
+            restart: false,
+        });
+        let next = response(&worker).result.unwrap().unwrap();
+        assert_eq!(next.frame_index, 2);
+        assert_eq!(next.elapsed, Duration::from_millis(20));
+        assert_eq!(colors(&next.pixels), vec![T, G]);
+        assert_eq!(colors(&loaded.pixels), vec![R, R]);
+        worker.shutdown();
+    }
 }
 
 // Tiny offline synthetic fixtures generated with Pillow/libwebp, not network samples.

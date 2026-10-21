@@ -9,8 +9,12 @@ pub mod model_client;
 pub mod model_update;
 pub mod platform;
 pub(crate) mod private_paths;
+#[cfg(windows)]
+mod private_publish;
 pub mod recovery;
 pub mod storage;
+#[cfg(test)]
+mod test_support;
 
 pub const PRODUCT_ID: &str = "9CCB6F43-7782-4F69-9E91-67C6D144737B";
 pub const UPDATER_PROTOCOL: u32 = 1;

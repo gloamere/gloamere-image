@@ -2179,6 +2179,7 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::updater::test_support::{self, fs};
     #[derive(Clone)]
     struct MemoryBackend {
         programs: PathBuf,
@@ -2393,7 +2394,7 @@ mod tests {
         }
     }
     fn fixture() -> (tempfile::TempDir, PathBuf, MemoryBackend) {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = test_support::tempdir().unwrap();
         let installation = directory.path().join("install");
         let memory = MemoryBackend::initial(directory.path().join("programs"), &installation);
         (directory, installation, memory)
@@ -2768,9 +2769,9 @@ mod tests {
     #[cfg(any(not(windows), test))]
     #[test]
     fn explicit_portable_fixture_never_contains_native_state() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir().unwrap();
         let app = dir.path().join("app");
-        std::fs::create_dir(&app).unwrap();
+        fs::create_dir(&app).unwrap();
         let journal = dir.path().join("transaction");
         let mut snapshot = Snapshot::capture(&app, &journal, true, "0.7.0").unwrap();
         assert!(snapshot.fixture && snapshot.registry.is_empty() && snapshot.shortcuts.is_empty());

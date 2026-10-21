@@ -34,7 +34,7 @@ pub fn load_brand_texture(ctx: &egui::Context) -> egui::TextureHandle {
     )
 }
 
-pub const TOOLBAR_HEIGHT: f32 = 52.0;
+pub const TOOLBAR_HEIGHT: f32 = 56.0;
 pub const BUTTON_COUNT: usize = 11;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
@@ -129,6 +129,7 @@ impl Icon {
 
 #[derive(Clone, Debug)]
 pub struct ToolbarLayout {
+    pub island: Rect,
     pub buttons: [Rect; BUTTON_COUNT],
     /// Indices remain aligned with `Icon::ALL`; hidden commands live in More.
     pub visible: [bool; BUTTON_COUNT],
@@ -146,10 +147,11 @@ impl ToolbarLayout {
             _ => true,
         });
         let count = visible.iter().filter(|&&shown| shown).count();
-        let side = if area.width() < 480.0 { 32.0 } else { 34.0 };
+        let side = ACTION_SIZE;
         let gap = 4.0;
         let separator = 12.0;
         let width = count as f32 * side + (count - 1) as f32 * gap + 3.0 * separator;
+        let island = Rect::from_center_size(area.center(), Vec2::new(width + 16.0, 40.0));
         let mut x = area.center().x - width / 2.0;
         let y = area.center().y - side / 2.0;
         let mut separators = Vec::with_capacity(3);
@@ -175,15 +177,15 @@ impl ToolbarLayout {
         });
         let metadata_rect = Rect::from_min_max(
             area.min + Vec2::new(12.0, 0.0),
-            Pos2::new(buttons[0].left() - 10.0, area.bottom()),
+            Pos2::new(island.left() - 12.0, area.bottom()),
         );
         let zoom_rect = Rect::from_min_max(
-            Pos2::new(buttons[BUTTON_COUNT - 1].right() + 10.0, area.top()),
+            Pos2::new(island.right() + 12.0, area.top()),
             area.max - Vec2::new(12.0, 0.0),
         );
         Self {
-            metadata: (area.width() >= 960.0 && metadata_rect.width() >= 96.0)
-                .then_some(metadata_rect),
+            island,
+            metadata: (metadata_rect.width() >= 48.0).then_some(metadata_rect),
             zoom: (area.width() >= 640.0 && zoom_rect.width() >= 64.0).then_some(zoom_rect),
             buttons,
             visible,
@@ -211,8 +213,8 @@ pub fn edge_label(ui: &mut egui::Ui, rect: Rect, text: &str, right: bool) -> egu
             egui::Align2::LEFT_CENTER
         },
         text,
-        egui::FontId::proportional(13.0),
-        Color32::from_gray(74),
+        egui::FontId::proportional(12.0),
+        crate::app_theme::palette(ui.ctx()).muted,
     );
     response
 }
@@ -245,6 +247,7 @@ pub fn icon_button(
     enabled: bool,
     selected: bool,
 ) -> egui::Response {
+    let enabled = enabled && ui.is_enabled();
     let response = ui.interact(
         rect,
         icon_id(icon),
@@ -257,28 +260,56 @@ pub fn icon_button(
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, icon.label())
     });
-    let color = if !enabled {
-        Color32::from_gray(183)
+    let color = paint_action_state(ui, &response, enabled, selected, false);
+    paint_icon(ui.painter(), rect.center(), icon, color);
+    action_tooltip(response, icon.label())
+}
+
+fn paint_action_state(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    enabled: bool,
+    selected: bool,
+    framed: bool,
+) -> Color32 {
+    let colors = crate::app_theme::palette(ui.ctx());
+    let fill = if enabled && response.is_pointer_button_down_on() {
+        Some(colors.pressed)
+    } else if selected {
+        Some(colors.selected)
+    } else if enabled && response.hovered() {
+        Some(colors.hover)
+    } else if framed {
+        Some(colors.input)
     } else {
-        Color32::from_gray(47)
+        None
     };
-    if selected || (enabled && response.hovered()) {
-        ui.painter().rect_filled(
-            rect,
-            5.0,
-            Color32::from_gray(if selected { 228 } else { 241 }),
-        );
+    if let Some(fill) = fill {
+        ui.painter().rect_filled(response.rect, 6.0, fill);
     }
-    if response.has_focus() {
+    if framed {
         ui.painter().rect_stroke(
-            rect.shrink(1.0),
-            5.0,
-            egui::Stroke::new(2.0, Color32::from_rgb(28, 79, 125)),
+            response.rect.shrink(0.5),
+            6.0,
+            egui::Stroke::new(1.0, colors.border),
             egui::StrokeKind::Inside,
         );
     }
-    paint_icon(ui.painter(), rect.center(), icon, color);
-    action_tooltip(response, icon.label())
+    if enabled && response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            6.0,
+            egui::Stroke::new(2.0, colors.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if !enabled {
+        colors.disabled
+    } else if selected {
+        colors.accent
+    } else {
+        colors.icon
+    }
 }
 
 /// Names are always available to assistive technology; captions appear only on
@@ -336,30 +367,8 @@ impl egui::Widget for CompactAction<'_> {
         response.widget_info(|| {
             egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, self.selected, self.name)
         });
-        let visuals = ui.style().interact_selectable(&response, self.selected);
-        if self.selected
-            || (enabled && (response.hovered() || response.is_pointer_button_down_on()))
-        {
-            ui.painter().rect_filled(rect, 5.0, visuals.bg_fill);
-        }
-        if response.has_focus() {
-            ui.painter().rect_stroke(
-                rect.shrink(1.0),
-                5.0,
-                egui::Stroke::new(2.0, Color32::from_rgb(28, 79, 125)),
-                egui::StrokeKind::Inside,
-            );
-        }
-        paint_icon(
-            ui.painter(),
-            rect.center(),
-            self.icon,
-            if enabled {
-                visuals.fg_stroke.color
-            } else {
-                Color32::from_gray(169)
-            },
-        );
+        let color = paint_action_state(ui, &response, enabled, self.selected, false);
+        paint_icon(ui.painter(), rect.center(), self.icon, color);
         action_tooltip(response, self.help)
     }
 }
@@ -395,10 +404,12 @@ impl<'a> ActionButton<'a> {
 impl egui::Widget for ActionButton<'_> {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
         let enabled = ui.is_enabled();
-        let font = egui::TextStyle::Button.resolve(ui.style());
-        let galley =
-            ui.painter()
-                .layout_no_wrap(self.label.to_owned(), font, ui.visuals().text_color());
+        let colors = crate::app_theme::palette(ui.ctx());
+        let galley = ui.painter().layout_no_wrap(
+            self.label.to_owned(),
+            egui::FontId::proportional(13.0),
+            colors.text,
+        );
         let width = if self.full_width {
             ui.available_width()
         } else {
@@ -409,30 +420,14 @@ impl egui::Widget for ActionButton<'_> {
             ui.spacing()
                 .interact_size
                 .y
-                .max(if self.full_width { 34.0 } else { 0.0 })
+                .max(ACTION_SIZE)
                 .max(galley.size().y + if self.full_width { 4.0 } else { 8.0 }),
         );
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
         response.widget_info(|| {
             egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, self.selected, self.label)
         });
-        let visuals = ui.style().interact_selectable(&response, self.selected);
-        if self.framed || self.selected || response.hovered() {
-            ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
-        }
-        if response.has_focus() {
-            ui.painter().rect_stroke(
-                rect.shrink(1.0),
-                4.0,
-                egui::Stroke::new(2.0, Color32::from_rgb(28, 79, 125)),
-                egui::StrokeKind::Inside,
-            );
-        }
-        let color = if enabled {
-            visuals.fg_stroke.color
-        } else {
-            Color32::from_gray(169)
-        };
+        let color = paint_action_state(ui, &response, enabled, self.selected, self.framed);
         paint_icon(
             ui.painter(),
             Pos2::new(rect.left() + 16.0, rect.center().y),
@@ -443,10 +438,16 @@ impl egui::Widget for ActionButton<'_> {
             Pos2::new(rect.left() + 32.0, rect.top()),
             rect.max - Vec2::new(5.0, 0.0),
         );
-        ui.painter_at(text_rect).galley(
+        ui.painter_at(text_rect).galley_with_override_text_color(
             Pos2::new(text_rect.left(), rect.center().y - galley.size().y / 2.0),
             galley,
-            color,
+            if !enabled {
+                colors.disabled
+            } else if self.selected {
+                colors.accent
+            } else {
+                colors.text
+            },
         );
         response.on_hover_text(self.label)
     }
@@ -487,27 +488,27 @@ pub fn paint_pin(painter: &egui::Painter, center: Pos2, size: f32, color: Color3
     let point = |x, y| center + Vec2::new(x, y) * scale;
     let stroke = egui::Stroke::new(1.5 * scale, color);
     let outline = [
-        (-3.5, -7.0),
-        (3.5, -7.0),
-        (3.5, -5.0),
-        (2.0, -5.0),
+        (-3.25, -6.5),
+        (3.25, -6.5),
+        (3.25, -4.75),
+        (2.0, -4.75),
         (2.0, -1.0),
-        (5.0, 2.0),
-        (-5.0, 2.0),
+        (4.75, 2.0),
+        (-4.75, 2.0),
         (-2.0, -1.0),
-        (-2.0, -5.0),
-        (-3.5, -5.0),
+        (-2.0, -4.75),
+        (-3.25, -4.75),
     ];
     painter.add(egui::Shape::closed_line(
         outline.into_iter().map(|(x, y)| point(x, y)).collect(),
         stroke,
     ));
-    painter.line_segment([point(0.0, 2.0), point(0.0, 7.0)], stroke);
+    painter.line_segment([point(0.0, 2.0), point(0.0, 6.5)], stroke);
 }
 
 fn paint_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) {
     let p = |x, y| center + Vec2::new(x, y);
-    let stroke = egui::Stroke::new(1.7, color);
+    let stroke = egui::Stroke::new(1.5, color);
     let line = |points: &[(f32, f32)]| {
         painter.add(egui::Shape::line(
             points.iter().map(|&(x, y)| p(x, y)).collect(),
@@ -516,84 +517,88 @@ fn paint_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32)
     };
     match icon {
         Icon::AiDetect => {
-            painter.text(
-                center,
-                egui::Align2::CENTER_CENTER,
-                "AI",
-                egui::FontId::proportional(13.0),
-                color,
-            );
+            line(&[
+                (-1.5, -5.5),
+                (0.5, -1.5),
+                (4.5, 0.5),
+                (0.5, 2.5),
+                (-1.5, 6.5),
+                (-3.5, 2.5),
+                (-6.5, 0.5),
+                (-3.5, -1.5),
+                (-1.5, -5.5),
+            ]);
+            line(&[(4.5, -6.5), (4.5, -2.5)]);
+            line(&[(2.5, -4.5), (6.5, -4.5)]);
         }
         Icon::Filter => line(&[
-            (-9., -7.),
-            (9., -7.),
-            (3., 0.),
-            (3., 7.),
-            (-3., 9.),
-            (-3., 0.),
-            (-9., -7.),
+            (-6.5, -5.5),
+            (6.5, -5.5),
+            (2.0, -0.5),
+            (2.0, 5.0),
+            (-2.0, 6.5),
+            (-2.0, -0.5),
+            (-6.5, -5.5),
         ]),
         Icon::Open => line(&[
-            (-9., 7.),
-            (-9., -6.),
-            (-3., -6.),
-            (0., -3.),
-            (9., -3.),
-            (9., 7.),
-            (-9., 7.),
+            (-6.5, 5.0),
+            (-6.5, -5.0),
+            (-2.5, -5.0),
+            (0.0, -2.5),
+            (6.5, -2.5),
+            (6.5, 5.0),
+            (-6.5, 5.0),
         ]),
-        Icon::Previous => line(&[(3., -8.), (-4., 0.), (3., 8.)]),
-        Icon::Next => line(&[(-3., -8.), (4., 0.), (-3., 8.)]),
+        Icon::Previous => line(&[(2.5, -6.0), (-3.0, 0.0), (2.5, 6.0)]),
+        Icon::Next => line(&[(-2.5, -6.0), (3.0, 0.0), (-2.5, 6.0)]),
         Icon::Minus | Icon::Plus => {
-            line(&[(-7., 0.), (7., 0.)]);
+            line(&[(-5.5, 0.0), (5.5, 0.0)]);
             if icon == Icon::Plus {
-                line(&[(0., -7.), (0., 7.)]);
+                line(&[(0.0, -5.5), (0.0, 5.5)]);
             }
         }
         Icon::Fit => {
-            for (x, y) in [(-1., -1.), (1., -1.), (-1., 1.), (1., 1.)] {
-                line(&[(x * 3., y * 8.), (x * 8., y * 8.), (x * 8., y * 3.)]);
+            for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                line(&[(x * 2.5, y * 6.0), (x * 6.0, y * 6.0), (x * 6.0, y * 2.5)]);
             }
         }
         Icon::Actual => {
             painter.rect_stroke(
-                Rect::from_center_size(center, Vec2::new(21., 17.)),
-                3.0,
+                Rect::from_center_size(center, Vec2::new(16.0, 13.0)),
+                2.0,
                 stroke,
                 egui::StrokeKind::Inside,
             );
-            painter.text(
-                center,
-                egui::Align2::CENTER_CENTER,
-                "1:1",
-                egui::FontId::proportional(10.0),
-                color,
-            );
+            for x in [-3.5, 3.0] {
+                line(&[(x - 1.0, -1.5), (x, -2.5), (x, 2.5)]);
+            }
+            painter.circle_filled(p(0.0, -1.25), 0.6, color);
+            painter.circle_filled(p(0.0, 1.25), 0.6, color);
         }
         Icon::Rotate | Icon::RotateLeft => {
             let direction = if icon == Icon::RotateLeft { -1.0 } else { 1.0 };
             let points = (0..=24)
                 .map(|i| {
                     let a = 0.70 + i as f32 / 24.0 * 5.05;
-                    p(direction * a.cos() * 8.0, a.sin() * 8.0)
+                    p(direction * a.cos() * 5.75, a.sin() * 5.75)
                 })
                 .collect();
             painter.add(egui::Shape::line(points, stroke));
             line(&[
-                (direction * 1., -5.),
-                (direction * 7., -4.),
-                (direction * 7., -10.),
+                (direction * 1.0, -3.5),
+                (direction * 5.5, -3.0),
+                (direction * 5.5, -6.5),
             ]);
         }
         Icon::Undo => {
-            line(&[(-3., -8.), (-9., -2.), (-3., 4.)]);
+            line(&[(-2.5, -5.5), (-6.5, -1.5), (-2.5, 2.5)]);
             line(&[
-                (-9., -2.),
-                (2., -2.),
-                (5., -1.),
-                (7., 2.),
-                (7., 5.),
-                (5., 8.),
+                (-6.5, -1.5),
+                (0.0, -1.5),
+                (3.0, 0.0),
+                (4.5, 2.0),
+                (4.5, 4.0),
+                (3.0, 6.0),
             ]);
         }
         Icon::Refresh => {
@@ -601,138 +606,168 @@ fn paint_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32)
                 let points = (0..=12)
                     .map(|i| {
                         let a = -2.8 + i as f32 / 12.0 * 2.5;
-                        p(direction * a.cos() * 7.5, direction * a.sin() * 7.5)
+                        p(direction * a.cos() * 5.5, direction * a.sin() * 5.5)
                     })
                     .collect();
                 painter.add(egui::Shape::line(points, stroke));
                 line(&[
-                    (direction * 2.5, direction * -3.),
-                    (direction * 7.5, direction * -2.),
-                    (direction * 8.5, direction * -7.),
+                    (direction * 1.5, direction * -2.0),
+                    (direction * 5.5, direction * -1.5),
+                    (direction * 6.5, direction * -5.0),
                 ]);
             }
         }
         Icon::Locate => {
-            painter.circle_stroke(center, 6.0, stroke);
-            painter.circle_filled(center, 1.8, color);
+            painter.circle_stroke(center, 4.0, stroke);
+            painter.circle_filled(center, 1.2, color);
             for direction in [-1.0, 1.0] {
-                line(&[(direction * 6., 0.), (direction * 10., 0.)]);
-                line(&[(0., direction * 6.), (0., direction * 10.)]);
+                line(&[(direction * 4.0, 0.0), (direction * 7.0, 0.0)]);
+                line(&[(0.0, direction * 4.0), (0.0, direction * 7.0)]);
             }
         }
         Icon::Restore => {
-            line(&[(-8., -1.), (-8., 8.), (8., 8.), (8., -8.), (-1., -8.)]);
-            line(&[(-5., 5.), (-1., 1.), (2., 4.), (4., 2.), (6., 5.)]);
-            line(&[(-4., -11.), (-8., -7.), (-4., -3.)]);
-            line(&[(-8., -7.), (-1., -7.)]);
+            line(&[
+                (-6.0, -0.5),
+                (-6.0, 6.0),
+                (6.0, 6.0),
+                (6.0, -6.0),
+                (-0.5, -6.0),
+            ]);
+            line(&[(-3.5, 3.5), (-0.5, 0.5), (2.0, 3.0), (3.0, 1.5), (4.5, 3.5)]);
+            line(&[(-3.0, -7.0), (-6.0, -4.0), (-3.0, -1.0)]);
+            line(&[(-6.0, -4.0), (-0.5, -4.0)]);
         }
         Icon::Recheck => {
             line(&[
-                (0., -10.),
-                (8., -7.),
-                (7., 2.),
-                (4., 7.),
-                (0., 10.),
-                (-4., 7.),
-                (-7., 2.),
-                (-8., -7.),
-                (0., -10.),
+                (0.0, -6.5),
+                (5.5, -4.5),
+                (4.5, 1.5),
+                (2.5, 4.5),
+                (0.0, 6.5),
+                (-2.5, 4.5),
+                (-4.5, 1.5),
+                (-5.5, -4.5),
+                (0.0, -6.5),
             ]);
-            line(&[(-4., -1.), (-1., 3.), (4., -3.)]);
+            line(&[(-2.5, -0.5), (-0.5, 2.0), (3.0, -2.0)]);
         }
         Icon::CropApply => {
-            line(&[(-5., -10.), (-5., 3.), (1., 3.)]);
-            line(&[(-10., -5.), (3., -5.), (3., 0.)]);
-            line(&[(1., 7.), (4., 10.), (10., 3.)]);
+            line(&[(-3.5, -6.5), (-3.5, 2.0), (0.5, 2.0)]);
+            line(&[(-6.5, -3.5), (2.0, -3.5), (2.0, 0.0)]);
+            line(&[(0.5, 4.5), (2.5, 6.5), (6.5, 2.0)]);
         }
         Icon::ResizeApply => {
-            line(&[(9., -2.), (9., -9.), (-9., -9.), (-9., 9.), (-2., 9.)]);
-            line(&[(-5., 3.), (4., -6.)]);
-            line(&[(-1., -6.), (4., -6.), (4., -1.)]);
-            line(&[(1., 7.), (4., 10.), (10., 3.)]);
+            line(&[
+                (6.0, -1.5),
+                (6.0, -6.0),
+                (-6.0, -6.0),
+                (-6.0, 6.0),
+                (-1.5, 6.0),
+            ]);
+            line(&[(-3.5, 2.0), (2.5, -4.0)]);
+            line(&[(-0.5, -4.0), (2.5, -4.0), (2.5, -1.0)]);
+            line(&[(0.5, 4.5), (2.5, 6.5), (6.5, 2.0)]);
         }
         Icon::Export => {
-            line(&[(-8., 1.), (-8., 8.), (8., 8.), (8., 1.)]);
-            line(&[(0., 3.), (0., -8.)]);
-            line(&[(-4., -4.), (0., -8.), (4., -4.)]);
+            line(&[(-6.0, 0.5), (-6.0, 6.0), (6.0, 6.0), (6.0, 0.5)]);
+            line(&[(0.0, 2.0), (0.0, -6.5)]);
+            line(&[(-3.5, -3.0), (0.0, -6.5), (3.5, -3.0)]);
         }
         Icon::Copy => {
-            line(&[(-5., 4.), (-9., 4.), (-9., -9.), (4., -9.), (4., -5.)]);
-            line(&[(-4., -4.), (9., -4.), (9., 9.), (-4., 9.), (-4., -4.)]);
+            line(&[
+                (-3.5, 3.0),
+                (-6.5, 3.0),
+                (-6.5, -6.5),
+                (3.0, -6.5),
+                (3.0, -3.5),
+            ]);
+            line(&[
+                (-3.0, -3.0),
+                (6.5, -3.0),
+                (6.5, 6.5),
+                (-3.0, 6.5),
+                (-3.0, -3.0),
+            ]);
         }
-        Icon::Pin => paint_pin(painter, center, 20.0, color),
+        Icon::Pin => paint_pin(painter, center, 16.0, color),
         Icon::Paste => {
             line(&[
-                (-4., -7.),
-                (-8., -7.),
-                (-8., 9.),
-                (8., 9.),
-                (8., -7.),
-                (4., -7.),
+                (-3.0, -5.0),
+                (-5.5, -5.0),
+                (-5.5, 6.5),
+                (5.5, 6.5),
+                (5.5, -5.0),
+                (3.0, -5.0),
             ]);
-            line(&[(-4., -10.), (4., -10.), (4., -5.), (-4., -5.), (-4., -10.)]);
-            line(&[(-4., 0.), (4., 0.)]);
-            line(&[(-4., 4.), (2., 4.)]);
+            line(&[
+                (-3.0, -6.5),
+                (3.0, -6.5),
+                (3.0, -3.5),
+                (-3.0, -3.5),
+                (-3.0, -6.5),
+            ]);
+            line(&[(-2.5, 0.0), (2.5, 0.0)]);
+            line(&[(-2.5, 3.0), (1.5, 3.0)]);
         }
         Icon::FitWidth => {
-            line(&[(-9., -8.), (-9., 8.)]);
-            line(&[(9., -8.), (9., 8.)]);
-            line(&[(-6., 0.), (6., 0.)]);
-            line(&[(-2., -4.), (-6., 0.), (-2., 4.)]);
-            line(&[(2., -4.), (6., 0.), (2., 4.)]);
+            line(&[(-6.5, -5.5), (-6.5, 5.5)]);
+            line(&[(6.5, -5.5), (6.5, 5.5)]);
+            line(&[(-4.0, 0.0), (4.0, 0.0)]);
+            line(&[(-1.0, -3.0), (-4.0, 0.0), (-1.0, 3.0)]);
+            line(&[(1.0, -3.0), (4.0, 0.0), (1.0, 3.0)]);
         }
-        Icon::Play => line(&[(-5., -8.), (8., 0.), (-5., 8.), (-5., -8.)]),
+        Icon::Play => line(&[(-4.0, -6.0), (5.5, 0.0), (-4.0, 6.0), (-4.0, -6.0)]),
         Icon::Pause => {
-            line(&[(-6., -8.), (-6., 8.)]);
-            line(&[(6., -8.), (6., 8.)]);
+            line(&[(-3.5, -6.0), (-3.5, 6.0)]);
+            line(&[(3.5, -6.0), (3.5, 6.0)]);
         }
         Icon::Step => {
-            line(&[(-8., -8.), (4., 0.), (-8., 8.), (-8., -8.)]);
-            line(&[(8., -8.), (8., 8.)]);
+            line(&[(-5.5, -6.0), (2.5, 0.0), (-5.5, 6.0), (-5.5, -6.0)]);
+            line(&[(5.5, -6.0), (5.5, 6.0)]);
         }
         Icon::Restart => {
             let points = (0..=24)
                 .map(|i| {
                     let a = -2.3 + i as f32 / 24.0 * 5.2;
-                    p(a.cos() * 9.0, a.sin() * 9.0)
+                    p(a.cos() * 6.0, a.sin() * 6.0)
                 })
                 .collect();
             painter.add(egui::Shape::line(points, stroke));
-            line(&[(-6., -10.), (-6., -6.), (-2., -6.)]);
-            line(&[(-2., -3.), (3., 0.), (-2., 3.), (-2., -3.)]);
+            line(&[(-4.0, -6.5), (-4.0, -4.0), (-1.0, -4.0)]);
+            line(&[(-1.5, -2.5), (2.5, 0.0), (-1.5, 2.5), (-1.5, -2.5)]);
         }
         Icon::List => {
-            for y in [-6.0, 0.0, 6.0] {
-                painter.circle_filled(p(-7.0, y), 1.2, color);
-                line(&[(-2.0, y), (8.0, y)]);
+            for y in [-4.5, 0.0, 4.5] {
+                painter.circle_filled(p(-5.5, y), 1.0, color);
+                line(&[(-1.5, y), (6.5, y)]);
             }
         }
         Icon::Crop => {
-            line(&[(-5.0, -10.0), (-5.0, 5.0), (10.0, 5.0)]);
-            line(&[(-10.0, -5.0), (5.0, -5.0), (5.0, 10.0)]);
+            line(&[(-3.5, -6.5), (-3.5, 3.5), (6.5, 3.5)]);
+            line(&[(-6.5, -3.5), (3.5, -3.5), (3.5, 6.5)]);
         }
         Icon::Info => {
-            painter.circle_stroke(center, 8.5, stroke);
-            painter.circle_filled(p(0.0, -4.0), 1.0, color);
-            line(&[(0.0, -0.5), (0.0, 5.0)]);
+            painter.circle_stroke(center, 6.5, stroke);
+            painter.circle_filled(p(0.0, -3.0), 0.8, color);
+            line(&[(0.0, -0.5), (0.0, 3.5)]);
         }
         Icon::Fullscreen => {
             for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                line(&[(x * 3.0, y * 8.0), (x * 8.0, y * 8.0), (x * 8.0, y * 3.0)]);
-                line(&[(x * 3.0, y * 3.0), (x * 8.0, y * 8.0)]);
+                line(&[(x * 2.5, y * 6.0), (x * 6.0, y * 6.0), (x * 6.0, y * 2.5)]);
+                line(&[(x * 2.5, y * 2.5), (x * 6.0, y * 6.0)]);
             }
         }
         Icon::Flip => {
-            line(&[(-3.0, -7.0), (-9.0, 7.0), (-3.0, 7.0), (-3.0, -7.0)]);
-            line(&[(3.0, -7.0), (9.0, 7.0), (3.0, 7.0), (3.0, -7.0)]);
+            line(&[(-2.0, -5.0), (-6.5, 5.0), (-2.0, 5.0), (-2.0, -5.0)]);
+            line(&[(2.0, -5.0), (6.5, 5.0), (2.0, 5.0), (2.0, -5.0)]);
         }
         Icon::Close => {
-            line(&[(-6.0, -6.0), (6.0, 6.0)]);
-            line(&[(-6.0, 6.0), (6.0, -6.0)]);
+            line(&[(-4.5, -4.5), (4.5, 4.5)]);
+            line(&[(-4.5, 4.5), (4.5, -4.5)]);
         }
         Icon::More => {
-            for x in [-6., 0., 6.] {
-                painter.circle_filled(p(x, 0.), 1.5, color);
+            for x in [-5.0, 0.0, 5.0] {
+                painter.circle_filled(p(x, 0.0), 1.1, color);
             }
         }
     }
@@ -989,6 +1024,8 @@ mod tests {
         ] {
             let area = Rect::from_min_size(Pos2::new(0., 498.), Vec2::new(width, TOOLBAR_HEIGHT));
             let layout = ToolbarLayout::new(area);
+            assert!(area.contains_rect(layout.island));
+            assert_eq!(layout.island.height(), 40.0);
             let buttons: Vec<_> = layout
                 .buttons
                 .iter()
@@ -997,11 +1034,14 @@ mod tests {
                 .collect();
             for rect in &buttons {
                 assert!(area.contains_rect(*rect), "width={width}, rect={rect:?}");
-                assert!(rect.width() >= 32.0);
+                assert!(layout.island.contains_rect(*rect));
+                assert_eq!(rect.width(), ACTION_SIZE);
                 assert_eq!(rect.width(), rect.height());
                 assert!(rect.left() >= area.left() + 12.0);
                 assert!(rect.right() <= area.right() - 12.0);
             }
+            assert!((buttons[0].left() - layout.island.left() - 8.0).abs() < 0.001);
+            assert!((layout.island.right() - buttons.last().unwrap().right() - 8.0).abs() < 0.001);
             for pair in buttons.windows(2) {
                 assert!(pair[0].right() + 4.0 <= pair[1].left());
                 assert_eq!(pair[0].center().y, pair[1].center().y);
@@ -1015,15 +1055,16 @@ mod tests {
                     "separator must be between visible buttons"
                 );
             }
-            assert_eq!(layout.metadata.is_some(), width >= 960.0);
+            let metadata_space = layout.island.left() - area.left() - 24.0;
+            assert_eq!(layout.metadata.is_some(), metadata_space >= 48.0);
             if let Some(metadata) = layout.metadata {
                 assert!(area.contains_rect(metadata));
-                assert!(metadata.right() < layout.buttons[0].left());
+                assert!(metadata.right() + 12.0 <= layout.island.left());
             }
             if let Some(zoom) = layout.zoom {
                 assert!(area.contains_rect(zoom));
                 assert!(zoom.width() >= 64.0);
-                assert!(zoom.left() > layout.buttons[BUTTON_COUNT - 1].right());
+                assert!(zoom.left() >= layout.island.right() + 12.0);
             }
         }
     }
@@ -1080,6 +1121,7 @@ mod tests {
                 let expected = ToolbarLayout::new(area);
                 assert_eq!(actual.buttons, expected.buttons);
                 assert_eq!(actual.visible, expected.visible);
+                assert_eq!(actual.island, expected.island);
                 for (rect, visible) in actual.buttons.iter().zip(actual.visible) {
                     if visible {
                         assert!(rect.width() * pixels_per_point >= 32.0 * pixels_per_point);
@@ -1090,7 +1132,7 @@ mod tests {
         }
     }
     #[test]
-    fn menu_actions_have_34_point_rows_and_accessible_labels() {
+    fn menu_actions_have_32_point_rows_and_accessible_labels() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut response = None;
@@ -1100,7 +1142,7 @@ mod tests {
         });
         output.textures_delta.clear();
         let response = response.unwrap();
-        assert!(response.rect.height() >= 34.0);
+        assert!(response.rect.height() >= 32.0);
         assert_eq!(response.rect.width(), 236.0);
         assert!(texts(&output).iter().any(|s| s == "从剪贴板打开 · Ctrl+V"));
         let node = &output
@@ -1148,7 +1190,76 @@ mod tests {
         assert!(response.has_focus());
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::Rect(rect) if rect.stroke.width == 2.0
-                && rect.stroke.color == Color32::from_rgb(28, 79, 125))));
+                && rect.stroke.color == crate::app_theme::palette(&ctx).accent)));
+    }
+
+    #[test]
+    fn compact_theme_colors_keep_the_same_hit_target() {
+        let mut targets = Vec::new();
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_theme(if dark {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            });
+            ctx.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            let (output, response) = compact_frame(&ctx, 240.0, true, true, 0.0, vec![]);
+            targets.push(response.rect);
+            let colors = crate::app_theme::palette(&ctx);
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Rect(rect) if rect.fill == colors.selected)));
+        }
+        assert_eq!(targets[0], targets[1]);
+    }
+
+    #[test]
+    fn command_glyphs_fit_their_sixteen_point_canvas_without_text() {
+        let ctx = egui::Context::default();
+        let center = Pos2::new(40.0, 40.0);
+        let area = Rect::from_center_size(center, Vec2::splat(16.0));
+        for icon in Icon::ALL.into_iter().chain([
+            Icon::List,
+            Icon::Crop,
+            Icon::Info,
+            Icon::RotateLeft,
+            Icon::Fullscreen,
+            Icon::Flip,
+            Icon::Refresh,
+            Icon::Locate,
+            Icon::Restore,
+            Icon::Recheck,
+            Icon::CropApply,
+            Icon::ResizeApply,
+            Icon::Close,
+            Icon::Copy,
+            Icon::Pin,
+            Icon::Paste,
+            Icon::FitWidth,
+            Icon::Play,
+            Icon::Pause,
+            Icon::Step,
+            Icon::Restart,
+            Icon::Filter,
+            Icon::AiDetect,
+        ]) {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                paint_icon(ui.painter(), center, icon, Color32::BLACK);
+            });
+            output.textures_delta.clear();
+            assert!(texts(&output).is_empty(), "text glyph for {icon:?}");
+            let bounds = output.shapes.iter().fold(Rect::NOTHING, |bounds, shape| {
+                bounds.union(shape.shape.visual_bounding_rect())
+            });
+            assert!(
+                area.contains_rect(bounds),
+                "out-of-bounds {icon:?}: {bounds:?}"
+            );
+        }
     }
     #[test]
     fn checker_uses_twelve_point_cells() {
@@ -1201,13 +1312,10 @@ mod tests {
         let ctx = egui::Context::default();
         for size in [16.0, 20.0] {
             let center = Pos2::new(50.0, 50.0);
-            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                if size == 20.0 {
-                    paint_icon(ui.painter(), center, Icon::Pin, Color32::BLACK);
-                } else {
-                    paint_pin(ui.painter(), center, size, Color32::BLACK);
-                }
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                paint_pin(ui.painter(), center, size, Color32::BLACK);
             });
+            output.textures_delta.clear();
             let outline = output
                 .shapes
                 .iter()
@@ -1251,7 +1359,7 @@ mod tests {
                     bounds.union(shape.shape.visual_bounding_rect())
                 });
             assert!(bounds.center().distance(center) < 0.001);
-            assert!((bounds.height() / size - 15.5 / 16.0).abs() < 0.001);
+            assert!((bounds.height() / size - 14.5 / 16.0).abs() < 0.001);
         }
     }
 }

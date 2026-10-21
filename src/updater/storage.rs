@@ -103,34 +103,24 @@ pub fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 pub fn persist_replace(temp: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    persist(temp, path, true)
+}
+pub fn persist_new(temp: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    persist(temp, path, false)
+}
+fn persist(temp: tempfile::NamedTempFile, path: &Path, replace: bool) -> Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        };
-        let source: Vec<u16> = temp
-            .path()
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        if unsafe {
-            MoveFileExW(
-                source.as_ptr(),
-                destination.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        super::private_publish::rename_same_directory(temp.as_file(), temp.path(), path, replace)?;
         drop(temp);
     }
     #[cfg(not(windows))]
     {
-        temp.persist(path).map_err(|e| e.error)?;
+        if replace {
+            temp.persist(path).map_err(|e| e.error)?;
+        } else {
+            temp.persist_noclobber(path).map_err(|e| e.error)?;
+        }
     }
     Ok(())
 }
@@ -138,7 +128,7 @@ pub fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
     #[cfg(not(unix))]
-    let _ = path; // Windows writes use MoveFileExW(MOVEFILE_WRITE_THROUGH).
+    let _ = path; // Windows publication flushes its write-through file handle.
     Ok(())
 }
 pub fn hash_file(path: &Path) -> Result<(u64, String)> {

@@ -58,38 +58,46 @@ fn button(ui: &mut egui::Ui, rect: Rect, icon: ChromeIcon, label: &str) -> egui:
         ui.ctx()
             .data_mut(|data| data.insert_temp(egui::Id::new("viewer-command-focus"), response.id));
     }
-    let close_hover = matches!(icon, ChromeIcon::Close) && response.hovered();
-    let green = Color32::from_rgb(43, 103, 78);
-    let color = if !ui.is_enabled() {
-        Color32::from_gray(176)
-    } else if close_hover {
-        Color32::WHITE
-    } else if matches!(icon, ChromeIcon::Pin | ChromeIcon::List(true)) {
-        green
+    let colors = crate::app_theme::palette(ui.ctx());
+    let enabled = ui.is_enabled();
+    let selected = matches!(icon, ChromeIcon::List(true));
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let hovered = enabled && response.hovered();
+    let close_active = matches!(icon, ChromeIcon::Close) && (hovered || pressed);
+    let color = if !enabled {
+        colors.disabled
+    } else if close_active {
+        colors.error
+    } else if selected {
+        colors.accent
     } else {
-        Color32::from_rgb(94, 108, 100)
+        colors.icon
     };
-    if response.hovered() || response.has_focus() || matches!(icon, ChromeIcon::List(true)) {
+    if hovered || pressed || selected {
         ui.painter().rect_filled(
             rect,
-            5.0,
-            if close_hover {
-                Color32::from_rgb(190, 64, 64)
+            6.0,
+            if close_active {
+                colors.error_bg
+            } else if pressed {
+                colors.pressed
+            } else if selected {
+                colors.selected
             } else {
-                Color32::from_rgb(228, 237, 231)
+                colors.hover
             },
         );
     }
-    if response.has_focus() {
+    if enabled && response.has_focus() {
         ui.painter().rect_stroke(
             rect.shrink(1.0),
-            5.0,
-            egui::Stroke::new(1.0, green),
+            6.0,
+            egui::Stroke::new(2.0, colors.accent),
             egui::StrokeKind::Inside,
         );
     }
     let p = |x, y| rect.center() + Vec2::new(x, y);
-    let stroke = egui::Stroke::new(1.25, color);
+    let stroke = egui::Stroke::new(1.5, color);
     let line = |points: &[(f32, f32)]| {
         ui.painter().add(egui::Shape::line(
             points.iter().map(|&(x, y)| p(x, y)).collect(),
@@ -101,13 +109,13 @@ fn button(ui: &mut egui::Ui, rect: Rect, icon: ChromeIcon, label: &str) -> egui:
             let outline = Rect::from_center_size(rect.center(), Vec2::splat(16.0));
             ui.painter()
                 .rect_stroke(outline, 2.0, stroke, egui::StrokeKind::Inside);
-            line(&[(-3.0, -6.75), (-3.0, 6.75)]);
+            line(&[(-2.5, -6.0), (-2.5, 6.0)]);
         }
         ChromeIcon::Pin => viewer_ui::paint_pin(ui.painter(), rect.center(), 16.0, color),
-        ChromeIcon::Minimize => line(&[(-4.5, 0.0), (4.5, 0.0)]),
+        ChromeIcon::Minimize => line(&[(-5.0, 0.0), (5.0, 0.0)]),
         ChromeIcon::Maximize(maximized) => {
             if maximized {
-                line(&[(-2.0, -4.5), (4.5, -4.5), (4.5, 2.0)]);
+                line(&[(-2.5, -5.0), (5.0, -5.0), (5.0, 2.5)]);
             }
             ui.painter().rect_stroke(
                 Rect::from_center_size(
@@ -115,7 +123,7 @@ fn button(ui: &mut egui::Ui, rect: Rect, icon: ChromeIcon, label: &str) -> egui:
                         if maximized { -1.0 } else { 0.0 },
                         if maximized { 1.0 } else { 0.0 },
                     ),
-                    Vec2::splat(8.0),
+                    Vec2::splat(10.0),
                 ),
                 0.5,
                 stroke,
@@ -123,11 +131,16 @@ fn button(ui: &mut egui::Ui, rect: Rect, icon: ChromeIcon, label: &str) -> egui:
             );
         }
         ChromeIcon::Close => {
-            line(&[(-4.0, -4.0), (4.0, 4.0)]);
-            line(&[(4.0, -4.0), (-4.0, 4.0)]);
+            line(&[(-4.5, -4.5), (4.5, 4.5)]);
+            line(&[(4.5, -4.5), (-4.5, 4.5)]);
         }
     }
-    response.on_hover_text(label)
+    if response.has_focus() {
+        response.show_tooltip_text(label);
+        response
+    } else {
+        response.on_hover_text(label)
+    }
 }
 
 impl ImageApp {
@@ -137,9 +150,10 @@ impl ImageApp {
             return;
         }
         let maximized = ctx.input(|input| input.viewport().maximized == Some(true));
+        let colors = crate::app_theme::palette(&ctx);
         egui::Panel::top("viewer-window-chrome")
             .exact_size(HEIGHT)
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(249, 251, 249)))
+            .frame(egui::Frame::NONE.fill(colors.window))
             .show(ui, |ui| {
                 let area = ui.max_rect();
                 let control_x = area.right() - BUTTON * 4.0 - 16.0;
@@ -196,7 +210,7 @@ impl ImageApp {
                 let galley = ui.painter().layout_no_wrap(
                     title.clone(),
                     egui::FontId::proportional(13.0),
-                    Color32::from_rgb(58, 73, 65),
+                    colors.text,
                 );
                 let title_rect = Rect::from_min_size(
                     Pos2::new(area.left() + TITLE_LEFT, area.top() + 4.0),
@@ -208,13 +222,9 @@ impl ImageApp {
                 }
                 let response = ui.put(
                     title_rect,
-                    egui::Label::new(
-                        egui::RichText::new(title)
-                            .size(13.0)
-                            .color(Color32::from_rgb(58, 73, 65)),
-                    )
-                    .truncate()
-                    .sense(egui::Sense::click_and_drag()),
+                    egui::Label::new(egui::RichText::new(title).size(13.0).color(colors.text))
+                        .truncate()
+                        .sense(egui::Sense::click_and_drag()),
                 );
                 if response.has_focus() {
                     ctx.data_mut(|data| {
@@ -265,7 +275,7 @@ impl ImageApp {
                         Pos2::new(control_x + BUTTON - 1.0, y + 7.0),
                         Pos2::new(control_x + BUTTON - 1.0, y + BUTTON - 7.0),
                     ],
-                    egui::Stroke::new(1.0, Color32::from_rgb(222, 230, 224)),
+                    egui::Stroke::new(1.0, colors.separator),
                 );
                 if button(ui, rect(1), ChromeIcon::Minimize, "最小化").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -290,7 +300,7 @@ impl ImageApp {
                 ui.painter().hline(
                     area.x_range(),
                     area.bottom() - 0.5,
-                    egui::Stroke::new(1.0, Color32::from_rgb(225, 232, 227)),
+                    egui::Stroke::new(1.0, colors.separator),
                 );
             });
     }
@@ -307,7 +317,7 @@ impl ImageApp {
         painter.rect_stroke(
             rect.shrink(0.5),
             0.0,
-            egui::Stroke::new(1.0, Color32::from_rgb(202, 214, 206)),
+            egui::Stroke::new(1.0, crate::app_theme::palette(ctx).border),
             egui::StrokeKind::Inside,
         );
         use egui::viewport::ResizeDirection as D;
@@ -507,12 +517,13 @@ mod tests {
         for selected in [false, true] {
             let ctx = egui::Context::default();
             let rect = Rect::from_center_size(Pos2::new(50.0, 50.0), Vec2::splat(BUTTON));
-            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 assert_eq!(
                     button(ui, rect, ChromeIcon::List(selected), "图片列表").rect,
                     rect
                 );
             });
+            output.textures_delta.clear();
             let outlines: Vec<_> = output
                 .shapes
                 .iter()
@@ -542,9 +553,10 @@ mod tests {
         let ctx = egui::Context::default();
         let rect = Rect::from_center_size(Pos2::new(50.0, 50.0), Vec2::splat(BUTTON));
         let mut target = None;
-        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             target = Some(button(ui, rect, ChromeIcon::Pin, "贴图置顶").rect);
         });
+        output.textures_delta.clear();
         assert_eq!(target.unwrap().size(), Vec2::splat(28.0));
         let bounds = output
             .shapes
@@ -590,6 +602,7 @@ mod tests {
                 },
                 |ui| app.window_edges(ui.ctx()),
             );
+            output.textures_delta.clear();
             assert_eq!(
                 output.viewport_output[&egui::ViewportId::ROOT]
                     .commands
@@ -597,7 +610,6 @@ mod tests {
                     .any(|c| matches!(c, egui::ViewportCommand::BeginResize(_))),
                 expected
             );
-            output.textures_delta.clear();
         }
     }
 }

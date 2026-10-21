@@ -75,9 +75,19 @@ pub enum FormatFilter {
     Png,
     Gif,
     WebP,
+    Bmp,
+    Ico,
 }
 impl FormatFilter {
-    pub const ALL: [Self; 5] = [Self::All, Self::Jpeg, Self::Png, Self::Gif, Self::WebP];
+    pub const ALL: [Self; 7] = [
+        Self::All,
+        Self::Jpeg,
+        Self::Png,
+        Self::Gif,
+        Self::WebP,
+        Self::Bmp,
+        Self::Ico,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             Self::All => "全部格式",
@@ -85,6 +95,8 @@ impl FormatFilter {
             Self::Png => "PNG",
             Self::Gif => "GIF",
             Self::WebP => "WebP",
+            Self::Bmp => "BMP",
+            Self::Ico => "ICO",
         }
     }
     pub fn matches(self, path: &Path) -> bool {
@@ -100,6 +112,8 @@ impl FormatFilter {
             Self::Png => extension.eq_ignore_ascii_case("png"),
             Self::Gif => extension.eq_ignore_ascii_case("gif"),
             Self::WebP => extension.eq_ignore_ascii_case("webp"),
+            Self::Bmp => extension.eq_ignore_ascii_case("bmp"),
+            Self::Ico => extension.eq_ignore_ascii_case("ico"),
         }
     }
 }
@@ -257,7 +271,7 @@ pub fn supported(path: &Path) -> bool {
     path.extension().is_some_and(|e| {
         matches!(
             e.to_string_lossy().to_ascii_lowercase().as_str(),
-            "jpg" | "jpeg" | "png" | "gif" | "webp"
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "ico"
         )
     })
 }
@@ -350,11 +364,24 @@ pub struct Response<T> {
     pub path: PathBuf,
     pub result: Result<T>,
 }
-#[derive(Default)]
-struct State {
-    pending: Option<Request>,
+type RequestOperation<T> = Box<dyn FnOnce(&Path, &Cancellation) -> Result<T> + Send + 'static>;
+struct QueuedRequest<T> {
+    request: Request,
+    operation: Option<RequestOperation<T>>,
+}
+struct State<T> {
+    pending: Option<QueuedRequest<T>>,
     active: Option<Cancellation>,
     shutdown: bool,
+}
+impl<T> Default for State<T> {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            active: None,
+            shutdown: false,
+        }
+    }
 }
 
 /// Measured cooperative shutdown, not a deadline or an interruption guarantee.
@@ -370,7 +397,7 @@ pub struct ShutdownReport {
 type ResultSlot<T> = Arc<Mutex<Option<(Cancellation, Response<T>)>>>;
 
 pub struct Worker<T> {
-    shared: Arc<(Mutex<State>, Condvar)>,
+    shared: Arc<(Mutex<State<T>>, Condvar)>,
     output: ResultSlot<T>,
     thread: Option<JoinHandle<()>>,
     name: String,
@@ -392,7 +419,7 @@ impl<T: Send + 'static> Worker<T> {
         name: &str,
         mut operation: impl FnMut(&Path, &Cancellation) -> Result<T> + Send + 'static,
     ) -> Self {
-        let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
+        let shared = Arc::new((Mutex::new(State::<T>::default()), Condvar::new()));
         let output = Arc::new(Mutex::new(None));
         let input = shared.clone();
         let result = output.clone();
@@ -400,7 +427,10 @@ impl<T: Send + 'static> Worker<T> {
             .name(name.into())
             .spawn(move || {
                 loop {
-                    let request = {
+                    let QueuedRequest {
+                        request,
+                        operation: request_operation,
+                    } = {
                         let (lock, wake) = &*input;
                         let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
                         while state.pending.is_none() && !state.shutdown {
@@ -410,12 +440,15 @@ impl<T: Send + 'static> Worker<T> {
                             break;
                         }
                         let request = state.pending.take().unwrap();
-                        state.active = Some(request.cancel.clone());
+                        state.active = Some(request.request.cancel.clone());
                         request
                     };
                     let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         request.cancel.check()?;
-                        let value = operation(&request.path, &request.cancel)?;
+                        let value = match request_operation {
+                            Some(operation) => operation(&request.path, &request.cancel),
+                            None => operation(&request.path, &request.cancel),
+                        }?;
                         request.cancel.check()?;
                         Ok(value)
                     }))
@@ -450,17 +483,35 @@ impl<T: Send + 'static> Worker<T> {
 }
 impl<T> Worker<T> {
     pub fn request(&self, request: Request) {
+        self.enqueue(QueuedRequest {
+            request,
+            operation: None,
+        });
+    }
+    /// Run one request-specific operation on the existing worker thread. Its
+    /// captured data is owned by this request and discarded on replacement.
+    pub fn request_with_operation(
+        &self,
+        request: Request,
+        operation: impl FnOnce(&Path, &Cancellation) -> Result<T> + Send + 'static,
+    ) {
+        self.enqueue(QueuedRequest {
+            request,
+            operation: Some(Box::new(operation)),
+        });
+    }
+    fn enqueue(&self, queued: QueuedRequest<T>) {
         let (lock, wake) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
         if state.shutdown {
-            request.cancel.cancel();
+            queued.request.cancel.cancel();
             return;
         }
         if let Some(active) = &state.active {
             active.cancel();
         }
-        if let Some(old) = state.pending.replace(request) {
-            old.cancel.cancel();
+        if let Some(old) = state.pending.replace(queued) {
+            old.request.cancel.cancel();
         }
         self.output
             .lock()
@@ -502,7 +553,7 @@ impl<T> Worker<T> {
             active.cancel();
         }
         if let Some(pending) = state.pending.take() {
-            pending.cancel.cancel();
+            pending.request.cancel.cancel();
         }
         self.output
             .lock()
@@ -531,7 +582,7 @@ impl<T> Worker<T> {
             }
             let pending = state.pending.take();
             if let Some(request) = &pending {
-                request.cancel.cancel();
+                request.request.cancel.cancel();
             }
             let discarded = self
                 .output
@@ -568,7 +619,7 @@ impl<T> Drop for Worker<T> {
 mod tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
         mpsc,
     };
 
@@ -701,7 +752,27 @@ mod tests {
         assert!(FormatFilter::Png.matches(Path::new("image.PNG")));
         assert!(FormatFilter::Gif.matches(Path::new("image.GIF")));
         assert!(FormatFilter::WebP.matches(Path::new("image.WeBp")));
+        assert!(FormatFilter::Bmp.matches(Path::new("image.BmP")));
+        assert!(FormatFilter::Ico.matches(Path::new("image.ICO")));
+        assert!(!FormatFilter::Bmp.matches(Path::new("image.ico")));
+        assert!(!FormatFilter::Ico.matches(Path::new("image.bmp")));
         assert!(FormatFilter::All.matches(Path::new("new-file")));
+    }
+
+    #[test]
+    fn supported_extensions_include_bitmap_and_icon_without_accepting_containers() {
+        for extension in ["jpg", "JPEG", "png", "GIF", "WebP", "BmP", "ICO"] {
+            assert!(supported(Path::new(&format!("image.{extension}"))));
+        }
+        for name in [
+            "image",
+            "image.cur",
+            "image.svg",
+            "image.tiff",
+            "image.bmp.exe",
+        ] {
+            assert!(!supported(Path::new(name)), "{name}");
+        }
     }
 
     #[test]
@@ -755,6 +826,99 @@ mod tests {
         assert_eq!(result.result.unwrap(), Path::new("501"));
         assert!(worker.take_result().is_none());
         assert!(!worker.shutdown().join_panicked);
+    }
+
+    #[test]
+    fn request_operation_consumes_owned_data_and_preserves_the_default_operation() {
+        let mut default_calls = 0;
+        let mut worker = Worker::start("request-operation-test", move |path, _| {
+            default_calls += 1;
+            Ok((
+                format!("default-{default_calls}-{}", path.display()),
+                thread::current().id(),
+            ))
+        });
+        let owned = String::from("selected-entry");
+        worker.request_with_operation(request(1), move |path, cancel| {
+            cancel.check()?;
+            let entry = owned;
+            Ok((
+                format!("{entry}-{}", path.display()),
+                thread::current().id(),
+            ))
+        });
+        let first = wait_result(&worker).result.unwrap();
+        assert_eq!(first.0, "selected-entry-1");
+        assert_ne!(first.1, thread::current().id());
+        for generation in 2..=3 {
+            worker.request(request(generation));
+            let result = wait_result(&worker).result.unwrap();
+            assert_eq!(result.0, format!("default-{}-{generation}", generation - 1));
+            assert_eq!(
+                result.1, first.1,
+                "all requests reuse the same worker thread"
+            );
+        }
+        assert!(!worker.shutdown().join_panicked);
+    }
+
+    #[test]
+    fn replaced_request_operations_are_cancelled_and_their_captures_are_reclaimed() {
+        struct OwnedCapture(Arc<AtomicUsize>);
+        impl Drop for OwnedCapture {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, AtomicOrdering::AcqRel);
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut worker = Worker::start("request-operation-replacement-test", |_, _| Ok(0_u64));
+        let first = request(1);
+        let active_cancel = first.cancel.clone();
+        worker.request_with_operation(first, move |_, _| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(1)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let executed = Arc::new(AtomicUsize::new(0));
+        let mut tokens = Vec::new();
+        for generation in 2..=501 {
+            let queued = request(generation);
+            tokens.push(queued.cancel.clone());
+            let owned = OwnedCapture(dropped.clone());
+            let executed = executed.clone();
+            worker.request_with_operation(queued, move |_, _| {
+                let _owned = owned;
+                executed.fetch_add(1, AtomicOrdering::AcqRel);
+                Ok(generation)
+            });
+        }
+        assert!(active_cancel.check().is_err());
+        assert!(tokens[..499].iter().all(|token| token.check().is_err()));
+        assert!(tokens[499].check().is_ok());
+        assert_eq!(dropped.load(AtomicOrdering::Acquire), 499);
+        release_tx.send(()).unwrap();
+        let result = wait_result(&worker);
+        assert_eq!(result.generation, 501);
+        assert_eq!(result.result.unwrap(), 501);
+        assert_eq!(executed.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(dropped.load(AtomicOrdering::Acquire), 500);
+        assert!(!worker.shutdown().join_panicked);
+
+        let rejected = request(502);
+        let cancelled = rejected.cancel.clone();
+        let owned = OwnedCapture(dropped.clone());
+        worker.request_with_operation(rejected, move |_, _| {
+            let _owned = owned;
+            panic!("a shut-down worker cannot execute an override");
+        });
+        assert!(cancelled.check().is_err());
+        assert_eq!(dropped.load(AtomicOrdering::Acquire), 501);
+        assert!(!worker.is_busy());
     }
 
     #[test]
@@ -950,7 +1114,9 @@ mod tests {
             "中 文.jpg",
             "image10.WeBp",
             "image2.GIF",
-            "ignore.bmp",
+            "bitmap.BmP",
+            "icon.ICO",
+            "ignore.cur",
             "ignore.txt",
         ] {
             std::fs::write(dir.path().join(name), b"fixture").unwrap();
@@ -958,8 +1124,10 @@ mod tests {
         std::fs::create_dir(dir.path().join("folder.png")).unwrap();
         let source = dir.path().join("z.PNG");
         let listing = scan(&source, &Cancellation::default()).unwrap();
-        assert_eq!(listing.paths.len(), 5);
+        assert_eq!(listing.paths.len(), 7);
         assert_eq!(listing.paths[0].file_name().unwrap(), "a.jpeg");
+        assert!(listing.paths.contains(&dir.path().join("bitmap.BmP")));
+        assert!(listing.paths.contains(&dir.path().join("icon.ICO")));
         assert!(!listing.truncated);
         let cancel = Cancellation::default();
         cancel.cancel();
@@ -988,5 +1156,29 @@ mod tests {
         assert!(thumb.width() <= THUMBNAIL_EDGE && thumb.height() <= THUMBNAIL_EDGE);
         assert!(thumb.pixels().all(|p| p[3] == 0));
         assert!(thumbnail(&dir.path().join("missing.png"), &Cancellation::default()).is_err());
+    }
+
+    #[test]
+    fn bitmap_and_icon_thumbnails_use_the_bounded_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, color) in [
+            ("bitmap.BMP", [21, 43, 65, 255]),
+            ("icon.ICO", [21, 43, 65, 128]),
+        ] {
+            let path = dir.path().join(name);
+            image::RgbaImage::from_pixel(128, 64, image::Rgba(color))
+                .save(&path)
+                .unwrap();
+            let thumb = thumbnail(&path, &Cancellation::default()).unwrap();
+            assert_eq!(thumb.dimensions(), (THUMBNAIL_EDGE, THUMBNAIL_EDGE / 2));
+            assert!(thumb.pixels().all(|pixel| pixel.0 == color));
+
+            let cancel = Cancellation::default();
+            cancel.cancel();
+            assert!(matches!(
+                thumbnail(&path, &cancel),
+                Err(ToolError::Cancelled)
+            ));
+        }
     }
 }

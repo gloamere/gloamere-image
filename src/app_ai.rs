@@ -591,6 +591,7 @@ impl ImageApp {
         }
     }
     pub(super) fn ai_details(&mut self, ui: &mut egui::Ui) {
+        let colors = crate::app_theme::palette(ui.ctx());
         ui.heading("AI 检测");
         let path = self.loaded.as_ref().map(|image| image.path.clone());
         if let Some(path) = path {
@@ -611,7 +612,7 @@ impl ImageApp {
             }
             if decision.conflict {
                 ui.colored_label(
-                    Color32::from_rgb(158, 76, 15),
+                    colors.warning,
                     "人工决定或自动证据存在冲突；下方保留各项原始依据。",
                 );
             }
@@ -644,7 +645,7 @@ impl ImageApp {
                         ui.small(format!("模型：{}", model.fingerprint));
                         if !model.approved {
                             ui.colored_label(
-                                Color32::from_rgb(158, 76, 15),
+                                colors.warning,
                                 "模型尚未通过正式发布的验证标准；结果仅为实验信号，不能证明来源。",
                             );
                         }
@@ -801,6 +802,7 @@ impl ImageApp {
         }
     }
     pub(super) fn ai_canvas_overlay(&mut self, ui: &mut egui::Ui, area: Rect) {
+        let colors = crate::app_theme::palette(ui.ctx());
         #[cfg(test)]
         {
             self.ai_view.badge_rect = None;
@@ -847,7 +849,7 @@ impl ImageApp {
                     ui.painter().rect_stroke(
                         rect,
                         5.0,
-                        egui::Stroke::new(2.0, Color32::from_rgb(28, 79, 125)),
+                        egui::Stroke::new(2.0, colors.accent),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -872,8 +874,7 @@ impl ImageApp {
                 area.left_bottom() + Vec2::new(12.0, -70.0),
                 Vec2::new((area.width() - 24.0).clamp(0.0, 400.0), 34.0),
             );
-            ui.painter()
-                .rect_filled(rect, 5.0, Color32::from_white_alpha(235));
+            ui.painter().rect_filled(rect, 5.0, colors.popover);
             ui.put(
                 rect,
                 egui::Label::new("已不符合当前筛选 · 主动翻图时进入结果集").truncate(),

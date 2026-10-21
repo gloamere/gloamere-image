@@ -512,10 +512,10 @@ pub(super) fn local_path(text: &str) -> ClipboardResult<PathBuf> {
         .map(|(_, ext)| ext.to_ascii_lowercase());
     if !matches!(
         ext.as_deref(),
-        Some("jpg" | "jpeg" | "png" | "gif" | "webp")
+        Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "ico")
     ) {
         return Err(ClipboardError::UnsupportedData(
-            "路径必须明确指向 JPEG、PNG、GIF 或 WebP 图片",
+            "路径必须明确指向 JPEG、PNG、GIF、WebP、BMP 或 ICO 图片",
         ));
     }
     Ok(PathBuf::from(text.replace('/', "\\")))

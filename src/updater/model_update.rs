@@ -42,7 +42,7 @@ fn cancelled(cancel: &CancellationToken) -> Result<()> {
 
 fn ensure_private_directory(root: &Path) -> Result<()> {
     storage::plain_path(root)?;
-    fs::create_dir_all(root)?;
+    let _pins = super::platform::ensure_private_data_directory(root)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -976,6 +976,7 @@ fn promote_directory(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::updater::test_support::{self, fs};
     use zip::write::SimpleFileOptions;
     fn tiny_archive(
         path: &Path,
@@ -1021,7 +1022,7 @@ mod tests {
     }
     #[test]
     fn exact_flat_bounded_zip_extracts_but_untrusted_bytes_never_validate() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir().unwrap();
         let path = dir.path().join("pack.zip");
         let (_, _, total) = tiny_archive(&path, None, false, false);
         let stage = tempfile::tempdir_in(dir.path()).unwrap();
@@ -1040,7 +1041,7 @@ mod tests {
             "unknown.dll",
             "C:\\evil.dll",
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = test_support::tempdir().unwrap();
             let path = dir.path().join("pack.zip");
             let (_, _, total) =
                 tiny_archive(&path, Some(("manifest.json", replacement)), false, false);
@@ -1048,7 +1049,7 @@ mod tests {
             assert!(unpack_fixture(&path, stage.path(), total, &CancellationToken::new()).is_err());
             assert!(!dir.path().join("escape.bin").exists());
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir().unwrap();
         let path = dir.path().join("pack.zip");
         let (_, _, total) = tiny_archive(&path, None, true, false);
         let stage = tempfile::tempdir_in(dir.path()).unwrap();
@@ -1056,7 +1057,7 @@ mod tests {
     }
     #[test]
     fn encrypted_flags_duplicate_names_and_expansion_budgets_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir().unwrap();
         let original = dir.path().join("pack.zip");
         let (_, _, total) = tiny_archive(&original, None, false, false);
         let baseline = fs::read(&original).unwrap();
@@ -1116,7 +1117,7 @@ mod tests {
     }
     #[test]
     fn header_rejects_count_comment_trailing_bytes_and_zip64_budget() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir().unwrap();
         let path = dir.path().join("pack.zip");
         tiny_archive(&path, None, false, true);
         assert!(bounded_zip_header(&mut File::open(&path).unwrap(), inventory().len()).is_err());
@@ -1139,7 +1140,7 @@ mod tests {
     }
     #[test]
     fn cancelled_extraction_and_hash_mismatch_publish_no_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir().unwrap();
         let path = dir.path().join("pack.zip");
         let (length, _, total) = tiny_archive(&path, None, false, false);
         let stage = tempfile::tempdir_in(dir.path()).unwrap();
@@ -1167,7 +1168,7 @@ mod tests {
         InstalledModel,
         InstalledModel,
     ) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir().unwrap();
         let root = dir.path().join("ai-model");
         fs::create_dir(&root).unwrap();
         let updates = dir.path().join("updates");
@@ -1295,7 +1296,7 @@ mod tests {
     }
     #[test]
     fn explicit_cancel_cleans_only_exact_partial_files_after_lock_release() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir().unwrap();
         let archive = dir.path().join("1-trusted.zip");
         for name in [
             "1-trusted.zip.part",

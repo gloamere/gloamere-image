@@ -271,7 +271,7 @@ mod tests {
     }
 
     fn draw(app: &mut ImageApp, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
-        ctx.run_ui(
+        let mut output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 720.0))),
                 events,
@@ -282,7 +282,9 @@ mod tests {
                     ui.allocate_exact_size(Vec2::new(780.0, 700.0), egui::Sense::click_and_drag());
                 response.context_menu(|ui| app.canvas_context_menu(ui));
             },
-        )
+        );
+        output.textures_delta.clear();
+        output
     }
 
     fn open_menu(app: &mut ImageApp, ctx: &egui::Context) -> egui::FullOutput {

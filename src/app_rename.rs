@@ -366,7 +366,7 @@ impl ImageApp {
                 format!("保留扩展名：{}", dialog.extension)
             });
             if let Some(error) = &dialog.error {
-                ui.colored_label(Color32::from_rgb(178, 45, 45), error);
+                ui.colored_label(crate::app_theme::palette(ui.ctx()).error, error);
             }
             if busy {
                 ui.horizontal(|ui| {

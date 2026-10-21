@@ -8,6 +8,8 @@ mod chrome_ui;
 mod comparison_ui;
 #[path = "app_context_menu.rs"]
 mod context_menu_ui;
+#[path = "app_icon.rs"]
+mod icon_ui;
 #[path = "app_inspector.rs"]
 mod inspector_ui;
 #[path = "app_menu.rs"]
@@ -18,6 +20,7 @@ mod rename_ui;
 mod stickers_ui;
 #[path = "app_update.rs"]
 mod update_ui;
+use crate::app_theme;
 use crate::viewer_ui::{self, ActionButton, CompactAction, Icon, ToolbarLayout};
 use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
 use light_image_tool::{
@@ -30,7 +33,7 @@ use light_image_tool::{
     export::{self, ExportFormat, ExportOptions},
     pipeline::LoadedImage,
     provenance::{self, CheckState, EvidenceCache, EvidenceReport, EvidenceState},
-    settings::{self, CanvasBackground, Preferences},
+    settings::{self, Appearance, CanvasBackground, Preferences},
     worker::{LoadRequest, Loader},
 };
 use std::{
@@ -59,7 +62,10 @@ fn accessible_path_input(ui: &mut egui::Ui, text: &mut String, name: &str, width
         })
     });
     if too_long {
-        ui.colored_label(Color32::from_rgb(178, 45, 45), "路径超过 Windows 长度限制");
+        ui.colored_label(
+            app_theme::palette(ui.ctx()).error,
+            "路径超过 Windows 长度限制",
+        );
     }
     ui.add(egui::TextEdit::singleline(text).id(id).desired_width(width));
 }
@@ -77,9 +83,17 @@ enum DocumentSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PendingIntent {
     Open(PathBuf),
+    OpenIconEntry(PathBuf, usize),
+    ReloadIcon(PathBuf, [u32; 2], u16),
     Clipboard,
     Restore,
     Close,
+}
+
+#[derive(Clone, Copy)]
+enum IconLoad {
+    Entry(usize),
+    Reload([u32; 2], u16),
 }
 
 enum WorkResult {
@@ -262,6 +276,8 @@ pub struct Smoke {
     pub jpeg_preview: bool,
     pub crop_preview: bool,
     pub background: Option<CanvasBackground>,
+    pub appearance: Option<Appearance>,
+    pub icon_entry: Option<usize>,
     pub hide_list: bool,
     pub compare_image: Option<PathBuf>,
     pub inspect_pixels: bool,
@@ -310,6 +326,8 @@ impl Smoke {
             jpeg_preview: false,
             crop_preview: false,
             background: None,
+            appearance: None,
+            icon_entry: None,
             hide_list: true,
             compare_image: None,
             inspect_pixels: false,
@@ -516,23 +534,7 @@ fn configure_with_font_candidates(ctx: &egui::Context, candidates: &[&str]) -> O
         }
     }
     ctx.set_fonts(fonts);
-    ctx.set_theme(egui::ThemePreference::Light);
-    ctx.set_visuals(egui::Visuals::light());
-    ctx.global_style_mut(|s| {
-        s.spacing.item_spacing = Vec2::new(8.0, 8.0);
-        s.spacing.button_padding = Vec2::new(10.0, 6.0);
-        s.spacing.interact_size.y = 34.0;
-        s.text_styles
-            .insert(egui::TextStyle::Small, egui::FontId::proportional(13.0));
-        s.text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
-        s.text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
-        s.visuals.weak_text_color = Some(Color32::from_gray(104));
-        s.visuals.panel_fill = Color32::WHITE;
-        s.visuals.selection.bg_fill = Color32::from_rgb(217, 234, 248);
-        s.visuals.selection.stroke.color = Color32::from_rgb(33, 84, 128);
-    });
+    app_theme::configure(ctx);
     selected
 }
 
@@ -599,6 +601,8 @@ impl ImageApp {
             app.ai_sync_scope();
             app.load_session_preferences();
         }
+        cc.egui_ctx
+            .set_theme(app_theme::preference(app.preferences.appearance));
         app
     }
     fn cancel_background(&mut self) {
@@ -806,6 +810,9 @@ impl ImageApp {
             if let Some(background) = smoke.background {
                 app.preferences.background = background;
             }
+            if let Some(appearance) = smoke.appearance {
+                app.preferences.appearance = appearance;
+            }
             app.preferences.list_visible = !smoke.hide_list;
             app.more_open = smoke.show_more;
         }
@@ -816,7 +823,11 @@ impl ImageApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         if let Some(path) = initial {
-            app.open(path);
+            if let Some(index) = app.smoke.as_ref().and_then(|smoke| smoke.icon_entry) {
+                app.open_with_icon_entry(path, Some(index));
+            } else {
+                app.open(path);
+            }
         }
         app
     }
@@ -879,17 +890,47 @@ impl ImageApp {
             .or_else(|| self.loaded.as_ref().map(|l| l.pixels.clone()))
     }
     fn open(&mut self, path: PathBuf) {
+        self.open_or_request(path, None);
+    }
+    fn open_or_request(&mut self, path: PathBuf, icon_entry: Option<IconLoad>) {
         if self.shutting_down || self.pending_intent.is_some() || self.rename.blocks_document() {
             return;
         }
         if self.unsaved() {
-            self.pending_intent = Some(PendingIntent::Open(path));
+            self.pending_intent = Some(match icon_entry {
+                Some(IconLoad::Entry(index)) => PendingIntent::OpenIconEntry(path, index),
+                Some(IconLoad::Reload(dimensions, bit_depth)) => {
+                    PendingIntent::ReloadIcon(path, dimensions, bit_depth)
+                }
+                None => PendingIntent::Open(path),
+            });
             self.pending_focus = true;
             return;
         }
-        self.open_now(path);
+        self.open_with_icon_request(path, icon_entry);
     }
     fn open_now(&mut self, path: PathBuf) {
+        self.open_with_icon_entry(path, None);
+    }
+    fn select_icon_entry(&mut self, index: usize) {
+        if self.loading || self.work.is_some() {
+            return;
+        }
+        let Some(image) = &self.loaded else {
+            return;
+        };
+        let Some(icon) = &image.icon else {
+            return;
+        };
+        if index >= icon.entries.len() || index == icon.selected_index {
+            return;
+        }
+        self.open_or_request(image.path.clone(), Some(IconLoad::Entry(index)));
+    }
+    fn open_with_icon_entry(&mut self, path: PathBuf, icon_entry: Option<usize>) {
+        self.open_with_icon_request(path, icon_entry.map(IconLoad::Entry));
+    }
+    fn open_with_icon_request(&mut self, path: PathBuf, icon_entry: Option<IconLoad>) {
         if self.rename.blocks_document() {
             return;
         }
@@ -923,11 +964,19 @@ impl ImageApp {
             "正在打开 {}",
             path.file_name().unwrap_or_default().to_string_lossy()
         );
-        self.loader.request(LoadRequest {
+        let request = LoadRequest {
             generation: self.generation,
             path,
             cancel: self.load_cancel.clone(),
-        });
+        };
+        match icon_entry {
+            Some(IconLoad::Entry(index)) => self.loader.request_icon_entry(request, index),
+            Some(IconLoad::Reload(dimensions, bit_depth)) => {
+                self.loader
+                    .request_icon_reload(request, dimensions, bit_depth);
+            }
+            None => self.loader.request(request),
+        }
     }
     fn load_feedback(&self, now: Instant) -> Option<String> {
         if !self.loading
@@ -961,6 +1010,12 @@ impl ImageApp {
         }
         match intent {
             PendingIntent::Open(path) => self.open_now(path),
+            PendingIntent::OpenIconEntry(path, index) => {
+                self.open_with_icon_entry(path, Some(index));
+            }
+            PendingIntent::ReloadIcon(path, dimensions, bit_depth) => {
+                self.open_with_icon_request(path, Some(IconLoad::Reload(dimensions, bit_depth)));
+            }
             PendingIntent::Clipboard => self.open_clipboard_now(ctx),
             PendingIntent::Restore => {
                 self.pixels = self.original_pixels();
@@ -1205,8 +1260,8 @@ impl ImageApp {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("gloamere-image · 打开图片")
             .add_filter(
-                "JPEG / PNG / GIF / WebP",
-                &["jpg", "jpeg", "png", "gif", "webp"],
+                "JPEG / PNG / GIF / WebP / BMP / ICO",
+                &["jpg", "jpeg", "png", "gif", "webp", "bmp", "ico"],
             )
             .pick_file()
         {
@@ -1418,6 +1473,26 @@ impl ImageApp {
                 .map(|error| format!("设置未保存，本次仍可使用：{error}"));
         }
     }
+    fn set_appearance(&mut self, ctx: &egui::Context, appearance: Appearance) {
+        if self.preferences.appearance == appearance {
+            return;
+        }
+        self.preferences.appearance = appearance;
+        ctx.set_theme(app_theme::preference(appearance));
+        self.save_preferences();
+        ctx.request_repaint();
+    }
+    fn canvas_colors(
+        &self,
+        ctx: &egui::Context,
+    ) -> (settings::Rgb, Option<settings::CheckerColors>) {
+        if self.preferences.background == CanvasBackground::Automatic {
+            let color = app_theme::palette(ctx).canvas;
+            ([color.r(), color.g(), color.b()], None)
+        } else {
+            self.preferences.background.colors()
+        }
+    }
     fn load_session_preferences(&mut self) {
         if let Some(path) = &self.settings_path {
             match settings::load(path) {
@@ -1546,14 +1621,15 @@ impl ImageApp {
         });
     }
     fn image_list(&mut self, ui: &mut egui::Ui) {
+        let colors = app_theme::palette(ui.ctx());
         let count = self.ai_visible_indices().len();
         let mut hide = false;
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("同目录图片")
-                    .size(14.0)
+                    .size(13.0)
                     .strong()
-                    .color(Color32::from_rgb(49, 73, 58)),
+                    .color(colors.text),
             );
             ui.weak(if count == self.siblings.len() {
                 format!("{count} 张")
@@ -1576,14 +1652,10 @@ impl ImageApp {
             ui.weak("正在读取目录…");
         }
         if let Some(warning) = &self.directory_warning {
-            ui.label(
-                egui::RichText::new(warning)
-                    .small()
-                    .color(Color32::from_rgb(150, 91, 16)),
-            );
+            ui.label(egui::RichText::new(warning).small().color(colors.warning));
         }
         ui.add_space(4.0);
-        let row_height = 62.0;
+        let row_height = 60.0;
         let mut scroll = egui::ScrollArea::vertical()
             .animated(false)
             .stick_to_bottom(indices.last() == Some(&self.position))
@@ -1620,41 +1692,34 @@ impl ImageApp {
                     self.selected_list_row_rect = Some(rect);
                 }
                 let fill = if selected {
-                    Color32::from_rgb(229, 238, 231)
+                    colors.selected
                 } else if response.hovered() {
-                    Color32::from_rgb(235, 241, 236)
+                    colors.hover
                 } else {
                     Color32::TRANSPARENT
                 };
                 ui.painter().rect_filled(rect, 5.0, fill);
                 if selected {
-                    ui.painter().rect_stroke(
-                        rect,
-                        5.0,
-                        egui::Stroke::new(1.0, Color32::from_rgb(174, 199, 181)),
-                        egui::StrokeKind::Inside,
-                    );
                     ui.painter().rect_filled(
                         Rect::from_min_size(
-                            rect.min + Vec2::new(0.0, 4.0),
-                            Vec2::new(3.0, row_height - 8.0),
+                            rect.left_center() - Vec2::new(0.0, 12.0),
+                            Vec2::new(2.0, 24.0),
                         ),
-                        1.5,
-                        Color32::from_rgb(43, 103, 78),
+                        1.0,
+                        colors.accent,
                     );
                 }
                 if response.has_focus() {
                     ui.painter().rect_stroke(
                         rect,
                         5.0,
-                        egui::Stroke::new(1.5, Color32::from_rgb(43, 103, 78)),
+                        egui::Stroke::new(1.5, colors.accent),
                         egui::StrokeKind::Inside,
                     );
                 }
                 let image_rect =
-                    Rect::from_min_size(rect.min + Vec2::new(9.0, 8.0), Vec2::splat(46.0));
-                ui.painter()
-                    .rect_filled(image_rect, 3.0, Color32::from_rgb(228, 234, 230));
+                    Rect::from_min_size(rect.min + Vec2::new(9.0, 7.0), Vec2::splat(46.0));
+                ui.painter().rect_filled(image_rect, 3.0, colors.hover);
                 if let Some(entry) = self
                     .thumbnail_cache
                     .iter_mut()
@@ -1686,7 +1751,7 @@ impl ImageApp {
                             egui::Align2::CENTER_CENTER,
                             "!",
                             egui::FontId::proportional(18.0),
-                            Color32::from_gray(110),
+                            colors.muted,
                         );
                     }
                 } else if request.is_none() {
@@ -1712,12 +1777,8 @@ impl ImageApp {
                 );
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 let text_painter = ui.painter().with_clip_rect(text_rect);
-                let name_color = if selected {
-                    Color32::from_rgb(35, 82, 61)
-                } else {
-                    Color32::from_rgb(49, 63, 55)
-                };
-                let mut title = egui::RichText::new(&*name).size(14.0).color(name_color);
+                let name_color = if selected { colors.accent } else { colors.text };
+                let mut title = egui::RichText::new(&*name).size(13.0).color(name_color);
                 if selected {
                     title = title.strong();
                 }
@@ -1738,7 +1799,7 @@ impl ImageApp {
                     egui::Align2::LEFT_TOP,
                     format!("{} / {} · {format}", index + 1, self.siblings.len()),
                     egui::FontId::proportional(12.0),
-                    Color32::from_rgb(112, 128, 117),
+                    colors.muted,
                 );
                 response.widget_info(|| {
                     egui::WidgetInfo::selected(
@@ -2157,7 +2218,7 @@ impl ImageApp {
                 self.status = if self.loaded.is_some() {
                     "打开失败；上一张图片仍可查看"
                 } else {
-                    "打开失败；请选择另一张 JPEG / PNG / GIF / WebP 图片"
+                    "打开失败；请选择另一张 JPEG / PNG / GIF / WebP / BMP / ICO 图片"
                 }
                 .into();
             }
@@ -2746,8 +2807,33 @@ impl ImageApp {
         }
         self.save_preferences();
     }
+    fn toolbar_metadata(&self, compact: bool) -> String {
+        let Some(image) = &self.loaded else {
+            return "JPEG / PNG / GIF / WebP / BMP / ICO".into();
+        };
+        // Navigation selects its target before decoding; metadata follows the
+        // image that is still visible until the new image is committed.
+        let sequence = self
+            .siblings
+            .iter()
+            .position(|path| path == &image.path)
+            .map(|index| format!("{} / {}", index + 1, self.siblings.len()));
+        let edited = if self.edited { " · 已编辑" } else { "" };
+        if compact && let Some(sequence) = &sequence {
+            return format!("{sequence}{edited}");
+        }
+        let [w, h] = self.dimensions();
+        let size = if image.file_bytes >= 1024 * 1024 {
+            format!("{:.1} MB", image.file_bytes as f64 / 1048576.0)
+        } else {
+            format!("{} KB", image.file_bytes.div_ceil(1024))
+        };
+        let prefix = sequence.map_or_else(String::new, |sequence| format!("{sequence} · "));
+        format!("{prefix}{w} × {h} · {size}{edited}")
+    }
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let colors = app_theme::palette(&ctx);
         let ready = self.pixels.is_some() && !self.loading && self.work.is_none();
         let modal = self.path_dialog
             || self.export_dialog
@@ -2760,35 +2846,28 @@ impl ImageApp {
             egui::Sense::hover(),
         );
         let layout = ToolbarLayout::new(area);
-        ui.painter().line_segment(
-            [area.left_top(), area.right_top()],
-            egui::Stroke::new(1.0, Color32::from_gray(231)),
+        ui.painter().rect(
+            layout.island,
+            8.0,
+            colors.toolbar,
+            egui::Stroke::new(1.0, colors.border),
+            egui::StrokeKind::Inside,
         );
         if let Some(rect) = layout.metadata {
-            let text = if let Some(image) = &self.loaded {
-                let [w, h] = self.dimensions();
-                let size = if image.file_bytes >= 1024 * 1024 {
-                    format!("{:.1} MB", image.file_bytes as f64 / 1048576.0)
-                } else {
-                    format!("{} KB", image.file_bytes.div_ceil(1024))
-                };
-                format!("{w} × {h}  ·  {size}")
-            } else {
-                "JPEG / PNG / GIF / WebP".into()
-            };
+            let text = self.toolbar_metadata(rect.width() < 270.0);
             viewer_ui::edge_label(ui, rect, &text, false).on_hover_text(text);
         }
         if let Some(rect) = layout.zoom {
             viewer_ui::edge_label(ui, rect, &format!("{:.0}%", self.zoom * 100.0), true)
                 .on_hover_text("实际显示比例 · 1 为实际像素，F 适应窗口");
         }
-        for x in &layout.separators {
+        for x in layout.separators.iter().take(1) {
             ui.painter().line_segment(
                 [
-                    Pos2::new(*x, area.center().y - 11.0),
-                    Pos2::new(*x, area.center().y + 11.0),
+                    Pos2::new(*x, area.center().y - 8.0),
+                    Pos2::new(*x, area.center().y + 8.0),
                 ],
-                egui::Stroke::new(1.0, Color32::from_gray(225)),
+                egui::Stroke::new(1.0, colors.separator),
             );
         }
         for (index, icon) in Icon::ALL.into_iter().enumerate() {
@@ -2844,6 +2923,32 @@ impl ImageApp {
         }
         self.toolbar_layout = Some(layout);
     }
+    fn bottom_controls(&mut self, ui: &mut egui::Ui) {
+        if self.toolbar_hidden {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        let (background, _) = self.canvas_colors(&ctx);
+        egui::Panel::bottom("viewer-toolbar")
+            .exact_size(viewer_ui::TOOLBAR_HEIGHT)
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(
+                background[0],
+                background[1],
+                background[2],
+            )))
+            .show(ui, |ui| {
+                if self.rename.blocks_document() {
+                    ui.disable();
+                }
+                self.toolbar(ui)
+            });
+        if self.playback.is_some() {
+            egui::Panel::bottom("animation-controls")
+                .exact_size(44.0)
+                .frame(egui::Frame::NONE.fill(app_theme::palette(&ctx).window))
+                .show(ui, |ui| self.playback_controls(ui));
+        }
+    }
     fn more_menu(&mut self, ctx: &egui::Context) {
         let newly_opened = self.menu_rect.is_none();
         self.menu_rect = None;
@@ -2891,15 +2996,17 @@ impl ImageApp {
                     .interact_pos()
                     .is_some_and(|pos| self.more_button_rect.is_some_and(|rect| rect.contains(pos)))
         });
-        let outside = ctx.input(|input| {
-            input.pointer.any_pressed()
-                && input.pointer.interact_pos().is_some_and(|pos| {
-                    !output.response.rect.contains(pos)
-                        && !self.more_button_rect.is_some_and(|rect| rect.contains(pos))
-                })
-        });
+        let outside = !egui::Popup::is_any_open(ctx)
+            && ctx.input(|input| {
+                (input.pointer.any_pressed() || input.pointer.any_click())
+                    && input.pointer.interact_pos().is_some_and(|pos| {
+                        !output.response.rect.contains(pos)
+                            && !self.more_button_rect.is_some_and(|rect| rect.contains(pos))
+                    })
+            });
         if close || outside || trigger_pressed {
             self.more_open = false;
+            egui::Popup::close_all(ctx);
             self.more_trigger_release_blocked = trigger_pressed;
             ctx.memory_mut(|memory| memory.request_focus(viewer_ui::icon_id(Icon::More)));
         }
@@ -2974,6 +3081,7 @@ impl ImageApp {
             if !self.editing {
                 ui.label(egui::RichText::new(self.document_name()).strong());
                 ui.label(format!("{w} × {h} 像素"));
+                self.icon_size_selector(ui);
                 ui.separator();
                 self.ai_details(ui);
                 ui.separator();
@@ -3001,7 +3109,7 @@ impl ImageApp {
                     ui.label(format!("EXIF 方向：{}（已应用）", image.orientation));
                     ui.label(&image.color_status);
                     for warning in &image.warnings {
-                        ui.colored_label(Color32::from_rgb(150, 91, 16), warning);
+                        ui.colored_label(app_theme::palette(ui.ctx()).warning, warning);
                     }
                 } else {
                     ui.label(&self.temporary_color_status);
@@ -3148,7 +3256,7 @@ impl ImageApp {
                 ui.heading("来源证据");
                 if self.edited {
                     ui.colored_label(
-                        Color32::from_rgb(150, 91, 16),
+                        app_theme::palette(ui.ctx()).warning,
                         "编辑副本：原图签名不适用于当前像素",
                     );
                 }
@@ -3179,7 +3287,7 @@ impl ImageApp {
         } else {
             ui.label("打开一张本地图片后，在这里核对尺寸、透明度与来源。");
             ui.separator();
-            ui.small("支持 JPEG / PNG / GIF / WebP");
+            ui.small("支持 JPEG / PNG / GIF / WebP / BMP / ICO");
             ui.small("单图最多 1600 万像素、64 MiB");
         }
     }
@@ -3233,7 +3341,8 @@ impl ImageApp {
         }
         let canvas_input = !menu_was_open && !egui::Popup::is_any_open(ui.ctx());
         let painter = ui.painter_at(area);
-        let (background, checker) = self.preferences.background.colors();
+        let colors = app_theme::palette(ui.ctx());
+        let (background, checker) = self.canvas_colors(ui.ctx());
         painter.rect_filled(
             area,
             0.0,
@@ -3242,10 +3351,8 @@ impl ImageApp {
         if let Some(colors) = checker {
             viewer_ui::paint_checker(&painter, area, colors);
         }
-        let dark_canvas = matches!(
-            self.preferences.background,
-            CanvasBackground::Dark | CanvasBackground::CheckerDark
-        );
+        let dark_canvas =
+            u32::from(background[0]) + u32::from(background[1]) + u32::from(background[2]) < 384;
         let text_color = if dark_canvas {
             Color32::from_gray(221)
         } else {
@@ -3287,13 +3394,13 @@ impl ImageApp {
                     area.height().min(86.0),
                 ),
             );
-            painter.rect_filled(panel, 6.0, Color32::from_rgb(248, 250, 249));
+            painter.rect_filled(panel, 6.0, colors.popover);
             painter.text(
                 panel.center() - Vec2::new(0.0, 20.0),
                 egui::Align2::CENTER_CENTER,
                 "画布上传未完成；未显示旧图片",
                 egui::FontId::proportional(15.0),
-                Color32::from_rgb(70, 80, 76),
+                colors.text,
             );
             let retry =
                 Rect::from_center_size(panel.center() + Vec2::new(0.0, 18.0), Vec2::splat(32.0));
@@ -3445,11 +3552,11 @@ impl ImageApp {
                 area.left_top() + Vec2::new(10.0, 10.0),
                 Vec2::new(if self.fit_width { 142.0 } else { 174.0 }, 26.0),
             );
-            painter.rect_filled(state_rect, 5.0, Color32::from_rgb(247, 250, 248));
+            painter.rect_filled(state_rect, 5.0, colors.popover);
             painter.rect_stroke(
                 state_rect,
                 5.0,
-                egui::Stroke::new(1.0, Color32::from_rgb(211, 219, 215)),
+                egui::Stroke::new(1.0, colors.border),
                 egui::StrokeKind::Inside,
             );
             painter.text(
@@ -3457,7 +3564,7 @@ impl ImageApp {
                 egui::Align2::CENTER_CENTER,
                 label,
                 egui::FontId::proportional(13.0),
-                Color32::from_rgb(44, 67, 58),
+                colors.text,
             );
             if max_scroll > 0.0 {
                 let rail = Rect::from_min_size(
@@ -3484,7 +3591,7 @@ impl ImageApp {
                         Vec2::new(18.0, thumb_height),
                     ),
                     4.0,
-                    Color32::from_rgb(36, 116, 94),
+                    colors.accent,
                 );
                 if canvas_input
                     && (response.clicked() || response.dragged())
@@ -3520,7 +3627,7 @@ impl ImageApp {
                     painter.rect_filled(shade, 0.0, Color32::from_black_alpha(150));
                 }
             }
-            let stroke = egui::Stroke::new(1.5, Color32::from_rgb(38, 108, 159));
+            let stroke = egui::Stroke::new(1.5, colors.accent);
             painter.rect_stroke(selection, 0.0, stroke, egui::StrokeKind::Inside);
             for fraction in [1.0 / 3.0, 2.0 / 3.0] {
                 let x = selection.min.x + selection.width() * fraction;
@@ -3546,11 +3653,11 @@ impl ImageApp {
                 area.left_top() + Vec2::splat(12.0),
                 Vec2::new((area.width() - 24.0).clamp(160.0, 370.0), 38.0),
             );
-            painter.rect_filled(warning_rect, 6.0, Color32::from_rgb(248, 250, 249));
+            painter.rect_filled(warning_rect, 6.0, colors.error_bg);
             painter.rect_stroke(
                 warning_rect,
                 6.0,
-                egui::Stroke::new(1.0, Color32::from_rgb(211, 219, 215)),
+                egui::Stroke::new(1.0, colors.border),
                 egui::StrokeKind::Inside,
             );
             painter.text(
@@ -3558,7 +3665,7 @@ impl ImageApp {
                 egui::Align2::CENTER_CENTER,
                 "打开失败；画面仍是上一张",
                 egui::FontId::proportional(15.0),
-                Color32::from_rgb(44, 67, 58),
+                colors.error,
             );
         }
     }
@@ -3793,7 +3900,7 @@ impl ImageApp {
                 .default_width(480.0)
                 .max_width((ctx.viewport_rect().width() - 32.0).max(200.0))
                 .show(ctx, |ui| {
-                    ui.label("粘贴或输入 JPEG / PNG / GIF / WebP 的本地完整路径");
+                    ui.label("粘贴或输入 JPEG / PNG / GIF / WebP / BMP / ICO 的本地完整路径");
                     accessible_path_input(
                         ui,
                         &mut self.open_path,
@@ -3937,6 +4044,10 @@ impl eframe::App for ImageApp {
         [0.0; 4]
     }
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let appearance = app_theme::preference(self.preferences.appearance);
+        if ctx.options(|options| options.theme_preference) != appearance {
+            ctx.set_theme(appearance);
+        }
         if self.smoke.is_some() {
             let screenshots = ctx.input(|input| {
                 input
@@ -4053,6 +4164,22 @@ impl eframe::App for ImageApp {
                     )?;
                     let mut report = serde_json::json!({"adapter":self.adapter,"image_dimensions":self.dimensions(),"image_loaded":self.loaded.is_some(),"error":self.error,"frames":self.frames,"elapsed_ms":self.start.elapsed().as_millis(),"ui_scale":smoke.scale,"ui_input_tested":false,"workflow":smoke.workflow_result,"idle_seconds":smoke.idle_seconds,"idle_frame_delta":smoke.idle_frames,"idle_focus_start":smoke.idle_focus_start,"idle_lost_focus":smoke.idle_lost_focus,"resident_estimate_bytes":self.resident_estimate(),"owned_budget_bytes":light_image_tool::memory::in_use(),"owned_budget_peak_bytes":light_image_tool::memory::peak(),"evidence":self.evidence});
                     report["browser"] = serde_json::json!({"list_visible":self.preferences.list_visible,"directory_count":self.siblings.len(),"position":self.position,"directory_scanning":self.directory_scanning,"warning":self.directory_warning,"thumbnail_cache_entries":self.thumbnail_cache.len(),"thumbnail_busy":self.thumbnail_busy.is_some(),"background":self.preferences.background});
+                    report["appearance"] = serde_json::json!({"preference":self.preferences.appearance,"effective":format!("{:?}",ctx.theme()),"canvas_colors":self.canvas_colors(ctx),"toolbar_island":self.toolbar_layout.as_ref().map(|layout|[layout.island.left(),layout.island.top(),layout.island.width(),layout.island.height()])});
+                    report["image_format"] = self
+                        .loaded
+                        .as_ref()
+                        .map(|image| format!("{:?}", image.format))
+                        .into();
+                    report["displayed_rgba_sha256"] = self
+                        .pixels
+                        .as_ref()
+                        .map(|pixels| {
+                            use sha2::Digest;
+                            format!("{:x}", sha2::Sha256::digest(pixels.as_raw()))
+                        })
+                        .into();
+                    report["icon"] = self.loaded.as_ref().and_then(|image| image.icon.as_ref()).map(|icon| serde_json::json!({"selected_index":icon.selected_index,"entries":icon.entries.iter().map(|entry| serde_json::json!({"index":entry.index,"width":entry.width,"height":entry.height,"bit_depth":entry.bit_depth,"encoding":entry.encoding.label()})).collect::<Vec<_>>()})).into();
+                    report["playback"] = self.playback.as_ref().map(|playback| serde_json::json!({"frame_index":playback.frame_index,"traversal":playback.traversal,"elapsed_ms":playback.elapsed.as_millis(),"frame_delay_ms":playback.frame_delay.as_millis(),"ended":playback.ended,"manual_paused":playback.manual_paused,"suspended":playback.suspended,"warning":playback.warning,"loop_policy":format!("{:?}",playback.source.loops)})).into();
                     report["window_chrome"] = serde_json::json!({"custom_frame":true,"height":chrome_ui::HEIGHT,"pin_hit_size":chrome_ui::BUTTON,"pin_glyph_size":16,"document_name":self.document_name(),"file_path":self.current_file_path(),"rename_open":self.rename.is_open(),"rename_busy":self.rename.is_busy()});
                     report["memory_breakdown"] = self.memory_breakdown();
                     report["viewer_ui"] = serde_json::json!({"toolbar_buttons":self.toolbar_layout.as_ref().map(|layout| layout.buttons.map(|r| [r.min.x,r.min.y,r.max.x,r.max.y])),"more_menu_open":self.more_open,"context_menu_open":egui::Popup::is_any_open(ctx),"single_row_toolbar":true,"reference_on_top":self.reference_on_top,"stickers":self.stickers.diagnostics(),"comparison":{"active":self.comparison.active(),"swapped":self.comparison.swapped,"sync":self.comparison.sync,"reference_name":self.comparison.pinned.as_ref().map(|p| &p.name)},"inspector":self.inspector.diagnostics()});
@@ -4103,6 +4230,7 @@ impl eframe::App for ImageApp {
         }
         let ctx = ui.ctx().clone();
         self.update_modal_open = ctx.memory(|m| m.top_modal_layer().is_some());
+        let colors = app_theme::palette(&ctx);
         self.updater.poll(
             self.start.elapsed().as_secs(),
             self.work.is_some() || self.ai.is_busy() || self.rename.blocks_document(),
@@ -4362,23 +4490,6 @@ impl eframe::App for ImageApp {
                 (1.8 - (now - self.fullscreen_activity)).max(0.01),
             ));
         }
-        if !self.toolbar_hidden {
-            egui::Panel::bottom("viewer-toolbar")
-                .exact_size(viewer_ui::TOOLBAR_HEIGHT)
-                .frame(egui::Frame::NONE.fill(Color32::WHITE))
-                .show(ui, |ui| {
-                    if self.rename.blocks_document() {
-                        ui.disable();
-                    }
-                    self.toolbar(ui)
-                });
-        }
-        if self.playback.is_some() && !self.toolbar_hidden {
-            egui::Panel::bottom("animation-controls")
-                .exact_size(44.0)
-                .frame(egui::Frame::NONE.fill(Color32::from_rgb(244, 247, 245)))
-                .show(ui, |ui| self.playback_controls(ui));
-        }
         self.window_chrome(ui);
         let width = ctx.viewport_rect().width();
         let panel_open = self.info_open || self.editing;
@@ -4394,18 +4505,15 @@ impl eframe::App for ImageApp {
                 .resizable(true)
                 .frame(
                     egui::Frame::NONE
-                        .fill(Color32::from_rgb(245, 248, 245))
-                        .inner_margin(egui::Margin::same(10))
-                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(222, 231, 224))),
+                        .fill(colors.panel)
+                        .inner_margin(egui::Margin::same(12))
+                        .stroke(egui::Stroke::new(1.0, colors.separator)),
                 )
                 .show(ui, |ui| {
                     if dialog_open {
                         ui.disable();
                     }
                     ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
-                    ui.visuals_mut().selection.bg_fill = Color32::from_rgb(229, 238, 231);
-                    ui.visuals_mut().selection.stroke =
-                        egui::Stroke::new(1.0, Color32::from_rgb(43, 103, 78));
                     self.image_list(ui);
                 });
         } else {
@@ -4413,6 +4521,10 @@ impl eframe::App for ImageApp {
             self.selected_list_row_rect = None;
             self.thumbnail_worker.cancel();
             self.thumbnail_busy = None;
+        }
+        let bottom_drawer = panel_open && width < 800.0;
+        if bottom_drawer {
+            self.bottom_controls(ui);
         }
         if panel_open {
             if width < 800.0 {
@@ -4444,6 +4556,9 @@ impl eframe::App for ImageApp {
                     });
             }
         }
+        if !bottom_drawer {
+            self.bottom_controls(ui);
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
@@ -4454,35 +4569,6 @@ impl eframe::App for ImageApp {
                 let current_area = self.canvas_viewport.unwrap_or(area);
                 self.ai_canvas_overlay(ui, current_area);
                 self.reference_badge(ui, area);
-                if !self.siblings.is_empty()
-                    && !self.canvas_unavailable
-                    && !self.loading
-                    && self
-                        .requested_path
-                        .as_ref()
-                        .zip(self.loaded.as_ref())
-                        .is_none_or(|(requested, loaded)| requested == &loaded.path)
-                {
-                    let label = format!(
-                        "{} / {}{}",
-                        self.position + 1,
-                        self.siblings.len(),
-                        if self.edited { " · 已编辑" } else { "" }
-                    );
-                    let width = if self.edited { 144.0 } else { 90.0 };
-                    let rect = Rect::from_min_size(
-                        area.right_top() + Vec2::new(-width - 16.0, 16.0),
-                        Vec2::new(width, 27.0),
-                    );
-                    ui.painter()
-                        .rect_filled(rect, 14.0, Color32::from_black_alpha(145));
-                    ui.put(
-                        rect,
-                        egui::Label::new(
-                            egui::RichText::new(label).size(13.0).color(Color32::WHITE),
-                        ),
-                    );
-                }
                 let load_feedback = self.load_feedback(Instant::now());
                 let busy = load_feedback.is_some() || !self.loading && self.work.is_some();
                 if busy
@@ -4495,8 +4581,7 @@ impl eframe::App for ImageApp {
                         area.center_bottom() - Vec2::new(0.0, 25.0),
                         Vec2::new(area.width().min(420.0) - 24.0, 34.0),
                     );
-                    ui.painter()
-                        .rect_filled(rect, 7.0, Color32::from_white_alpha(242));
+                    ui.painter().rect_filled(rect, 7.0, colors.popover);
                     let cancel_rect = Rect::from_center_size(
                         Pos2::new(rect.right() - 18.0, rect.center().y),
                         Vec2::splat(viewer_ui::ACTION_SIZE),
@@ -4763,7 +4848,7 @@ mod tests {
         let (mut app, ctx) = app_with(&source);
         configure(&ctx);
         assert!(!app.preferences.list_visible && !app.editing && !app.info_open);
-        assert_eq!(app.preferences.background, CanvasBackground::CheckerLight);
+        assert_eq!(app.preferences.background, CanvasBackground::Automatic);
         for size in [
             Vec2::new(800.0, 550.0),
             Vec2::new(1180.0, 780.0),
@@ -4820,6 +4905,254 @@ mod tests {
         click_icon(&mut app, &ctx, Icon::Export, size);
         assert!(app.export_dialog);
         assert_eq!(std::fs::read(source).unwrap(), bytes);
+    }
+    #[test]
+    fn toolbar_metadata_tracks_the_visible_image_during_navigation() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.png");
+        let b = dir.path().join("b.png");
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let c = other.join("c.png");
+        for path in [&a, &b, &c] {
+            fixture(path, false);
+        }
+        let (mut app, ctx) = app_with(&a);
+        app.directory_path = Some(browsing::directory(&a));
+        app.siblings = vec![a.clone(), b.clone()];
+        app.open_now(b.clone());
+        assert!(app.loading);
+        assert_eq!(app.position, 1);
+        assert_eq!(app.loaded.as_ref().unwrap().path, a);
+        assert_eq!(app.toolbar_metadata(true), "1 / 2");
+        assert!(app.toolbar_metadata(false).starts_with("1 / 2 · 4 × 3 · "));
+        wait(&mut app, &ctx);
+        assert_eq!(app.loaded.as_ref().unwrap().path, b);
+        assert_eq!(app.toolbar_metadata(true), "2 / 2");
+
+        app.open_now(c.clone());
+        assert!(app.loading);
+        assert_eq!(app.loaded.as_ref().unwrap().path, b);
+        assert!(!app.toolbar_metadata(true).contains('/'));
+        assert!(!app.toolbar_metadata(false).contains('/'));
+        wait(&mut app, &ctx);
+        assert_eq!(app.loaded.as_ref().unwrap().path, c);
+        assert_eq!(app.toolbar_metadata(true), "1 / 1");
+    }
+    #[test]
+    fn ico_size_menu_switches_in_background_and_exports_the_selected_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("sizes.ico");
+        let original = include_bytes!("../assets/gloamere-image.ico");
+        std::fs::write(&source, original).unwrap();
+        let (mut app, ctx) = app_with(&source);
+        configure(&ctx);
+        app.info_open = true;
+        app.evidence_attempted = true;
+        let selected = app
+            .loaded
+            .as_ref()
+            .unwrap()
+            .icon
+            .as_ref()
+            .unwrap()
+            .selected_index;
+        assert_ne!(selected, 0);
+        let size = Vec2::new(1180.0, 780.0);
+        pointer_ui_size(&mut app, &ctx, vec![], size);
+        let trigger = ctx
+            .data(|data| data.get_temp::<Rect>(egui::Id::new("icon-size-trigger")))
+            .unwrap();
+        click_at(&mut app, &ctx, trigger.center(), size);
+        pointer_ui_size(&mut app, &ctx, vec![], size);
+        let choice = ctx
+            .data(|data| data.get_temp::<Rect>(egui::Id::new(("icon-choice", 0usize))))
+            .unwrap();
+        let previous = app.pixels.clone().unwrap();
+        let generation = app.generation;
+        click_at(&mut app, &ctx, choice.center(), size);
+        assert!(app.generation > generation);
+        if app.loading {
+            assert!(Arc::ptr_eq(app.pixels.as_ref().unwrap(), &previous));
+        }
+        wait(&mut app, &ctx);
+        let icon = app.loaded.as_ref().unwrap().icon.as_ref().unwrap();
+        assert_eq!(icon.selected_index, 0);
+        assert_eq!(
+            app.dimensions(),
+            [icon.entries[0].width, icon.entries[0].height]
+        );
+        app.begin_export();
+        let output = dir.path().join("selected-size.png");
+        app.export_name = output.to_string_lossy().into_owned();
+        app.start_export(&ctx);
+        wait(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let exported = light_image_tool::pipeline::load(&output, &Cancellation::default()).unwrap();
+        assert_eq!(
+            exported.pixels.as_raw(),
+            app.pixels.as_ref().unwrap().as_raw()
+        );
+        app.reload_current();
+        wait(&mut app, &ctx);
+        assert_eq!(
+            app.loaded
+                .as_ref()
+                .unwrap()
+                .icon
+                .as_ref()
+                .unwrap()
+                .selected_index,
+            0
+        );
+        assert_eq!(std::fs::read(source).unwrap(), original);
+    }
+    #[test]
+    fn ico_size_switch_preserves_unsaved_guard_and_default_cache_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("guard.ico");
+        std::fs::write(&source, include_bytes!("../assets/gloamere-image.ico")).unwrap();
+        let (mut app, ctx) = app_with(&source);
+        app.open_now(source.clone());
+        wait(&mut app, &ctx);
+        let default_index = app
+            .loaded
+            .as_ref()
+            .unwrap()
+            .icon
+            .as_ref()
+            .unwrap()
+            .selected_index;
+        app.start_edit(EditOp::Rotate90, &ctx);
+        wait(&mut app, &ctx);
+        let edited = app.pixels.clone().unwrap();
+        app.select_icon_entry(0);
+        assert_eq!(
+            app.pending_intent,
+            Some(PendingIntent::OpenIconEntry(source.clone(), 0))
+        );
+        assert!(!app.loading);
+        app.resolve_pending_choice(3, &ctx);
+        assert!(app.pending_intent.is_none());
+        assert!(Arc::ptr_eq(app.pixels.as_ref().unwrap(), &edited));
+        app.select_icon_entry(0);
+        app.resolve_pending_choice(2, &ctx);
+        wait(&mut app, &ctx);
+        assert_eq!(
+            app.loaded
+                .as_ref()
+                .unwrap()
+                .icon
+                .as_ref()
+                .unwrap()
+                .selected_index,
+            0
+        );
+        app.open_now(source);
+        wait(&mut app, &ctx);
+        assert_eq!(
+            app.loaded
+                .as_ref()
+                .unwrap()
+                .icon
+                .as_ref()
+                .unwrap()
+                .selected_index,
+            default_index
+        );
+        assert!(!app.edited);
+    }
+    #[test]
+    fn appearance_switch_preserves_pixels_textures_view_and_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("appearance.png");
+        fixture(&source, false);
+        let (mut app, ctx) = app_with(&source);
+        configure(&ctx);
+        app.preferences.background = CanvasBackground::CheckerDark;
+        app.preferences.list_visible = true;
+        app.fit = false;
+        app.zoom = 1.7;
+        app.pan = Vec2::new(14.0, -9.0);
+        let pixels = app.pixels.as_ref().unwrap().clone();
+        let texture_ids: Vec<_> = app.tiles.iter().map(|tile| tile.texture.id()).collect();
+        let generation = app.generation;
+        pointer_ui(&mut app, &ctx, vec![]);
+        let geometry = app.toolbar_layout.as_ref().unwrap().buttons;
+        for mode in [Appearance::Light, Appearance::Dark, Appearance::System] {
+            app.set_appearance(&ctx, mode);
+            assert_eq!(
+                ctx.options(|options| options.theme_preference),
+                app_theme::preference(mode)
+            );
+            assert!(Arc::ptr_eq(&pixels, app.pixels.as_ref().unwrap()));
+            assert_eq!(
+                texture_ids,
+                app.tiles
+                    .iter()
+                    .map(|tile| tile.texture.id())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(app.generation, generation);
+            assert!(!app.loading);
+            assert_eq!(app.zoom, 1.7);
+            assert_eq!(app.pan, Vec2::new(14.0, -9.0));
+            assert_eq!(app.preferences.background, CanvasBackground::CheckerDark);
+            assert!(app.preferences.list_visible);
+            pointer_ui(&mut app, &ctx, vec![]);
+            assert_eq!(app.toolbar_layout.as_ref().unwrap().buttons, geometry);
+        }
+    }
+    #[test]
+    fn appearance_submenu_selection_outside_click_and_escape_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("appearance-menu.png");
+        fixture(&source, false);
+        let (mut app, ctx) = app_with(&source);
+        configure(&ctx);
+        let size = Vec2::new(1180.0, 780.0);
+        click_icon(&mut app, &ctx, Icon::More, size);
+        let trigger = ctx
+            .data(|data| data.get_temp::<Rect>(egui::Id::new("appearance-menu-trigger")))
+            .unwrap();
+        click_at(&mut app, &ctx, trigger.center(), size);
+        pointer_ui(&mut app, &ctx, vec![]);
+        assert!(app.more_open && egui::Popup::is_any_open(&ctx));
+        let dark = ctx
+            .data(|data| data.get_temp::<Rect>(egui::Id::new(("appearance-choice", "深色"))))
+            .unwrap();
+        click_at(&mut app, &ctx, dark.center(), size);
+        assert_eq!(app.preferences.appearance, Appearance::Dark);
+        assert!(!app.more_open);
+        click_icon(&mut app, &ctx, Icon::More, size);
+        let trigger = ctx
+            .data(|data| data.get_temp::<Rect>(egui::Id::new("appearance-menu-trigger")))
+            .unwrap();
+        click_at(&mut app, &ctx, trigger.center(), size);
+        pointer_ui(&mut app, &ctx, vec![]);
+        assert!(egui::Popup::is_any_open(&ctx));
+        click_at(&mut app, &ctx, Pos2::new(12.0, 12.0), size);
+        assert!(!app.more_open && !egui::Popup::is_any_open(&ctx));
+        click_icon(&mut app, &ctx, Icon::More, size);
+        let trigger = ctx
+            .data(|data| data.get_temp::<Rect>(egui::Id::new("appearance-menu-trigger")))
+            .unwrap();
+        click_at(&mut app, &ctx, trigger.center(), size);
+        pointer_ui(&mut app, &ctx, vec![]);
+        raw_ui(
+            &mut app,
+            &ctx,
+            Some(egui::Key::Escape),
+            egui::Modifiers::NONE,
+        );
+        assert!(app.more_open && !egui::Popup::is_any_open(&ctx));
+        raw_ui(
+            &mut app,
+            &ctx,
+            Some(egui::Key::Escape),
+            egui::Modifiers::NONE,
+        );
+        assert!(!app.more_open);
     }
     #[test]
     fn more_menu_closes_after_selection_and_outside_click() {
@@ -5630,7 +5963,7 @@ mod tests {
         fixture(&path, false);
         let (mut app, ctx) = app_with(&path);
         let mut frame = eframe::Frame::_new_kittest();
-        let _ = ctx.run_ui(
+        let mut output = ctx.run_ui(
             egui::RawInput {
                 focused: false,
                 events: vec![egui::Event::Key {
@@ -5644,6 +5977,7 @@ mod tests {
             },
             |ui| eframe::App::ui(&mut app, ui, &mut frame),
         );
+        output.textures_delta.clear();
         assert!(app.work.is_none());
         assert!(!app.edited);
         assert_eq!(app.dimensions(), [4, 3]);
@@ -5865,7 +6199,7 @@ mod tests {
             Rect::from_min_size(Pos2::ZERO, size).contains_rect(rect),
             "{rect:?}"
         );
-        assert!(rect.min.y > 350.0 && rect.max.y < 530.0, "{rect:?}");
+        assert!(rect.min.y > 350.0 && rect.max.y < size.y - 8.0, "{rect:?}");
         for pressed in [true, false] {
             pointer_ui_size(
                 &mut app,
@@ -6994,12 +7328,15 @@ mod tests {
         fixture(&path, false);
         let (mut app, ctx) = app_with(&path);
         let ids: Vec<_> = app.tiles.iter().map(|t| t.texture.id()).collect();
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
-        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut initial = ctx.run_ui(egui::RawInput::default(), |_| {});
+        initial.textures_delta.clear();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             app.refresh_texture(ui.ctx());
         });
+        let texture_updates = std::mem::take(&mut output.textures_delta.set);
+        output.textures_delta.clear();
         for id in ids {
-            let deltas = output.textures_delta.set.get(&id).unwrap();
+            let deltas = texture_updates.get(&id).unwrap();
             assert!(!deltas.is_empty());
             assert!(deltas.iter().all(|delta| delta.pos == Some([0, 0])));
         }

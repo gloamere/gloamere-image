@@ -872,6 +872,7 @@ pub fn current_user_update_root() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod directory_descriptor_tests {
+    use super::super::super::test_support;
     use super::*;
     fn legacy_write(path: &Path, sddl: &str) {
         let mut descriptor = ptr::null_mut();
@@ -893,13 +894,13 @@ mod directory_descriptor_tests {
         );
     }
     fn fixture() -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_support::tempdir().unwrap();
         let nested = root.path().join("unrelated-folder");
-        std::fs::create_dir(&nested).unwrap();
+        test_support::fs::create_dir(&nested).unwrap();
         let a = root.path().join("unrelated.txt");
         let b = nested.join("nested.txt");
-        std::fs::write(&a, b"SYNTHETIC").unwrap();
-        std::fs::write(&b, b"SYNTHETIC").unwrap();
+        test_support::fs::write(&a, b"SYNTHETIC").unwrap();
+        test_support::fs::write(&b, b"SYNTHETIC").unwrap();
         let paths = vec![root.path().to_owned(), nested, a, b];
         for leaf in &paths[2..] {
             legacy_write(leaf, &file_sddl(leaf).unwrap());
@@ -933,9 +934,10 @@ mod directory_descriptor_tests {
     }
     #[test]
     fn changed_inherited_leaf_restores_exactly_using_pinned_handle() {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_support::tempdir().unwrap();
         let leaf = root.path().join("owned.txt");
-        std::fs::write(&leaf, b"SYNTHETIC").unwrap();
+        test_support::fs::write(&leaf, b"SYNTHETIC").unwrap();
+        test_support::normalize_inheritance(&leaf).unwrap();
         let original = file_sddl(&leaf).unwrap();
         assert!(original.contains("AI"));
         legacy_write(&leaf, &original);

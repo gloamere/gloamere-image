@@ -71,10 +71,21 @@ pub fn create_private_directory_new(path: &Path) -> Result<DirectoryPins> {
 /// Create a randomly named private file atomically with explicit ownership.
 /// Initial parent pins are retained while creating; callers must additionally
 /// retain their app-boundary pins through writing and durable publication.
-/// Windows temp handles allow rename for MoveFileExW publication. A name
+/// Windows temp handles support same-directory publication by handle. A name
 /// collision retries CREATE_NEW and never opens or modifies the existing file.
 pub fn new_private_tempfile(parent: &Path) -> Result<tempfile::NamedTempFile> {
     let _pins = pin_existing_private_directory(parent)?;
+    create_private_tempfile(parent)
+}
+
+// Transaction fixtures isolate their objects from the shared host namespace,
+// while retaining exactly the production file creation and descriptor audit.
+#[cfg(all(windows, test))]
+pub(super) fn fixture_tempfile(parent: &Path) -> Result<tempfile::NamedTempFile> {
+    create_private_tempfile(parent)
+}
+
+fn create_private_tempfile(parent: &Path) -> Result<tempfile::NamedTempFile> {
     let identity = native::Identity::current()?;
     let file = tempfile::Builder::new()
         .prefix(".gloamere-")
@@ -408,11 +419,11 @@ mod native {
             let handle = unsafe {
                 CreateFileW(
                     wide(path).as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
+                    GENERIC_READ | GENERIC_WRITE | READ_CONTROL | DELETE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     &attributes,
                     CREATE_NEW,
-                    FILE_FLAG_OPEN_REPARSE_POINT,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
                     ptr::null_mut(),
                 )
             };
@@ -712,25 +723,94 @@ mod native {
             ));
         }
         #[test]
-        fn normal_windows_namespace_and_created_file_ownership_are_audited() {
+        fn created_private_objects_keep_explicit_ownership_and_directory_pins() {
             use std::io::Write;
-            // This is native acceptance evidence only when actually run on
-            // Windows under both standard and elevated tokens. Cross-compiling
-            // this test does not establish those runtime properties.
+            // Exercise explicit object creation independently of the host's
+            // temporary-directory ancestors. Their policy is tested below.
             let temp = tempfile::tempdir().unwrap();
             let app = temp.path().join("LightImageTool");
             let state = app.join("updater-state");
-            let pins = ensure_private_tree(&app, &state).unwrap();
             let identity = Identity::current().unwrap();
-            let lock = open_private_lock(&state.join("state.lock")).unwrap();
+            assert!(identity.create(&app).unwrap());
+            let app_pin = identity.pin(&app, true, true).unwrap();
+            assert!(identity.create(&state).unwrap());
+            let state_pin = identity.pin(&state, true, true).unwrap();
+            let lock_path = state.join("state.lock");
+            let lock = open_private_lock(&lock_path).unwrap();
             identity.audit(&lock, true, true).unwrap();
-            let mut journal = new_private_tempfile(&state).unwrap();
-            identity.audit(journal.as_file(), true, true).unwrap();
+            let reopened_lock = identity.open_lock(&lock_path).unwrap();
+            identity.audit(&reopened_lock, true, false).unwrap();
+            let mut journal = tempfile::Builder::new()
+                .prefix(".gloamere-")
+                .rand_bytes(16)
+                .make_in(&state, |path| identity.create_new_file(path))
+                .unwrap();
+            identity.verify_new_file(journal.as_file()).unwrap();
             journal.write_all(b"synthetic journal").unwrap();
-            journal.persist(state.join("journal.json")).unwrap();
-            assert!(std::fs::rename(&app, temp.path().join("renamed")).is_err());
+            crate::updater::storage::persist_new(journal, &state.join("journal.json")).unwrap();
+            let published = File::open(state.join("journal.json")).unwrap();
+            identity.audit(&published, true, true).unwrap();
+            drop(published);
+            drop(reopened_lock);
             drop(lock);
-            drop(pins);
+            let renamed = temp.path().join("renamed");
+            assert!(std::fs::rename(&app, &renamed).is_err());
+            drop(state_pin);
+            drop(app_pin);
+            std::fs::rename(&app, &renamed).unwrap();
+            assert_eq!(
+                std::fs::read(renamed.join("updater-state/journal.json")).unwrap(),
+                b"synthetic journal"
+            );
+        }
+        #[test]
+        fn full_namespace_creation_requires_every_existing_ancestor_to_pass() {
+            let temp = tempfile::tempdir().unwrap();
+            let app = temp.path().join("LightImageTool");
+            let state = app.join("updater-state");
+            let identity = Identity::current().unwrap();
+            let mut ancestors: Vec<_> = temp
+                .path()
+                .ancestors()
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect();
+            ancestors.reverse();
+            let mut ancestor_pins = Vec::new();
+            let mut expected_error = None;
+            for path in ancestors {
+                match identity.pin(path, false, false) {
+                    Ok(pin) => ancestor_pins.push(pin),
+                    Err(error) => {
+                        expected_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            match expected_error {
+                Some(expected) => {
+                    let actual = ensure_private_tree(&app, &state).unwrap_err();
+                    assert_eq!(
+                        std::mem::discriminant(&actual),
+                        std::mem::discriminant(&expected),
+                        "full namespace rejected for a different reason: {actual}; expected {expected}"
+                    );
+                    if let (UpdateError::Io(actual), UpdateError::Io(expected)) = (actual, expected)
+                    {
+                        assert_eq!(actual.kind(), expected.kind());
+                        assert_eq!(actual.raw_os_error(), expected.raw_os_error());
+                    }
+                    assert!(!app.exists());
+                    assert!(!state.exists());
+                }
+                None => {
+                    let _pins = ensure_private_tree(&app, &state).unwrap();
+                    let _app_pin = identity.pin(&app, true, true).unwrap();
+                    let _state_pin = identity.pin(&state, true, true).unwrap();
+                    let _existing = pin_existing_private_tree(&app, &state).unwrap();
+                    let file = new_private_tempfile(&state).unwrap();
+                    identity.verify_new_file(file.as_file()).unwrap();
+                }
+            }
         }
     }
 }

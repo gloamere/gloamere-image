@@ -250,7 +250,7 @@ impl Transaction {
             });
         }
         let integration = platform::IntegrationSnapshot::capture(&plan.installation)?;
-        fs::create_dir(&directory)?;
+        let _directory_pins = platform::create_private_data_directory_new(&directory)?;
         storage::atomic_bytes(&directory.join("PRODUCT-OWNER.txt"), PRODUCT_ID.as_bytes())?;
         let transaction = directory
             .file_name()
@@ -597,9 +597,9 @@ fn copy_verified(
     let parent = destination
         .parent()
         .ok_or_else(|| failure("目标目录无效"))?;
-    fs::create_dir_all(parent)?;
+    let _parent_pins = platform::ensure_private_data_directory(parent)?;
     storage::plain_path(parent)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut temp = platform::private_tempfile(parent)?;
     let mut input = File::open(source)?;
     std::io::copy(&mut input, &mut temp)?;
     temp.flush()?;
@@ -611,7 +611,7 @@ fn copy_verified(
     if replace {
         storage::persist_replace(temp, destination)?;
     } else {
-        temp.persist_noclobber(destination).map_err(|e| e.error)?;
+        storage::persist_new(temp, destination)?;
     }
     storage::sync_directory(parent)?;
     Ok(())
@@ -619,6 +619,7 @@ fn copy_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::updater::test_support::{self, fs};
     struct Fixture {
         _dir: tempfile::TempDir,
         root: PathBuf,
@@ -627,7 +628,7 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let d = tempfile::tempdir().unwrap();
+            let d = test_support::tempdir().unwrap();
             let root = d.path().join("中文 app");
             fs::create_dir_all(root.join("runtime")).unwrap();
             fs::write(root.join("LIGHT-IMAGE-INSTALL.txt"), PRODUCT_ID).unwrap();
